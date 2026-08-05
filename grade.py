@@ -85,8 +85,10 @@ def discover_submissions(
     - a folder (e.g. an unzipped Eclipse project - any nesting under it, .class/.classpath/
       bin/ etc. are simply ignored since only *.java is globbed)
     - a single loose .java file
-    - a .zip file (e.g. an Eclipse project exported as-is) - extracted into
-      extract_root/<student_id>/ and then scanned the same way as a folder submission.
+    - a .zip or .jar file (a JAR is just a ZIP file with a manifest, so the same extraction
+      works for both - e.g. an Eclipse project exported as a zip, or exported as a runnable
+      JAR with sources included) - extracted into extract_root/<student_id>/ and then
+      scanned the same way as a folder submission.
     """
     results: list[tuple[str, list[Path], list[str]]] = []
     for entry in sorted(submissions_dir.iterdir()):
@@ -95,7 +97,7 @@ def discover_submissions(
             results.append((entry.name, java_files, []))
         elif entry.is_file() and entry.suffix == ".java":
             results.append((entry.stem, [entry], []))
-        elif entry.is_file() and entry.suffix == ".zip":
+        elif entry.is_file() and entry.suffix in (".zip", ".jar"):
             student_id = entry.stem
             extract_dir = extract_root / student_id
             if extract_dir.exists():
@@ -105,7 +107,7 @@ def discover_submissions(
                 with zipfile.ZipFile(entry) as zf:
                     zf.extractall(extract_dir)
             except zipfile.BadZipFile:
-                results.append((student_id, [], [f"could not open {entry.name}: not a valid zip file"]))
+                results.append((student_id, [], [f"could not open {entry.name}: not a valid zip/jar file"]))
                 continue
             java_files = sorted(extract_dir.rglob("*.java"))
             notes = [] if java_files else [f"{entry.name} extracted OK but contained no .java files"]
