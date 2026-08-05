@@ -1,0 +1,9 @@
+# real student submissions - never commit these to a shared repo
+submissions/*
+!submissions/.gitkeep
+
+build_tmp/
+results/*.csv
+lib/*.jar
+__pycache__/
+*.pyc
