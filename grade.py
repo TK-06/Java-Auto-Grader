@@ -2,18 +2,23 @@
 """Auto-Grader for Data Structures (Java + JUnit).
 
 Compiles each student submission together with the week's fixed JUnit tests,
-runs the tests via the JUnit Platform Console Launcher, and writes one row
-per student to a CSV: student_id, compiled, tests_passed, tests_total, score, notes.
+runs the tests via the JUnit Platform Console Launcher, and writes one row per
+student to a CSV: student_id, compiled, tests_passed, tests_total, score,
+max_score, passed_tests, failed_tests, notes. Score is 1 point per passed test
+by default, or a weighted sum if tests/rubric.json is present.
 """
 import argparse
 import csv
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,12 +26,10 @@ BUILD_ROOT = Path("build_tmp")
 OUTPUT_TRUNCATE_CHARS = 2000
 OUTPUT_TRUNCATE_LINES = 40
 
-TESTS_SUMMARY_RE = re.compile(
-    r"\[\s*(\d+)\s+tests\s+(found|skipped|started|aborted|successful|failed)\s*\]"
-)
 PUBLIC_TYPE_RE = re.compile(
     r"public\s+(?:final\s+|abstract\s+)?(?:class|interface|enum|record)\s+(\w+)"
 )
+METHOD_NAME_RE = re.compile(r"^\w+")
 
 
 def resolve_java_filename(path: Path) -> str:
@@ -87,11 +90,14 @@ def discover_submissions(
     - a single loose .java file
     - a .zip or .jar file (a JAR is just a ZIP file with a manifest, so the same extraction
       works for both - e.g. an Eclipse project exported as a zip, or exported as a runnable
-      JAR with sources included) - extracted into extract_root/<student_id>/ and then
-      scanned the same way as a folder submission.
+      JAR with sources included) - extracted into extract_root/<n>/ (a plain sequential
+      counter, NOT the student_id: real submission filenames can be arbitrarily long -
+      LMS downloads, browser dedup suffixes, etc. - and combined with this repo's own path
+      depth plus a jar's internal package structure, that reliably blows past Windows'
+      260-character path limit during extraction) and then scanned like a folder submission.
     """
     results: list[tuple[str, list[Path], list[str]]] = []
-    for entry in sorted(submissions_dir.iterdir()):
+    for idx, entry in enumerate(sorted(submissions_dir.iterdir())):
         if entry.is_dir():
             java_files = sorted(entry.rglob("*.java"))
             results.append((entry.name, java_files, []))
@@ -99,7 +105,7 @@ def discover_submissions(
             results.append((entry.stem, [entry], []))
         elif entry.is_file() and entry.suffix in (".zip", ".jar"):
             student_id = entry.stem
-            extract_dir = extract_root / student_id
+            extract_dir = extract_root / str(idx)
             if extract_dir.exists():
                 shutil.rmtree(extract_dir)
             extract_dir.mkdir(parents=True)
@@ -108,6 +114,11 @@ def discover_submissions(
                     zf.extractall(extract_dir)
             except zipfile.BadZipFile:
                 results.append((student_id, [], [f"could not open {entry.name}: not a valid zip/jar file"]))
+                continue
+            except OSError as exc:
+                # e.g. Windows path-length limit blown by a long filename/deeply
+                # nested entry inside the archive - must not crash the whole batch.
+                results.append((student_id, [], [f"could not extract {entry.name}: {exc}"]))
                 continue
             java_files = sorted(extract_dir.rglob("*.java"))
             notes = [] if java_files else [f"{entry.name} extracted OK but contained no .java files"]
@@ -123,10 +134,10 @@ def discover_test_files(tests_dir: Path) -> list[Path]:
 
 
 def prepare_build_dir(
-    student_id: str, student_files: list[Path], test_files: list[Path], build_root: Path
+    build_key: str, student_files: list[Path], test_files: list[Path], build_root: Path
 ) -> tuple[Path, list[str]]:
     notes: list[str] = []
-    build_dir = build_root / student_id
+    build_dir = build_root / build_key
     if build_dir.exists():
         shutil.rmtree(build_dir)
     build_dir.mkdir(parents=True)
@@ -135,6 +146,14 @@ def prepare_build_dir(
     seen_names: set[str] = set()
     for src in student_files:
         dest_name = resolve_java_filename(src)
+        if dest_name == "Main.java":
+            # Excluded by course policy: recent IntelliJ project templates auto-generate
+            # a scaffold Main.java (JEP 445 "instance main method" preview syntax) that
+            # students often never touch or delete. It isn't part of any assignment and
+            # its preview syntax fails plain javac, which would otherwise fail the whole
+            # submission over an irrelevant leftover file.
+            notes.append(f"skipped student's {src.name} (Main.java is excluded from grading)")
+            continue
         if dest_name in test_names:
             notes.append(f"skipped student's {src.name} (colliding with official test file {dest_name})")
             continue
@@ -239,12 +258,13 @@ def compile_submission(build_dir: Path, junit_jar: Path, timeout: int) -> Compil
 TestRunResult = ProcResult
 
 
-def run_tests(classes_dir: Path, junit_jar: Path, timeout: int) -> TestRunResult:
+def run_tests(classes_dir: Path, reports_dir: Path, junit_jar: Path, timeout: int) -> TestRunResult:
     cmd = [
         "java", "-jar", str(junit_jar),
         "execute",
         "--class-path", str(classes_dir),
         "--scan-classpath", str(classes_dir),
+        "--reports-dir", str(reports_dir),
         "--disable-banner",
         "--disable-ansi-colors",
         "--details=summary",
@@ -253,46 +273,50 @@ def run_tests(classes_dir: Path, junit_jar: Path, timeout: int) -> TestRunResult
 
 
 @dataclass
-class ParsedSummary:
-    parse_ok: bool
-    found: int = 0
-    skipped: int = 0
-    started: int = 0
-    aborted: int = 0
-    successful: int = 0
-    failed: int = 0
-
-    @property
-    def total(self) -> int:
-        return self.found - self.skipped
-
-    @property
-    def passed(self) -> int:
-        return self.successful
+class TestCase:
+    classname: str  # simple name, package prefix stripped (e.g. "TestStation2")
+    method: str      # trailing "()"/params stripped (e.g. "testSetName")
+    status: str       # "passed" | "failed" | "skipped"
 
 
-def parse_junit_output(stdout: str) -> ParsedSummary:
-    counts: dict[str, int] = {}
-    for value, label in TESTS_SUMMARY_RE.findall(stdout):
-        counts[label] = int(value)
+def collect_test_results(reports_dir: Path) -> list[TestCase]:
+    """Parse every TEST-*.xml report the console launcher wrote (one per test
+    engine - unused engines just produce an empty <testsuite tests="0">) into
+    a flat list of per-test results. XML reports are used instead of the
+    printed text summary because they give per-test names/outcomes, which
+    the summary block doesn't - needed for rubric-weighted scoring."""
+    results: list[TestCase] = []
+    for report_file in sorted(reports_dir.glob("TEST-*.xml")):
+        tree = ET.parse(report_file)
+        for testcase in tree.getroot().findall("testcase"):
+            classname = testcase.get("classname", "").rsplit(".", 1)[-1]
+            method_match = METHOD_NAME_RE.match(testcase.get("name", ""))
+            method = method_match.group(0) if method_match else testcase.get("name", "")
+            if testcase.find("skipped") is not None:
+                status = "skipped"
+            elif testcase.find("failure") is not None or testcase.find("error") is not None:
+                status = "failed"
+            else:
+                status = "passed"
+            results.append(TestCase(classname, method, status))
+    return results
 
-    required = {"found", "skipped", "started", "aborted", "successful", "failed"}
-    if not required.issubset(counts.keys()):
-        return ParsedSummary(parse_ok=False)
 
-    return ParsedSummary(
-        parse_ok=True,
-        found=counts["found"],
-        skipped=counts["skipped"],
-        started=counts["started"],
-        aborted=counts["aborted"],
-        successful=counts["successful"],
-        failed=counts["failed"],
-    )
+def load_rubric(tests_dir: Path) -> dict[str, dict[str, float]] | None:
+    """Optional tests/rubric.json: {"ClassName": {"testMethod": points, ...}, ...}.
+    When present, score becomes the weighted sum of passed tests found in the
+    rubric instead of a flat 1-point-per-test count. Absent by default so weeks
+    without a rubric behave exactly as before."""
+    rubric_path = tests_dir / "rubric.json"
+    if not rubric_path.exists():
+        return None
+    with open(rubric_path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def grade_student(
     student_id: str,
+    build_key: str,
     student_files: list[Path],
     discovery_notes: list[str],
     test_files: list[Path],
@@ -300,6 +324,7 @@ def grade_student(
     build_root: Path,
     timeout: int,
     keep_build: bool,
+    rubric: dict[str, dict[str, float]] | None,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -307,6 +332,9 @@ def grade_student(
         "tests_passed": 0,
         "tests_total": 0,
         "score": 0,
+        "max_score": 0,
+        "passed_tests": "",
+        "failed_tests": "",
         "notes": "",
     }
     build_dir = None
@@ -315,7 +343,7 @@ def grade_student(
             row["notes"] = "; ".join(discovery_notes + ["no .java source files found"]).strip("; ")
             return row
 
-        build_dir, prep_notes = prepare_build_dir(student_id, student_files, test_files, build_root)
+        build_dir, prep_notes = prepare_build_dir(build_key, student_files, test_files, build_root)
         prep_notes = discovery_notes + prep_notes
 
         compile_result = compile_submission(build_dir, junit_jar, timeout)
@@ -323,36 +351,73 @@ def grade_student(
             row["notes"] = "; ".join(prep_notes + [f"COMPILE ERROR: {compile_result.output}"]).strip("; ")
             return row
 
-        run_result = run_tests(compile_result.classes_dir, junit_jar, timeout)
+        reports_dir = build_dir / "reports"
+        reports_dir.mkdir(exist_ok=True)
+        run_result = run_tests(compile_result.classes_dir, reports_dir, junit_jar, timeout)
         if run_result.timed_out:
             row["compiled"] = "yes"
             row["notes"] = "; ".join(prep_notes + [f"test run timed out after {timeout}s"]).strip("; ")
             return row
 
-        summary = parse_junit_output(run_result.stdout)
         row["compiled"] = "yes"
-        if not summary.parse_ok:
+        try:
+            test_cases = collect_test_results(reports_dir)
+        except ET.ParseError as exc:
             row["notes"] = "; ".join(
-                prep_notes + [f"could not parse JUnit output: {truncate(run_result.stdout)}"]
+                prep_notes + [f"could not parse JUnit XML reports ({exc}): {truncate(run_result.stdout)}"]
             ).strip("; ")
             return row
 
-        if summary.found == 0:
+        if not test_cases:
             row["notes"] = "; ".join(
                 prep_notes
                 + ["compiled OK but 0 tests found (student may have renamed/overwritten a class referenced by the test)"]
             ).strip("; ")
             return row
 
-        row["tests_passed"] = summary.passed
-        row["tests_total"] = summary.total
-        row["score"] = summary.passed
+        passed = [tc for tc in test_cases if tc.status == "passed"]
+        failed = [tc for tc in test_cases if tc.status == "failed"]
+        skipped = [tc for tc in test_cases if tc.status == "skipped"]
+
+        row["tests_passed"] = len(passed)
+        row["tests_total"] = len(passed) + len(failed)
+        row["passed_tests"] = "; ".join(f"{tc.classname}.{tc.method}" for tc in passed)
+        row["failed_tests"] = "; ".join(f"{tc.classname}.{tc.method}" for tc in failed)
 
         extra = []
-        if summary.aborted:
-            extra.append(f"{summary.aborted} test(s) aborted")
-        if summary.failed:
-            extra.append(f"{summary.failed} test(s) failed")
+        if skipped:
+            extra.append(f"{len(skipped)} test(s) skipped")
+        if failed:
+            extra.append(f"{len(failed)} test(s) failed")
+
+        if rubric is None:
+            row["score"] = row["tests_passed"]
+            row["max_score"] = row["tests_total"]
+        else:
+            found = {(tc.classname, tc.method) for tc in test_cases}
+            passed_set = {(tc.classname, tc.method) for tc in passed}
+            score = 0.0
+            max_score = 0.0
+            missing = []
+            for classname, methods in rubric.items():
+                for method, points in methods.items():
+                    max_score += points
+                    if (classname, method) in passed_set:
+                        score += points
+                    elif (classname, method) not in found:
+                        missing.append(f"{classname}.{method}")
+            row["score"] = score
+            row["max_score"] = max_score
+            if missing:
+                extra.append(f"rubric test(s) not found in results: {', '.join(missing)}")
+            rubric_keys = {(c, m) for c, ms in rubric.items() for m in ms}
+            extras_found = found - rubric_keys
+            if extras_found:
+                extra.append(
+                    "extra test(s) not in rubric (not scored): "
+                    + ", ".join(f"{c}.{m}" for c, m in sorted(extras_found))
+                )
+
         row["notes"] = "; ".join(prep_notes + extra).strip("; ")
         return row
 
@@ -375,7 +440,10 @@ def sort_rows(rows: list[dict]) -> list[dict]:
 def write_csv(rows: list[dict], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rows_sorted = sort_rows(rows)
-    fieldnames = ["student_id", "compiled", "tests_passed", "tests_total", "score", "notes"]
+    fieldnames = [
+        "student_id", "compiled", "tests_passed", "tests_total", "score", "max_score",
+        "passed_tests", "failed_tests", "notes",
+    ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -399,7 +467,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tests", default="tests")
     parser.add_argument("--lib", default="lib")
     parser.add_argument("--out", default=str(Path("results") / "grades.csv"),
-                         help="detailed CSV: student_id, compiled, tests_passed, tests_total, score, notes")
+                         help="detailed CSV: student_id, compiled, tests_passed, tests_total, "
+                              "score, max_score, passed_tests, failed_tests, notes")
     parser.add_argument("--scores-out", default=str(Path("results") / "scores.csv"),
                          help="simple CSV: student_id, score (e.g. for gradebook upload)")
     parser.add_argument("--timeout", type=int, default=30)
@@ -426,6 +495,7 @@ def main() -> None:
 
     junit_jar = find_junit_jar(lib_dir)
     test_files = discover_test_files(tests_dir)
+    rubric = load_rubric(tests_dir)
 
     if build_root.exists():
         shutil.rmtree(build_root)
@@ -437,17 +507,34 @@ def main() -> None:
     if not submissions:
         sys.exit(f"ERROR: no student submissions found in {submissions_dir}")
 
+    id_counts = Counter(student_id for student_id, _, _ in submissions)
+    duplicate_ids = [sid for sid, count in id_counts.items() if count > 1]
+    if duplicate_ids:
+        print(
+            "WARNING: multiple submissions resolved to the same student_id - "
+            "both will be graded as separate rows in the CSV:"
+        )
+        for sid in duplicate_ids:
+            print(f"  {sid}  ({id_counts[sid]} submissions)")
+        print()
+
     print("Auto-Grader for Data Structures - starting run")
     print(f"  submissions: {submissions_dir}  ({len(submissions)} found)")
     print(f"  tests:       {tests_dir}  ({len(test_files)} test file(s))")
     print(f"  junit jar:   {junit_jar}")
+    if rubric is not None:
+        rubric_total = sum(points for methods in rubric.values() for points in methods.values())
+        print(f"  rubric:      {tests_dir / 'rubric.json'}  (weighted, {rubric_total:g} points total)")
+    else:
+        print("  rubric:      none (tests/rubric.json not found - scoring 1 point per test)")
 
     rows = []
     total = len(submissions)
     for i, (student_id, student_files, discovery_notes) in enumerate(submissions, start=1):
+        build_key = str(i)
         row = grade_student(
-            student_id, student_files, discovery_notes, test_files,
-            junit_jar, build_root, args.timeout, args.keep_build
+            student_id, build_key, student_files, discovery_notes, test_files,
+            junit_jar, build_root, args.timeout, args.keep_build, rubric
         )
         rows.append(row)
         if row["compiled"] == "no":
@@ -456,8 +543,11 @@ def main() -> None:
         else:
             print(
                 f"[{i}/{total}] {student_id}: compiled, "
-                f"{row['tests_passed']}/{row['tests_total']} tests passed (score {row['score']})"
+                f"{row['tests_passed']}/{row['tests_total']} tests passed "
+                f"(score {row['score']:g}/{row['max_score']:g})"
             )
+        if args.keep_build:
+            print(f"         build dir: {build_root / build_key}")
 
     if not args.keep_build and build_root.exists():
         shutil.rmtree(build_root, ignore_errors=True)
