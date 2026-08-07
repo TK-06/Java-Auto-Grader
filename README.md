@@ -76,6 +76,17 @@ this exclusion, that one irrelevant leftover file would fail the whole submissio
 compile, even though the actual assignment code is fine. Any student file that resolves to
 `Main.java` is skipped and noted in `notes`, exactly like a colliding test file.
 
+**Package declarations are stripped from student files before compiling** (and any
+now-dangling `import` referencing that package is stripped too). This grader assumes every
+class — student and official test alike — lives in one flat, unnamed package, since your
+`tests/*.java` files never declare one. Some IDEs (IntelliJ especially, when a project's
+source root isn't marked correctly — plain `main/java` folders instead of a configured
+`src` root) auto-insert a real `package main.java;` line into student files. Left in place,
+the student's classes would compile into that named package while the unnamed-package
+official test can't see them — `cannot find symbol`, even though the code is otherwise
+fine. Both the stripped package and any import cleaned up alongside it are noted in
+`notes`.
+
 ### 2b. (Optional) Weighted scoring — some test cases worth more than others
 
 By default every passing test is worth 1 point. If your rubric gives different test cases

@@ -56,6 +56,45 @@ def resolve_java_filename(path: Path) -> str:
     return path.name
 
 
+def strip_package_declaration(text: str) -> tuple[str, str | None]:
+    """This grader assumes every student class and the official test files
+    it's compiled against share one flat, unnamed package (the official
+    tests/*.java files never declare a package - see test_class_fqcn). Some
+    IDEs (e.g. IntelliJ, when a project's source root isn't marked
+    correctly - plain "main/java" folders instead of a configured "src"
+    root) auto-insert a real `package main.java;` line into student files.
+    Left in place, javac compiles the student's classes into that named
+    package while the unnamed-package test file references them
+    unqualified, producing "cannot find symbol" even though the class is
+    right there. Stripping the declaration only removes a namespace label -
+    it doesn't change how the file's own types reference each other."""
+    match = PACKAGE_RE.search(text)
+    if not match:
+        return text, None
+    return PACKAGE_RE.sub("", text, count=1), match.group(1)
+
+
+IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\.(?:\w+|\*)\s*;\s*\n?", re.MULTILINE)
+
+
+def strip_imports_of_packages(text: str, package_names: set[str]) -> str:
+    """Once strip_package_declaration has flattened a submission's classes
+    into the unnamed package, any `import <pkg>.Foo;` elsewhere in that same
+    submission naming one of those now-gone packages (e.g. a student's own
+    TestBot.java doing `import main.java.Bot;` because Bot.java used to
+    declare `package main.java;`) is a compile error, not just dead code:
+    Java doesn't allow importing from the unnamed package at all - same-
+    package types are simply visible without an import. Every other import
+    (java.util.*, org.junit.*, an unrelated package) is left untouched."""
+    if not package_names:
+        return text
+
+    def _drop(match: re.Match) -> str:
+        return "" if match.group(1) in package_names else match.group(0)
+
+    return IMPORT_RE.sub(_drop, text)
+
+
 def truncate(text: str) -> str:
     lines = text.splitlines()
     if len(lines) > OUTPUT_TRUNCATE_LINES:
@@ -183,6 +222,8 @@ def prepare_build_dir(
 
     test_names = {f.name for f in test_files}
     seen_names: set[str] = set()
+    kept: list[tuple[str, str]] = []  # (dest_name, text)
+    stripped_package_names: set[str] = set()
     for src in student_files:
         dest_name = resolve_java_filename(src)
         if dest_name == "Main.java":
@@ -200,7 +241,25 @@ def prepare_build_dir(
             notes.append(f"skipped duplicate student file {src.name} (-> {dest_name})")
             continue
         seen_names.add(dest_name)
-        shutil.copy2(src, build_dir / dest_name)
+        text = src.read_text(encoding="utf-8", errors="ignore")
+        text, package_name = strip_package_declaration(text)
+        if package_name:
+            stripped_package_names.add(package_name)
+            notes.append(
+                f"stripped package declaration '{package_name}' from {src.name} "
+                f"(this grader compiles everything in the unnamed package)"
+            )
+        kept.append((dest_name, text))
+
+    # Second pass: now that every kept file's OWN package has been stripped
+    # (collected above), remove any `import <thatpackage>.Foo;` line - even
+    # in files whose own package was different or absent - since those
+    # packages no longer exist in the flattened build. Must run after the
+    # first pass: a file can't know which packages are being flattened
+    # submission-wide until every other file has been read.
+    for dest_name, text in kept:
+        text = strip_imports_of_packages(text, stripped_package_names)
+        (build_dir / dest_name).write_text(text, encoding="utf-8")
 
     for tf in test_files:
         shutil.copy2(tf, build_dir / tf.name)
