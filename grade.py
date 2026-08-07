@@ -2,10 +2,14 @@
 """Auto-Grader for Data Structures (Java + JUnit).
 
 Compiles each student submission together with the week's fixed JUnit tests,
-runs the tests via the JUnit Platform Console Launcher, and writes one row per
-student to a CSV: student_id, compiled, tests_passed, tests_total, score,
-max_score, passed_tests, failed_tests, notes. Score is 1 point per passed test
-by default, or a weighted sum if tests/rubric.json is present.
+runs each official test class in its own isolated JVM invocation via the
+JUnit Platform Console Launcher, and writes one row per student to a CSV:
+student_id, compiled, tests_passed, tests_total, score, max_score,
+passed_tests, failed_tests, extra_tests_passed, extra_tests_total,
+extra_failed_tests, notes. Score is 1 point per passed test by default, or a
+weighted sum if tests/rubric.json is present. extra_* columns report any
+leftover JUnit test classes still in the student's submission (e.g. from an
+earlier week) - run isolated for visibility, never counted toward the score.
 """
 import argparse
 import csv
@@ -30,6 +34,8 @@ PUBLIC_TYPE_RE = re.compile(
     r"public\s+(?:final\s+|abstract\s+)?(?:class|interface|enum|record)\s+(\w+)"
 )
 METHOD_NAME_RE = re.compile(r"^\w+")
+PACKAGE_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
+JUNIT_IMPORT_RE = re.compile(r"^\s*import\s+org\.junit\b", re.MULTILINE)
 
 
 def resolve_java_filename(path: Path) -> str:
@@ -131,6 +137,38 @@ def discover_test_files(tests_dir: Path) -> list[Path]:
     if not test_files:
         sys.exit(f"ERROR: no .java test files found in {tests_dir}")
     return test_files
+
+
+def test_class_fqcn(path: Path) -> str:
+    """Fully-qualified class name (package.ClassName) for a test file, used
+    with --select-class to run it in its own JVM invocation. JUnit 5 test
+    classes don't need to be public, so this trusts the filename for the
+    class name (matching Java's own requirement that a top-level type's
+    filename match its name) rather than requiring a "public" modifier match."""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    pkg_match = PACKAGE_RE.search(text)
+    class_name = path.stem
+    if pkg_match:
+        return f"{pkg_match.group(1)}.{class_name}"
+    return class_name
+
+
+def discover_extra_test_classes(build_dir: Path, official_names: set[str]) -> list[str]:
+    """A student's submission sometimes still contains their OWN JUnit test
+    class from a prior week (e.g. a leftover TestCPTSMachine.java sitting
+    next to this week's official TestCPTSMachine2.java). It's still compiled
+    (student source is compiled together) but isn't one of the official
+    tests/ files, so it's found here by content (a JUnit import) rather than
+    by filename, and run separately - see run_tests - so it can't share
+    static state with the official run or count toward the score."""
+    extra: list[str] = []
+    for java_file in sorted(build_dir.glob("*.java")):
+        if java_file.name in official_names:
+            continue
+        text = java_file.read_text(encoding="utf-8", errors="ignore")
+        if JUNIT_IMPORT_RE.search(text):
+            extra.append(test_class_fqcn(java_file))
+    return extra
 
 
 def prepare_build_dir(
@@ -258,18 +296,45 @@ def compile_submission(build_dir: Path, junit_jar: Path, timeout: int) -> Compil
 TestRunResult = ProcResult
 
 
-def run_tests(classes_dir: Path, reports_dir: Path, junit_jar: Path, timeout: int) -> TestRunResult:
-    cmd = [
-        "java", "-jar", str(junit_jar),
-        "execute",
-        "--class-path", str(classes_dir),
-        "--scan-classpath", str(classes_dir),
-        "--reports-dir", str(reports_dir),
-        "--disable-banner",
-        "--disable-ansi-colors",
-        "--details=summary",
-    ]
-    return run_with_hard_timeout(cmd, timeout)
+def run_tests(
+    classes_dir: Path, reports_dir: Path, junit_jar: Path, timeout: int, test_classes: list[str]
+) -> TestRunResult:
+    """Run each official test class as its own JVM invocation (--select-class)
+    rather than one --scan-classpath call across everything compiled. This
+    matters because student code under test often keeps state in static
+    fields: a single shared JVM lets one test class's run leak state into the
+    next, including from a leftover test file a student never deleted from an
+    earlier week (it still gets compiled since student source is compiled
+    together, but is simply never selected/run here). Running each official
+    class fresh matches what a student sees running one test class at a time
+    in their IDE, and keeps every graded run's state isolated to just that
+    class - exactly the scope tests/rubric.json expects."""
+    stdout_parts = []
+    stderr_parts = []
+    for i, fqcn in enumerate(test_classes):
+        # The console launcher names report files by test ENGINE
+        # (TEST-junit-jupiter.xml), not by class, so every --select-class
+        # invocation here would overwrite the previous one's report if they
+        # shared a --reports-dir. Each call gets its own subdirectory instead;
+        # collect_test_results() walks all of them recursively.
+        class_reports_dir = reports_dir / str(i)
+        class_reports_dir.mkdir(exist_ok=True)
+        cmd = [
+            "java", "-jar", str(junit_jar),
+            "execute",
+            "--class-path", str(classes_dir),
+            "--select-class", fqcn,
+            "--reports-dir", str(class_reports_dir),
+            "--disable-banner",
+            "--disable-ansi-colors",
+            "--details=summary",
+        ]
+        result = run_with_hard_timeout(cmd, timeout)
+        stdout_parts.append(f"--- {fqcn} ---\n{result.stdout}")
+        stderr_parts.append(result.stderr)
+        if result.timed_out:
+            return ProcResult(True, None, "\n".join(stdout_parts), "\n".join(stderr_parts))
+    return ProcResult(False, 0, "\n".join(stdout_parts), "\n".join(stderr_parts))
 
 
 @dataclass
@@ -281,12 +346,13 @@ class TestCase:
 
 def collect_test_results(reports_dir: Path) -> list[TestCase]:
     """Parse every TEST-*.xml report the console launcher wrote (one per test
-    engine - unused engines just produce an empty <testsuite tests="0">) into
-    a flat list of per-test results. XML reports are used instead of the
-    printed text summary because they give per-test names/outcomes, which
-    the summary block doesn't - needed for rubric-weighted scoring."""
+    engine per --select-class run, each in its own subdirectory - see
+    run_tests) into a flat list of per-test results. XML reports are used
+    instead of the printed text summary because they give per-test
+    names/outcomes, which the summary block doesn't - needed for
+    rubric-weighted scoring."""
     results: list[TestCase] = []
-    for report_file in sorted(reports_dir.glob("TEST-*.xml")):
+    for report_file in sorted(reports_dir.rglob("TEST-*.xml")):
         tree = ET.parse(report_file)
         for testcase in tree.getroot().findall("testcase"):
             classname = testcase.get("classname", "").rsplit(".", 1)[-1]
@@ -320,6 +386,7 @@ def grade_student(
     student_files: list[Path],
     discovery_notes: list[str],
     test_files: list[Path],
+    test_classes: list[str],
     junit_jar: Path,
     build_root: Path,
     timeout: int,
@@ -335,6 +402,9 @@ def grade_student(
         "max_score": 0,
         "passed_tests": "",
         "failed_tests": "",
+        "extra_tests_passed": 0,
+        "extra_tests_total": 0,
+        "extra_failed_tests": "",
         "notes": "",
     }
     build_dir = None
@@ -353,7 +423,7 @@ def grade_student(
 
         reports_dir = build_dir / "reports"
         reports_dir.mkdir(exist_ok=True)
-        run_result = run_tests(compile_result.classes_dir, reports_dir, junit_jar, timeout)
+        run_result = run_tests(compile_result.classes_dir, reports_dir, junit_jar, timeout, test_classes)
         if run_result.timed_out:
             row["compiled"] = "yes"
             row["notes"] = "; ".join(prep_notes + [f"test run timed out after {timeout}s"]).strip("; ")
@@ -418,6 +488,37 @@ def grade_student(
                     + ", ".join(f"{c}.{m}" for c, m in sorted(extras_found))
                 )
 
+        # Leftover test classes from the student's own submission (e.g. an old
+        # TestCPTSMachine.java sitting next to this week's TestCPTSMachine2.java)
+        # are compiled but never --select-class'd above, so they never affect
+        # the official score. Still run them here - in their own isolated JVM
+        # per class, same as the official run - purely so their results are
+        # visible; never counted toward tests_passed/tests_total/score.
+        extra_test_classes = discover_extra_test_classes(build_dir, {f.name for f in test_files})
+        if extra_test_classes:
+            extra_reports_dir = build_dir / "reports_extra"
+            extra_reports_dir.mkdir(exist_ok=True)
+            extra_run_result = run_tests(
+                compile_result.classes_dir, extra_reports_dir, junit_jar, timeout, extra_test_classes
+            )
+            if extra_run_result.timed_out:
+                extra.append("extra student test file(s) timed out (not scored)")
+            else:
+                try:
+                    extra_cases = collect_test_results(extra_reports_dir)
+                except ET.ParseError:
+                    extra_cases = []
+                if extra_cases:
+                    extra_passed = [tc for tc in extra_cases if tc.status == "passed"]
+                    extra_failed = [tc for tc in extra_cases if tc.status == "failed"]
+                    row["extra_tests_passed"] = len(extra_passed)
+                    row["extra_tests_total"] = len(extra_cases)
+                    row["extra_failed_tests"] = "; ".join(f"{tc.classname}.{tc.method}" for tc in extra_failed)
+                    extra.append(
+                        f"{len(extra_passed)}/{len(extra_cases)} extra test(s) from student's own "
+                        f"leftover test file(s), run isolated (not scored)"
+                    )
+
         row["notes"] = "; ".join(prep_notes + extra).strip("; ")
         return row
 
@@ -442,7 +543,8 @@ def write_csv(rows: list[dict], out_path: Path) -> None:
     rows_sorted = sort_rows(rows)
     fieldnames = [
         "student_id", "compiled", "tests_passed", "tests_total", "score", "max_score",
-        "passed_tests", "failed_tests", "notes",
+        "passed_tests", "failed_tests", "extra_tests_passed", "extra_tests_total",
+        "extra_failed_tests", "notes",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -468,7 +570,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lib", default="lib")
     parser.add_argument("--out", default=str(Path("results") / "grades.csv"),
                          help="detailed CSV: student_id, compiled, tests_passed, tests_total, "
-                              "score, max_score, passed_tests, failed_tests, notes")
+                              "score, max_score, passed_tests, failed_tests, extra_tests_passed, "
+                              "extra_tests_total, extra_failed_tests, notes")
     parser.add_argument("--scores-out", default=str(Path("results") / "scores.csv"),
                          help="simple CSV: student_id, score (e.g. for gradebook upload)")
     parser.add_argument("--timeout", type=int, default=30)
@@ -495,6 +598,7 @@ def main() -> None:
 
     junit_jar = find_junit_jar(lib_dir)
     test_files = discover_test_files(tests_dir)
+    test_classes = [test_class_fqcn(tf) for tf in test_files]
     rubric = load_rubric(tests_dir)
 
     if build_root.exists():
@@ -533,7 +637,7 @@ def main() -> None:
     for i, (student_id, student_files, discovery_notes) in enumerate(submissions, start=1):
         build_key = str(i)
         row = grade_student(
-            student_id, build_key, student_files, discovery_notes, test_files,
+            student_id, build_key, student_files, discovery_notes, test_files, test_classes,
             junit_jar, build_root, args.timeout, args.keep_build, rubric
         )
         rows.append(row)
