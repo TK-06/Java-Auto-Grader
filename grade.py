@@ -5,9 +5,10 @@ Compiles each student submission together with the week's fixed JUnit tests,
 runs each official test class in its own isolated JVM invocation via the
 JUnit Platform Console Launcher, and writes one row per student to a CSV:
 student_id, compiled, tests_passed, tests_total, score, max_score,
-passed_tests, failed_tests, extra_tests_passed, extra_tests_total,
-extra_failed_tests, notes. Score is 1 point per passed test by default, or a
-weighted sum if tests/rubric.json is present. extra_* columns report any
+passed_tests, failed_tests, student_submitted_tests_passed,
+student_submitted_tests_total, student_submitted_failed_tests, notes. Score
+is 1 point per passed test by default, or a weighted sum if
+tests/rubric.json is present. student_submitted_* columns report any
 leftover JUnit test classes still in the student's submission (e.g. from an
 earlier week) - run isolated for visibility, never counted toward the score.
 """
@@ -402,9 +403,9 @@ def grade_student(
         "max_score": 0,
         "passed_tests": "",
         "failed_tests": "",
-        "extra_tests_passed": 0,
-        "extra_tests_total": 0,
-        "extra_failed_tests": "",
+        "student_submitted_tests_passed": 0,
+        "student_submitted_tests_total": 0,
+        "student_submitted_failed_tests": "",
         "notes": "",
     }
     build_dir = None
@@ -502,7 +503,7 @@ def grade_student(
                 compile_result.classes_dir, extra_reports_dir, junit_jar, timeout, extra_test_classes
             )
             if extra_run_result.timed_out:
-                extra.append("extra student test file(s) timed out (not scored)")
+                extra.append("student-submitted leftover test file(s) timed out (not scored)")
             else:
                 try:
                     extra_cases = collect_test_results(extra_reports_dir)
@@ -511,12 +512,14 @@ def grade_student(
                 if extra_cases:
                     extra_passed = [tc for tc in extra_cases if tc.status == "passed"]
                     extra_failed = [tc for tc in extra_cases if tc.status == "failed"]
-                    row["extra_tests_passed"] = len(extra_passed)
-                    row["extra_tests_total"] = len(extra_cases)
-                    row["extra_failed_tests"] = "; ".join(f"{tc.classname}.{tc.method}" for tc in extra_failed)
+                    row["student_submitted_tests_passed"] = len(extra_passed)
+                    row["student_submitted_tests_total"] = len(extra_cases)
+                    row["student_submitted_failed_tests"] = "; ".join(
+                        f"{tc.classname}.{tc.method}" for tc in extra_failed
+                    )
                     extra.append(
-                        f"{len(extra_passed)}/{len(extra_cases)} extra test(s) from student's own "
-                        f"leftover test file(s), run isolated (not scored)"
+                        f"{len(extra_passed)}/{len(extra_cases)} student-submitted leftover test(s) "
+                        f"found (not part of this week's rubric), run isolated (not scored)"
                     )
 
         row["notes"] = "; ".join(prep_notes + extra).strip("; ")
@@ -543,8 +546,8 @@ def write_csv(rows: list[dict], out_path: Path) -> None:
     rows_sorted = sort_rows(rows)
     fieldnames = [
         "student_id", "compiled", "tests_passed", "tests_total", "score", "max_score",
-        "passed_tests", "failed_tests", "extra_tests_passed", "extra_tests_total",
-        "extra_failed_tests", "notes",
+        "passed_tests", "failed_tests", "student_submitted_tests_passed",
+        "student_submitted_tests_total", "student_submitted_failed_tests", "notes",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -570,8 +573,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lib", default="lib")
     parser.add_argument("--out", default=str(Path("results") / "grades.csv"),
                          help="detailed CSV: student_id, compiled, tests_passed, tests_total, "
-                              "score, max_score, passed_tests, failed_tests, extra_tests_passed, "
-                              "extra_tests_total, extra_failed_tests, notes")
+                              "score, max_score, passed_tests, failed_tests, "
+                              "student_submitted_tests_passed, student_submitted_tests_total, "
+                              "student_submitted_failed_tests, notes")
     parser.add_argument("--scores-out", default=str(Path("results") / "scores.csv"),
                          help="simple CSV: student_id, score (e.g. for gradebook upload)")
     parser.add_argument("--timeout", type=int, default=30)
