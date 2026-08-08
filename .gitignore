@@ -2,6 +2,10 @@
 submissions/*
 !submissions/.gitkeep
 
+# this week's official test cases / rubric - course material, never commit these either
+tests/*
+!tests/.gitkeep
+
 build_tmp/
 results/*.csv
 lib/*.jar

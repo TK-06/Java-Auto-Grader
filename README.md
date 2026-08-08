@@ -76,15 +76,18 @@ this exclusion, that one irrelevant leftover file would fail the whole submissio
 compile, even though the actual assignment code is fine. Any student file that resolves to
 `Main.java` is skipped and noted in `notes`, exactly like a colliding test file.
 
-**Package declarations are stripped from student files before compiling** (and any
-now-dangling `import` referencing that package is stripped too). This grader assumes every
-class — student and official test alike — lives in one flat, unnamed package, since your
-`tests/*.java` files never declare one. Some IDEs (IntelliJ especially, when a project's
-source root isn't marked correctly — plain `main/java` folders instead of a configured
-`src` root) auto-insert a real `package main.java;` line into student files. Left in place,
-the student's classes would compile into that named package while the unnamed-package
-official test can't see them — `cannot find symbol`, even though the code is otherwise
-fine. Both the stripped package and any import cleaned up alongside it are noted in
+**A student's package declaration is stripped before compiling, but only if none of this
+week's official test files actually need it** (and if it's stripped, any now-dangling
+`import` of that package elsewhere in the submission is stripped too). Some weeks' official
+tests assume every class lives in one flat, unnamed package (no `package`/`import` at all);
+others explicitly `import application.CPTSMachine;`, meaning that package is a real project
+requirement. The grader checks what `tests/*.java` itself declares/imports before touching
+anything, so it never strips a package the official test still needs. This exists because
+some IDEs (IntelliJ especially, when a project's source root isn't marked correctly — plain
+`main/java` folders instead of a configured `src` root) auto-insert a real
+`package main.java;` line into student files that were never meant to have one, which
+otherwise causes `cannot find symbol` against an unnamed-package test even though the code
+is fine. Both the stripped package and any import cleaned up alongside it are noted in
 `notes`.
 
 ### 2b. (Optional) Weighted scoring — some test cases worth more than others
@@ -200,7 +203,7 @@ grading/                  <- repo root
     junit-platform-console-standalone-*.jar   <- you download this, not committed
     README.md
   submissions/             <- gitignored; this week's real student work goes here
-  tests/                   <- this week's official test file(s), tracked in git
+  tests/                   <- gitignored; this week's official test file(s) + rubric.json
   results/
     grades.csv              <- gitignored output
     scores.csv               <- gitignored output

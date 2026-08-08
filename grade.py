@@ -56,25 +56,46 @@ def resolve_java_filename(path: Path) -> str:
     return path.name
 
 
-def strip_package_declaration(text: str) -> tuple[str, str | None]:
-    """This grader assumes every student class and the official test files
-    it's compiled against share one flat, unnamed package (the official
-    tests/*.java files never declare a package - see test_class_fqcn). Some
-    IDEs (e.g. IntelliJ, when a project's source root isn't marked
-    correctly - plain "main/java" folders instead of a configured "src"
-    root) auto-insert a real `package main.java;` line into student files.
-    Left in place, javac compiles the student's classes into that named
-    package while the unnamed-package test file references them
-    unqualified, producing "cannot find symbol" even though the class is
-    right there. Stripping the declaration only removes a namespace label -
-    it doesn't change how the file's own types reference each other."""
+def strip_package_declaration(
+    text: str, keep_packages: set[str] | None = None
+) -> tuple[str, str | None]:
+    """Some weeks' official tests (e.g. Bot/Part) assume every student class
+    sits in the default, unnamed package. Other weeks' official tests
+    explicitly `import application.CPTSMachine;` etc., meaning THAT package
+    is required, not accidental. Blindly flattening every student package
+    broke the second case: a correctly-structured submission stopped
+    compiling because its own official test still imported the now-gone
+    package. So the caller must tell us which package names the official
+    tests actually reference (see collect_referenced_packages) - anything
+    in that set is left untouched. Only when a package is NOT referenced by
+    any official test is it safe to assume it's an IDE artifact (e.g.
+    IntelliJ inferring `package main.java;` from an unmarked "main/java"
+    source folder) rather than a real project requirement, and strip it so
+    the unnamed-package test can see the class unqualified."""
+    keep_packages = keep_packages or set()
     match = PACKAGE_RE.search(text)
-    if not match:
+    if not match or match.group(1) in keep_packages:
         return text, None
     return PACKAGE_RE.sub("", text, count=1), match.group(1)
 
 
 IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\.(?:\w+|\*)\s*;\s*\n?", re.MULTILINE)
+
+
+def collect_referenced_packages(test_files: list[Path]) -> set[str]:
+    """Package names the official test files themselves declare or import
+    from - see strip_package_declaration for why this matters. Reads each
+    test file's own package declaration (a test in `package logic;` needs
+    same-package access to a student's `logic` classes) plus every package
+    named in an `import pkg.Thing;` line."""
+    referenced: set[str] = set()
+    for tf in test_files:
+        text = tf.read_text(encoding="utf-8", errors="ignore")
+        pkg_match = PACKAGE_RE.search(text)
+        if pkg_match:
+            referenced.add(pkg_match.group(1))
+        referenced.update(m.group(1) for m in IMPORT_RE.finditer(text))
+    return referenced
 
 
 def strip_imports_of_packages(text: str, package_names: set[str]) -> str:
@@ -221,6 +242,7 @@ def prepare_build_dir(
     build_dir.mkdir(parents=True)
 
     test_names = {f.name for f in test_files}
+    referenced_packages = collect_referenced_packages(test_files)
     seen_names: set[str] = set()
     kept: list[tuple[str, str]] = []  # (dest_name, text)
     stripped_package_names: set[str] = set()
@@ -242,7 +264,7 @@ def prepare_build_dir(
             continue
         seen_names.add(dest_name)
         text = src.read_text(encoding="utf-8", errors="ignore")
-        text, package_name = strip_package_declaration(text)
+        text, package_name = strip_package_declaration(text, referenced_packages)
         if package_name:
             stripped_package_names.add(package_name)
             notes.append(
