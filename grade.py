@@ -258,6 +258,20 @@ def find_java_files(root: Path) -> list[Path]:
     return sorted(found)
 
 
+def find_nested_archives(root: Path) -> list[Path]:
+    """.zip/.jar files sitting inside an already-extracted submission - e.g.
+    a student who zipped up their built .jar instead of submitting it
+    directly, so the real project is one archive level deeper than a
+    normal submission. Only ever consulted as a fallback (see
+    discover_submissions) when the straightforward extraction turns up
+    zero .java files: a student's own bundled JUnit library jars
+    (lib/junit-jupiter-*.jar) are also .jar files sitting in the tree, and
+    blindly extracting those would be wasted work - a library ships only
+    .class files, never a student's own source, so it would never change
+    the answer for a submission that already has real .java files."""
+    return sorted(root.rglob("*.zip")) + sorted(root.rglob("*.jar"))
+
+
 def discover_submissions(
     submissions_dir: Path, extract_root: Path
 ) -> list[tuple[str, list[Path], list[str]]]:
@@ -298,7 +312,23 @@ def discover_submissions(
                 results.append((student_id, [], [f"could not extract {entry.name}: {exc}"]))
                 continue
             java_files = find_java_files(extract_dir)
-            notes = [] if java_files else [f"{entry.name} extracted OK but contained no .java files"]
+            notes: list[str] = []
+            if not java_files:
+                for nested in find_nested_archives(extract_dir):
+                    try:
+                        with zipfile.ZipFile(nested) as nzf:
+                            nzf.extractall(extract_dir)
+                    except (zipfile.BadZipFile, OSError):
+                        continue
+                    java_files = find_java_files(extract_dir)
+                    if java_files:
+                        notes.append(
+                            f"{entry.name} contained no .java files directly - found them inside "
+                            f"a nested archive ({nested.relative_to(extract_dir)}) and extracted that too"
+                        )
+                        break
+            if not java_files:
+                notes.append(f"{entry.name} extracted OK but contained no .java files")
             results.append((student_id, java_files, notes))
     return results
 
