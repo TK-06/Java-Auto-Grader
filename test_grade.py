@@ -1,18 +1,27 @@
+import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from grade import (
+    RMTREE_RETRY_ATTEMPTS,
     CompileResult,
+    bare_student_id,
+    check_structure_baseline,
     collect_test_results,
     compile_submission_with_fallback,
+    find_java_files,
     find_junit_jar,
     grade_student,
+    load_structure_baseline,
     prepare_build_dir,
     rewrite_imports_of_renamed_packages,
+    rmtree_with_retry,
     strip_imports_of_packages,
     strip_package_declaration,
+    write_scores_csv,
 )
 
 
@@ -387,6 +396,91 @@ class TestCompileSubmissionWithFallback(unittest.TestCase):
             mock_compile.assert_called_once()
 
 
+class TestLoadStructureBaseline(unittest.TestCase):
+    def test_returns_none_when_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(load_structure_baseline(Path(tmp)))
+
+    def test_parses_a_valid_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "structure.json").write_text(
+                json.dumps({"required_classes": ["Station", "Ticket", "CPTSMachine"]}),
+                encoding="utf-8",
+            )
+
+            result = load_structure_baseline(tests_dir)
+
+            self.assertEqual(result, ["Station", "Ticket", "CPTSMachine"])
+
+    def test_exits_loudly_on_a_malformed_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "structure.json").write_text(
+                json.dumps({"required_classes": "Station"}), encoding="utf-8"
+            )
+
+            with self.assertRaises(SystemExit):
+                load_structure_baseline(tests_dir)
+
+
+class TestCheckStructureBaseline(unittest.TestCase):
+    def test_no_violations_when_everything_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Station.java").write_text("public class Station {}\n", encoding="utf-8")
+            (build_dir / "Ticket.java").write_text("public class Ticket {}\n", encoding="utf-8")
+            (build_dir / "TestStation2.java").write_text("public class TestStation2 {}\n", encoding="utf-8")
+
+            violations = check_structure_baseline(
+                build_dir, official_names={"TestStation2.java"}, required_classes=["Station", "Ticket"]
+            )
+
+            self.assertEqual(violations, [])
+
+    def test_reports_a_missing_required_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Station.java").write_text("public class Station {}\n", encoding="utf-8")
+
+            violations = check_structure_baseline(
+                build_dir, official_names=set(), required_classes=["Station", "Ticket"]
+            )
+
+            self.assertEqual(len(violations), 1)
+            self.assertIn("missing required class Ticket", violations[0])
+
+    def test_extra_classes_are_never_flagged(self):
+        # Mental model: if we swapped in the official test file on the
+        # student's own machine, would it still work? An unused extra
+        # class - or a leftover test file from a prior week - doesn't
+        # break that, so neither is a violation.
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Station.java").write_text("public class Station {}\n", encoding="utf-8")
+            (build_dir / "Helper.java").write_text("public class Helper {}\n", encoding="utf-8")
+            (build_dir / "TestStation.java").write_text(
+                "import org.junit.jupiter.api.Test;\npublic class TestStation {}\n", encoding="utf-8"
+            )
+
+            violations = check_structure_baseline(
+                build_dir, official_names=set(), required_classes=["Station"]
+            )
+
+            self.assertEqual(violations, [])
+
+    def test_reports_multiple_missing_classes_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Helper.java").write_text("public class Helper {}\n", encoding="utf-8")
+
+            violations = check_structure_baseline(
+                build_dir, official_names=set(), required_classes=["Station", "Ticket"]
+            )
+
+            self.assertEqual(len(violations), 2)
+
+
 class TestGradeStudentPreservesFailedBuilds(unittest.TestCase):
     def _junit_jar(self) -> Path:
         return find_junit_jar(Path(__file__).resolve().parent / "lib")
@@ -406,7 +500,7 @@ class TestGradeStudentPreservesFailedBuilds(unittest.TestCase):
 
             row = grade_student(
                 "12345678", "1", [bad_file], [], [], [], junit_jar, build_root,
-                30, False, None, failed_build_root,
+                30, False, None, None, failed_build_root,
             )
 
             self.assertEqual(row["compiled"], "no")
@@ -430,11 +524,161 @@ class TestGradeStudentPreservesFailedBuilds(unittest.TestCase):
 
             row = grade_student(
                 "87654321", "1", [good_file], [], [], [], junit_jar, build_root,
-                30, False, None, failed_build_root,
+                30, False, None, None, failed_build_root,
             )
 
             self.assertEqual(row["compiled"], "yes")
             self.assertEqual(list(failed_build_root.iterdir()), [])
+
+
+class TestGradeStudentStructureBaseline(unittest.TestCase):
+    def test_missing_required_class_is_rejected_before_compiling(self):
+        # junit_jar is never touched on this path - the structure check
+        # returns before compile_submission_with_fallback is ever called.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_dir = tmp_path / "src"
+            src_dir.mkdir()
+            station_file = src_dir / "Station.java"
+            station_file.write_text("public class Station {}\n", encoding="utf-8")
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "11112222", "1", [station_file], [], [], [], Path("unused.jar"), build_root,
+                30, False, None, ["Station", "Ticket"], failed_build_root,
+            )
+
+            self.assertEqual(row["compiled"], "no")
+            self.assertIn("STRUCTURE ERROR", row["notes"])
+            self.assertIn("missing required class Ticket", row["notes"])
+            audit_dir = failed_build_root / "11112222__1"
+            self.assertTrue(audit_dir.exists())
+            self.assertTrue((audit_dir / "Station.java").exists())
+
+    def test_matching_structure_proceeds_to_compile(self):
+        junit_jar = find_junit_jar(Path(__file__).resolve().parent / "lib")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_dir = tmp_path / "src"
+            src_dir.mkdir()
+            station_file = src_dir / "Station.java"
+            station_file.write_text("public class Station {}\n", encoding="utf-8")
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "33334444", "1", [station_file], [], [], [], junit_jar, build_root,
+                30, False, None, ["Station"], failed_build_root,
+            )
+
+            self.assertEqual(row["compiled"], "yes")
+            self.assertEqual(list(failed_build_root.iterdir()), [])
+
+
+class TestFindJavaFiles(unittest.TestCase):
+    def test_skips_known_build_and_ide_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "Station.java").write_text("public class Station {}\n", encoding="utf-8")
+            for skip_dir in ("out", "target", "bin", "build", ".git", ".idea", ".vscode", ".settings"):
+                d = root / skip_dir
+                d.mkdir()
+                (d / "Leftover.java").write_text("public class Leftover {}\n", encoding="utf-8")
+
+            found = find_java_files(root)
+
+            self.assertEqual({f.name for f in found}, {"Station.java"})
+
+    def test_walks_normally_named_nested_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "src" / "logic"
+            nested.mkdir(parents=True)
+            (nested / "Station.java").write_text("public class Station {}\n", encoding="utf-8")
+
+            found = find_java_files(root)
+
+            self.assertEqual([f.name for f in found], ["Station.java"])
+
+
+class TestRmtreeWithRetry(unittest.TestCase):
+    def test_removes_a_normal_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "victim"
+            target.mkdir()
+            (target / "file.txt").write_text("x", encoding="utf-8")
+
+            rmtree_with_retry(target)
+
+            self.assertFalse(target.exists())
+
+    def test_retries_past_a_transient_lock_then_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "victim"
+            target.mkdir()
+
+            real_rmtree = shutil.rmtree
+            attempts = {"n": 0}
+
+            def flaky_rmtree(path, *args, **kwargs):
+                attempts["n"] += 1
+                if attempts["n"] < 3:
+                    raise PermissionError("simulated transient lock")
+                real_rmtree(path, *args, **kwargs)
+
+            with mock.patch("grade.shutil.rmtree", side_effect=flaky_rmtree), \
+                 mock.patch("grade.time.sleep") as mock_sleep:
+                rmtree_with_retry(target)
+
+            self.assertEqual(attempts["n"], 3)
+            self.assertEqual(mock_sleep.call_count, 2)
+            self.assertFalse(target.exists())
+
+    def test_exits_loudly_when_the_lock_never_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "victim"
+            target.mkdir()
+
+            with mock.patch("grade.shutil.rmtree", side_effect=PermissionError("stuck")), \
+                 mock.patch("grade.time.sleep") as mock_sleep:
+                with self.assertRaises(SystemExit):
+                    rmtree_with_retry(target)
+
+            self.assertEqual(mock_sleep.call_count, RMTREE_RETRY_ATTEMPTS - 1)
+
+
+class TestBareStudentId(unittest.TestCase):
+    def test_strips_a_week_question_tag(self):
+        self.assertEqual(bare_student_id("6638002421_w1_q1"), "6638002421")
+
+    def test_leaves_a_plain_numeric_id_unchanged(self):
+        self.assertEqual(bare_student_id("6638002421"), "6638002421")
+
+    def test_falls_back_to_the_original_when_it_does_not_start_with_digits(self):
+        self.assertEqual(bare_student_id("some_weird_name"), "some_weird_name")
+
+
+class TestWriteScoresCsv(unittest.TestCase):
+    def test_writes_bare_ids_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "mcvScore.csv"
+            rows = [
+                {"student_id": "6638002421_w1_q1", "score": 14.0},
+                {"student_id": "6638030021_w1_q1", "score": 0},
+            ]
+
+            write_scores_csv(rows, out_path)
+
+            content = out_path.read_text(encoding="utf-8")
+            self.assertIn("6638002421,14.0", content)
+            self.assertIn("6638030021,0", content)
+            self.assertNotIn("_w1_q1", content)
 
 
 if __name__ == "__main__":

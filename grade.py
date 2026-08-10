@@ -16,7 +16,11 @@ any leftover JUnit test classes still in the student's submission (e.g. from
 an earlier week) - run isolated for visibility, never counted toward the
 score. A submission that fails to compile has its extracted+flattened build
 directory preserved under results/failed_builds/<student_id>__<n>/ for
-manual review, regardless of --keep-build.
+manual review, regardless of --keep-build. If tests/structure.json is
+present ({"required_classes": [...]}), a submission missing one of those
+classes is rejected before compiling ("STRUCTURE ERROR" in notes), the
+same way a compile error is - extra classes beyond what's required are
+never flagged.
 """
 import argparse
 import csv
@@ -27,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter
@@ -36,13 +41,42 @@ from pathlib import Path
 BUILD_ROOT = Path("build_tmp")
 OUTPUT_TRUNCATE_CHARS = 2000
 OUTPUT_TRUNCATE_LINES = 40
+RMTREE_RETRY_ATTEMPTS = 5
+RMTREE_RETRY_DELAY_SECONDS = 2.0
 
 PUBLIC_TYPE_RE = re.compile(
     r"public\s+(?:final\s+|abstract\s+)?(?:class|interface|enum|record)\s+(\w+)"
 )
 METHOD_NAME_RE = re.compile(r"^\w+")
 PACKAGE_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
+STUDENT_ID_RE = re.compile(r"^\d+")
 JUNIT_IMPORT_RE = re.compile(r"^\s*import\s+org\.junit\b", re.MULTILINE)
+
+
+def rmtree_with_retry(path: Path) -> None:
+    """shutil.rmtree, but tolerant of a file still being transiently locked
+    by something outside our control - a cloud-sync client (OneDrive,
+    Dropbox) hashing/uploading a file the instant after it's created is the
+    common case if this project lives inside a synced folder, but Windows
+    Search indexing or antivirus real-time scanning can do the same thing.
+    That lock is normally released within a second or two on its own, so
+    retrying briefly turns a hard crash into (at worst) a few seconds of
+    waiting - only a lock that's still held after every retry becomes a
+    real, reported error."""
+    last_exc: OSError | None = None
+    for attempt in range(RMTREE_RETRY_ATTEMPTS):
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt < RMTREE_RETRY_ATTEMPTS - 1:
+                time.sleep(RMTREE_RETRY_DELAY_SECONDS)
+    sys.exit(
+        f"ERROR: could not remove {path} after {RMTREE_RETRY_ATTEMPTS} attempts ({last_exc}). "
+        f"Something still has a file inside it open - close any editor/terminal browsing that "
+        f"folder, let antivirus/cloud-sync settle, and try again."
+    )
 
 
 def resolve_java_filename(path: Path) -> str:
@@ -202,12 +236,34 @@ def find_junit_jar(lib_dir: Path) -> Path:
     )
 
 
+SKIP_DIR_NAMES = {"out", "target", "bin", "build", ".git", ".idea", ".vscode", ".settings"}
+
+
+def find_java_files(root: Path) -> list[Path]:
+    """Like root.rglob("*.java"), but never descends into a directory whose
+    name is a known build-output or IDE-metadata folder (out, target, bin,
+    build, .git, .idea, .vscode, .settings). A build-artifact folder's
+    .class files are already invisible to a *.java glob, but the walk
+    itself doesn't otherwise know to stay out of one - and a student's
+    export sometimes bundles one in (an IntelliJ out/, a stray .git),
+    along with whatever else. Nothing under one of these was ever part of
+    what the student actually wrote, so it's excluded before anything else
+    even sees it - not just ignored by extension."""
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES]
+        for name in filenames:
+            if name.endswith(".java"):
+                found.append(Path(dirpath) / name)
+    return sorted(found)
+
+
 def discover_submissions(
     submissions_dir: Path, extract_root: Path
 ) -> list[tuple[str, list[Path], list[str]]]:
     """Each result is (student_id, java_files, notes). A submission may be:
-    - a folder (e.g. an unzipped Eclipse project - any nesting under it, .class/.classpath/
-      bin/ etc. are simply ignored since only *.java is globbed)
+    - a folder (e.g. an unzipped Eclipse project - any nesting under it is scanned via
+      find_java_files, which both filters to *.java and skips known build/IDE folders)
     - a single loose .java file
     - a .zip or .jar file (a JAR is just a ZIP file with a manifest, so the same extraction
       works for both - e.g. an Eclipse project exported as a zip, or exported as a runnable
@@ -220,7 +276,7 @@ def discover_submissions(
     results: list[tuple[str, list[Path], list[str]]] = []
     for idx, entry in enumerate(sorted(submissions_dir.iterdir())):
         if entry.is_dir():
-            java_files = sorted(entry.rglob("*.java"))
+            java_files = find_java_files(entry)
             results.append((entry.name, java_files, []))
         elif entry.is_file() and entry.suffix == ".java":
             results.append((entry.stem, [entry], []))
@@ -228,7 +284,7 @@ def discover_submissions(
             student_id = entry.stem
             extract_dir = extract_root / str(idx)
             if extract_dir.exists():
-                shutil.rmtree(extract_dir)
+                rmtree_with_retry(extract_dir)
             extract_dir.mkdir(parents=True)
             try:
                 with zipfile.ZipFile(entry) as zf:
@@ -241,7 +297,7 @@ def discover_submissions(
                 # nested entry inside the archive - must not crash the whole batch.
                 results.append((student_id, [], [f"could not extract {entry.name}: {exc}"]))
                 continue
-            java_files = sorted(extract_dir.rglob("*.java"))
+            java_files = find_java_files(extract_dir)
             notes = [] if java_files else [f"{entry.name} extracted OK but contained no .java files"]
             results.append((student_id, java_files, notes))
     return results
@@ -301,7 +357,7 @@ def prepare_build_dir(
     notes: list[str] = []
     build_dir = build_root / build_key
     if build_dir.exists():
-        shutil.rmtree(build_dir)
+        rmtree_with_retry(build_dir)
     build_dir.mkdir(parents=True)
 
     test_names = {f.name for f in test_files}
@@ -601,6 +657,58 @@ def load_rubric(tests_dir: Path) -> dict[str, dict[str, float]] | None:
         return json.load(f)
 
 
+def load_structure_baseline(tests_dir: Path) -> list[str] | None:
+    """Optional tests/structure.json: {"required_classes": ["Station", ...]}.
+    When present, every submission must define exactly these top-level
+    classes - and no unexpected extras, see check_structure_baseline -
+    before it's even compiled. Absent by default so weeks without one
+    behave exactly as before. Malformed (not just absent) fails loudly at
+    startup rather than as a silent per-student side effect, the same way
+    a misconfigured lib/ directory already does (see find_junit_jar) - a
+    broken config for the whole run should never be discovered one student
+    at a time."""
+    structure_path = tests_dir / "structure.json"
+    if not structure_path.exists():
+        return None
+    with open(structure_path, encoding="utf-8") as f:
+        data = json.load(f)
+    required = data.get("required_classes")
+    if not isinstance(required, list) or not all(isinstance(c, str) for c in required):
+        sys.exit(
+            f'ERROR: {structure_path} must contain a "required_classes" list of class '
+            f'name strings, e.g. {{"required_classes": ["Station", "Ticket"]}}.'
+        )
+    return required
+
+
+def check_structure_baseline(
+    build_dir: Path, official_names: set[str], required_classes: list[str]
+) -> list[str]:
+    """Compares the submission's flattened, normalized file set (see
+    prepare_build_dir - Main.java already excluded, packages already
+    resolved to their canonical names) against tests/structure.json's
+    required_classes. Meant to run BEFORE compiling, so a submission
+    missing a required class gets one specific, readable reason instead of
+    a wall of downstream "cannot find symbol" errors from every file that
+    referenced it.
+
+    Only checks for MISSING required classes, not extra ones: the mental
+    model is "if we swapped in the official test file on the student's own
+    machine, would it work" - an extra class sitting unused alongside the
+    required ones doesn't break that, so it isn't a violation. (A name
+    COLLISION with an official test file is already handled earlier, in
+    prepare_build_dir.) Returns a list of violation messages, empty if
+    every required class is present."""
+    present_classes = {
+        f.stem for f in build_dir.glob("*.java") if f.name not in official_names
+    }
+    return [
+        f"missing required class {name} (expected {name}.java)"
+        for name in required_classes
+        if name not in present_classes
+    ]
+
+
 def grade_student(
     student_id: str,
     build_key: str,
@@ -613,6 +721,7 @@ def grade_student(
     timeout: int,
     keep_build: bool,
     rubric: dict[str, dict[str, float]] | None,
+    required_classes: list[str] | None,
     failed_build_root: Path | None = None,
 ) -> dict:
     row = {
@@ -641,6 +750,15 @@ def grade_student(
         prep_notes = discovery_notes + prep_notes
 
         official_names = {f.name for f in test_files}
+
+        if required_classes is not None:
+            violations = check_structure_baseline(build_dir, official_names, required_classes)
+            if violations:
+                row["notes"] = "; ".join(
+                    prep_notes + [f"STRUCTURE ERROR: {v}" for v in violations]
+                ).strip("; ")
+                return row
+
         compile_result, fallback_notes = compile_submission_with_fallback(
             build_dir, junit_jar, timeout, official_names
         )
@@ -802,15 +920,28 @@ def write_csv(rows: list[dict], out_path: Path) -> None:
         writer.writerows(rows_sorted)
 
 
+def bare_student_id(student_id: str) -> str:
+    """Just the numeric ID, stripping any trailing tag a submission's own
+    filename carried (e.g. "6638002421_w1_q1" -> "6638002421", from a
+    <id>_w1_q1.jar submission). grades.csv keeps the full original ID for
+    traceability back to the exact submitted file; the gradebook-upload
+    CSV needs the bare ID to match LMS records. Falls back to the ID
+    unchanged if it doesn't start with digits at all, rather than guessing."""
+    match = STUDENT_ID_RE.match(student_id)
+    return match.group(0) if match else student_id
+
+
 def write_scores_csv(rows: list[dict], out_path: Path) -> None:
-    """Simple 2-column CSV (student_id, score) for gradebook upload."""
+    """Simple 2-column CSV (student_id, score) for gradebook upload -
+    student_id here is always the bare numeric ID (see bare_student_id),
+    regardless of what a submission's own filename was tagged with."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rows_sorted = sort_rows(rows)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["student_id", "score"])
         for row in rows_sorted:
-            writer.writerow([row["student_id"], row["score"]])
+            writer.writerow([bare_student_id(row["student_id"]), row["score"]])
 
 
 def parse_args() -> argparse.Namespace:
@@ -824,8 +955,9 @@ def parse_args() -> argparse.Namespace:
                               "student_submitted_tests_passed, student_submitted_tests_total, "
                               "student_submitted_failed_tests, student_submitted_failure_details, "
                               "notes")
-    parser.add_argument("--scores-out", default=str(Path("results") / "scores.csv"),
-                         help="simple CSV: student_id, score (e.g. for gradebook upload)")
+    parser.add_argument("--scores-out", default=str(Path("results") / "mcvScore.csv"),
+                         help="simple CSV: student_id, score (bare numeric ID - e.g. for "
+                              "MyCourseVille gradebook upload)")
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--keep-build", action="store_true")
     return parser.parse_args()
@@ -853,15 +985,16 @@ def main() -> None:
     test_files = discover_test_files(tests_dir)
     test_classes = [test_class_fqcn(tf) for tf in test_files]
     rubric = load_rubric(tests_dir)
+    required_classes = load_structure_baseline(tests_dir)
 
     if build_root.exists():
-        shutil.rmtree(build_root)
+        rmtree_with_retry(build_root)
     build_root.mkdir(parents=True)
     extract_root = build_root / "_extracted"
     extract_root.mkdir(parents=True)
 
     if failed_build_root.exists():
-        shutil.rmtree(failed_build_root)
+        rmtree_with_retry(failed_build_root)
     failed_build_root.mkdir(parents=True)
 
     submissions = discover_submissions(submissions_dir, extract_root)
@@ -888,6 +1021,10 @@ def main() -> None:
         print(f"  rubric:      {tests_dir / 'rubric.json'}  (weighted, {rubric_total:g} points total)")
     else:
         print("  rubric:      none (tests/rubric.json not found - scoring 1 point per test)")
+    if required_classes is not None:
+        print(f"  structure:   {tests_dir / 'structure.json'}  (required classes: {', '.join(required_classes)})")
+    else:
+        print("  structure:   none (tests/structure.json not found - no structure check)")
 
     rows = []
     total = len(submissions)
@@ -895,11 +1032,17 @@ def main() -> None:
         build_key = str(i)
         row = grade_student(
             student_id, build_key, student_files, discovery_notes, test_files, test_classes,
-            junit_jar, build_root, args.timeout, args.keep_build, rubric, failed_build_root
+            junit_jar, build_root, args.timeout, args.keep_build, rubric, required_classes,
+            failed_build_root,
         )
         rows.append(row)
         if row["compiled"] == "no":
-            status = "COMPILE ERROR" if "COMPILE ERROR" in row["notes"] else "NO SOURCE FILES"
+            if "STRUCTURE ERROR" in row["notes"]:
+                status = "STRUCTURE ERROR"
+            elif "COMPILE ERROR" in row["notes"]:
+                status = "COMPILE ERROR"
+            else:
+                status = "NO SOURCE FILES"
             print(f"[{i}/{total}] {student_id}: {status} (score {row['score']})")
         else:
             print(
