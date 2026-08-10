@@ -17,8 +17,8 @@ For every student submission, it:
 4. Runs the tests with the JUnit Console Launcher and parses its XML reports (not just the
    printed summary), so it knows the pass/fail result of every individual test method.
 5. Writes one row per student to `results/grades.csv` (detailed, including which named
-   tests passed/failed) and `results/scores.csv` (just `student_id,score` for quick
-   gradebook upload).
+   tests passed/failed) and `results/mcvScore.csv` (just `student_id,score`, ID stripped
+   down to the bare number, for quick MyCourseVille gradebook upload).
 
 **Score = number of tests passed** by default (not a percentage) — `max_score` is recorded
 alongside it in `grades.csv` so you can see what it was out of. A submission that doesn't
@@ -145,6 +145,36 @@ place:
 **No `tests/rubric.json`?** Nothing changes — `score` stays the flat "1 point per passed
 test" count exactly as before. This is entirely opt-in, per week.
 
+### 2c. (Optional) Required project structure
+
+Compiling against the official tests already catches a wrong method signature — that
+fails compilation with a real, specific error, so there's no separate check for it here.
+What it *doesn't* catch is a submission missing one of the classes the assignment actually
+requires entirely (e.g. no `Station.java` at all): that fails with a wall of `cannot find
+symbol` errors from every file that referenced it, instead of one specific reason. If you
+want that caught explicitly, create `tests/structure.json`:
+
+```json
+{
+    "required_classes": ["CPTSMachine", "Station", "Ticket"]
+}
+```
+
+Just class names — not filenames, not signatures. By the time this check runs, every
+student file has already been resolved to its real public type name regardless of what it
+was originally called on disk, so "is there a class named `Station`" and "is there a file
+named `Station.java`" are the same question.
+
+This only checks for *missing* required classes, not extra ones — the mental model is "if
+we swapped in the official test file on the student's own machine, would it still work,"
+and an extra class sitting unused alongside the required ones doesn't break that. With
+this in place, a submission missing one or more required classes is rejected *before*
+compiling — `compiled` is `no` and `notes` starts with `STRUCTURE ERROR:`, listing every
+missing class, not just the first.
+
+**No `tests/structure.json`?** Nothing changes — no structure check runs, exactly as
+before. Entirely opt-in, per week.
+
 ### 3. Run it
 
 ```
@@ -152,7 +182,8 @@ python grade.py
 ```
 
 Progress prints as it goes; when it's done, check `results/grades.csv` (detailed, with
-a `notes` column explaining any 0 score) and `results/scores.csv` (just IDs and scores).
+a `notes` column explaining any 0 score) and `results/mcvScore.csv` (just bare IDs and
+scores, ready for MyCourseVille).
 
 ### Useful flags
 
@@ -162,7 +193,7 @@ python grade.py \
   --tests tests \
   --lib lib \
   --out results/grades.csv \
-  --scores-out results/scores.csv \
+  --scores-out results/mcvScore.csv \
   --timeout 30 \
   --keep-build   # don't delete build_tmp/, useful for debugging a student's compile error
 ```
@@ -215,7 +246,7 @@ grading/                  <- repo root
   tests/                   <- gitignored; this week's official test file(s) + rubric.json
   results/
     grades.csv              <- gitignored output
-    scores.csv               <- gitignored output
+    mcvScore.csv             <- gitignored output, bare student IDs for MyCourseVille
   build_tmp/               <- gitignored scratch space, created/cleaned automatically
 ```
 
