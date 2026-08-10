@@ -5,12 +5,18 @@ Compiles each student submission together with the week's fixed JUnit tests,
 runs each official test class in its own isolated JVM invocation via the
 JUnit Platform Console Launcher, and writes one row per student to a CSV:
 student_id, compiled, tests_passed, tests_total, score, max_score,
-passed_tests, failed_tests, student_submitted_tests_passed,
-student_submitted_tests_total, student_submitted_failed_tests, notes. Score
-is 1 point per passed test by default, or a weighted sum if
-tests/rubric.json is present. student_submitted_* columns report any
-leftover JUnit test classes still in the student's submission (e.g. from an
-earlier week) - run isolated for visibility, never counted toward the score.
+passed_tests, failed_tests, failure_details, student_submitted_tests_passed,
+student_submitted_tests_total, student_submitted_failed_tests,
+student_submitted_failure_details, notes. Score is 1 point per passed test by
+default, or a weighted sum if tests/rubric.json is present. failure_details
+carries the JUnit assertion message for each failed test (e.g. "expected:
+<0> but was: <-1>"), so a failure can be understood straight from the CSV
+instead of re-reading the test's source. student_submitted_* columns report
+any leftover JUnit test classes still in the student's submission (e.g. from
+an earlier week) - run isolated for visibility, never counted toward the
+score. A submission that fails to compile has its extracted+flattened build
+directory preserved under results/failed_builds/<student_id>__<n>/ for
+manual review, regardless of --keep-build.
 """
 import argparse
 import csv
@@ -58,7 +64,7 @@ def resolve_java_filename(path: Path) -> str:
 
 def strip_package_declaration(
     text: str, keep_packages: set[str] | None = None
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None]:
     """Some weeks' official tests (e.g. Bot/Part) assume every student class
     sits in the default, unnamed package. Other weeks' official tests
     explicitly `import application.CPTSMachine;` etc., meaning THAT package
@@ -67,16 +73,43 @@ def strip_package_declaration(
     compiling because its own official test still imported the now-gone
     package. So the caller must tell us which package names the official
     tests actually reference (see collect_referenced_packages) - anything
-    in that set is left untouched. Only when a package is NOT referenced by
-    any official test is it safe to assume it's an IDE artifact (e.g.
-    IntelliJ inferring `package main.java;` from an unmarked "main/java"
-    source folder) rather than a real project requirement, and strip it so
-    the unnamed-package test can see the class unqualified."""
+    in that set is left untouched.
+
+    A declared package that ISN'T an exact match may still be a required one
+    sitting under an extra prefix - e.g. an IDE inferring
+    `Q1_toStudent.application` from a source-root folder literally named
+    after the assignment, when the official tests require exactly
+    `application`. Deleting the declaration in that case still leaves
+    `import application.Foo;` (in the official tests, or in a leftover
+    student test file written against the same required package) unable to
+    resolve, so instead the declaration is rewritten down to the canonical
+    required name. Only when a package matches NO required package, even as
+    a suffix, is it safe to assume it's a pure IDE artifact (e.g. IntelliJ
+    inferring `package main.java;` from an unmarked "main/java" source
+    folder) rather than a real project requirement, and stripped entirely so
+    the unnamed-package test can see the class unqualified.
+
+    Returns (possibly-modified text, the declared package name if it was
+    acted on at all, the canonical name it was rewritten to - or None if it
+    was stripped to the unnamed package instead of rewritten)."""
     keep_packages = keep_packages or set()
     match = PACKAGE_RE.search(text)
-    if not match or match.group(1) in keep_packages:
-        return text, None
-    return PACKAGE_RE.sub("", text, count=1), match.group(1)
+    if not match:
+        return text, None, None
+    declared = match.group(1)
+    if declared in keep_packages:
+        return text, None, None
+
+    canonical = max(
+        (kp for kp in keep_packages if declared.endswith("." + kp)),
+        key=len,
+        default=None,
+    )
+    if canonical is not None:
+        new_text = PACKAGE_RE.sub(f"package {canonical};", text, count=1)
+        return new_text, declared, canonical
+
+    return PACKAGE_RE.sub("", text, count=1), declared, None
 
 
 IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\.(?:\w+|\*)\s*;\s*\n?", re.MULTILINE)
@@ -114,6 +147,27 @@ def strip_imports_of_packages(text: str, package_names: set[str]) -> str:
         return "" if match.group(1) in package_names else match.group(0)
 
     return IMPORT_RE.sub(_drop, text)
+
+
+def rewrite_imports_of_renamed_packages(text: str, renamed_packages: dict[str, str]) -> str:
+    """Companion to strip_imports_of_packages for the other outcome of
+    strip_package_declaration: a package that was rewritten down to its
+    canonical required name (e.g. `Q1_toStudent.logic` -> `logic`) still
+    exists as a real, named package - unlike the fully-stripped case, a
+    sibling file's `import Q1_toStudent.logic.Station;` can't just be
+    dropped (that would assume unnamed-package visibility, which no longer
+    applies); it must be rewritten to `import logic.Station;` instead."""
+    if not renamed_packages:
+        return text
+
+    def _rename(match: re.Match) -> str:
+        old_pkg = match.group(1)
+        new_pkg = renamed_packages.get(old_pkg)
+        if new_pkg is None:
+            return match.group(0)
+        return match.group(0).replace(f"{old_pkg}.", f"{new_pkg}.", 1)
+
+    return IMPORT_RE.sub(_rename, text)
 
 
 def truncate(text: str) -> str:
@@ -214,22 +268,31 @@ def test_class_fqcn(path: Path) -> str:
     return class_name
 
 
-def discover_extra_test_classes(build_dir: Path, official_names: set[str]) -> list[str]:
-    """A student's submission sometimes still contains their OWN JUnit test
-    class from a prior week (e.g. a leftover TestCPTSMachine.java sitting
-    next to this week's official TestCPTSMachine2.java). It's still compiled
-    (student source is compiled together) but isn't one of the official
-    tests/ files, so it's found here by content (a JUnit import) rather than
-    by filename, and run separately - see run_tests - so it can't share
-    static state with the official run or count toward the score."""
-    extra: list[str] = []
+def find_extra_test_files(build_dir: Path, official_names: set[str]) -> list[Path]:
+    """.java files sitting directly in build_dir that aren't one of the
+    official tests/ files but do import JUnit - i.e. a student's own
+    leftover test class from a prior week (e.g. TestCPTSMachine.java sitting
+    next to this week's official TestCPTSMachine2.java). Detected by content
+    rather than filename, since there's no naming convention to rely on.
+    Works on source text alone, so it can run either before compiling (to
+    decide what to exclude on a fallback compile - see
+    compile_submission_with_fallback) or after (see
+    discover_extra_test_classes, run separately from the official tests so
+    it can't share static state with them or count toward the score)."""
+    extra: list[Path] = []
     for java_file in sorted(build_dir.glob("*.java")):
         if java_file.name in official_names:
             continue
         text = java_file.read_text(encoding="utf-8", errors="ignore")
         if JUNIT_IMPORT_RE.search(text):
-            extra.append(test_class_fqcn(java_file))
+            extra.append(java_file)
     return extra
+
+
+def discover_extra_test_classes(build_dir: Path, official_names: set[str]) -> list[str]:
+    """FQCNs of find_extra_test_files, for --select-class - see that
+    function for what counts as an "extra" test class and why."""
+    return [test_class_fqcn(f) for f in find_extra_test_files(build_dir, official_names)]
 
 
 def prepare_build_dir(
@@ -246,6 +309,7 @@ def prepare_build_dir(
     seen_names: set[str] = set()
     kept: list[tuple[str, str]] = []  # (dest_name, text)
     stripped_package_names: set[str] = set()
+    renamed_package_names: dict[str, str] = {}
     for src in student_files:
         dest_name = resolve_java_filename(src)
         if dest_name == "Main.java":
@@ -264,23 +328,32 @@ def prepare_build_dir(
             continue
         seen_names.add(dest_name)
         text = src.read_text(encoding="utf-8", errors="ignore")
-        text, package_name = strip_package_declaration(text, referenced_packages)
-        if package_name:
-            stripped_package_names.add(package_name)
+        text, declared_package, rewritten_to = strip_package_declaration(text, referenced_packages)
+        if declared_package and rewritten_to:
+            renamed_package_names[declared_package] = rewritten_to
             notes.append(
-                f"stripped package declaration '{package_name}' from {src.name} "
+                f"rewrote package declaration '{declared_package}' to '{rewritten_to}' in {src.name} "
+                f"(nested under an extra prefix, but the official tests require exactly '{rewritten_to}')"
+            )
+        elif declared_package:
+            stripped_package_names.add(declared_package)
+            notes.append(
+                f"stripped package declaration '{declared_package}' from {src.name} "
                 f"(this grader compiles everything in the unnamed package)"
             )
         kept.append((dest_name, text))
 
-    # Second pass: now that every kept file's OWN package has been stripped
-    # (collected above), remove any `import <thatpackage>.Foo;` line - even
-    # in files whose own package was different or absent - since those
-    # packages no longer exist in the flattened build. Must run after the
-    # first pass: a file can't know which packages are being flattened
-    # submission-wide until every other file has been read.
+    # Second pass: now that every kept file's OWN package has been resolved
+    # (collected above), fix up `import <thatpackage>.Foo;` lines elsewhere -
+    # even in files whose own package was different or absent - to match:
+    # drop the import for a package that's now unnamed (stripped_package_names),
+    # or rewrite it to the canonical name for a package that just moved
+    # (renamed_package_names). Must run after the first pass: a file can't
+    # know how other packages in the submission were resolved until every
+    # other file has been read.
     for dest_name, text in kept:
         text = strip_imports_of_packages(text, stripped_package_names)
+        text = rewrite_imports_of_renamed_packages(text, renamed_package_names)
         (build_dir / dest_name).write_text(text, encoding="utf-8")
 
     for tf in test_files:
@@ -375,6 +448,56 @@ def compile_submission(build_dir: Path, junit_jar: Path, timeout: int) -> Compil
     return CompileResult(True, classes_dir)
 
 
+def compile_submission_with_fallback(
+    build_dir: Path, junit_jar: Path, timeout: int, official_names: set[str]
+) -> tuple[CompileResult, list[str]]:
+    """Try the normal full compile first. If it fails AND the submission
+    contains leftover, never-scored student test file(s) (see
+    find_extra_test_files - e.g. a prior week's TestCPTSMachine.java sitting
+    next to this week's official TestCPTSMachine2.java), retry once with
+    just those files excluded. Every student .java file is compiled together
+    in one javac invocation, so today a single broken leftover test class -
+    which was never going to count toward the score anyway - can zero out an
+    otherwise fully-working submission. Main.java is already excluded from
+    grading for the same class of reason (see prepare_build_dir); this
+    extends the same idea to leftover test files, but only as a recovery
+    path: if excluding them does NOT make the submission compile, the
+    ORIGINAL compile error is reported, not the retry's - excluding files is
+    for recovering a submission, never for hiding a real compile error in
+    the student's actual code or the official tests."""
+    notes: list[str] = []
+    compile_result = compile_submission(build_dir, junit_jar, timeout)
+    if compile_result.success:
+        return compile_result, notes
+
+    extra_files = find_extra_test_files(build_dir, official_names)
+    if not extra_files:
+        return compile_result, notes
+
+    original_error = compile_result.output
+    excluded_dir = build_dir / "_excluded_extra"
+    excluded_dir.mkdir(exist_ok=True)
+    for f in extra_files:
+        shutil.move(str(f), str(excluded_dir / f.name))
+
+    retry_result = compile_submission(build_dir, junit_jar, timeout)
+    if retry_result.success:
+        names = ", ".join(f.name for f in extra_files)
+        notes.append(
+            f"excluded student's leftover test file(s) {names} (failed to compile on "
+            f"their own and aren't part of this week's rubric) so the official tests "
+            f"could still run; original compile error before exclusion: {original_error}"
+        )
+        return retry_result, notes
+
+    # Excluding them didn't help - something else is actually broken, so put
+    # the files back (for --keep-build inspection) and report the ORIGINAL
+    # error rather than the retry's.
+    for f in extra_files:
+        shutil.move(str(excluded_dir / f.name), str(f))
+    return compile_result, notes
+
+
 TestRunResult = ProcResult
 
 
@@ -424,6 +547,7 @@ class TestCase:
     classname: str  # simple name, package prefix stripped (e.g. "TestStation2")
     method: str      # trailing "()"/params stripped (e.g. "testSetName")
     status: str       # "passed" | "failed" | "skipped"
+    detail: str = ""  # failed/errored only: e.g. "expected: <0> but was: <-1>"
 
 
 def collect_test_results(reports_dir: Path) -> list[TestCase]:
@@ -432,7 +556,15 @@ def collect_test_results(reports_dir: Path) -> list[TestCase]:
     run_tests) into a flat list of per-test results. XML reports are used
     instead of the printed text summary because they give per-test
     names/outcomes, which the summary block doesn't - needed for
-    rubric-weighted scoring."""
+    rubric-weighted scoring.
+
+    For a failed/errored test, the <failure>/<error> element's own `message`
+    attribute (JUnit's assertion library fills this with e.g. "expected:
+    <0> but was: <-1>") is captured as `detail` - this is the one piece of
+    the console launcher's output that actually says WHY a test failed, as
+    opposed to just which one did. Falls back to the first line of the
+    exception's stack trace when a message attribute isn't present (e.g. an
+    exception thrown without one)."""
     results: list[TestCase] = []
     for report_file in sorted(reports_dir.rglob("TEST-*.xml")):
         tree = ET.parse(report_file)
@@ -440,13 +572,20 @@ def collect_test_results(reports_dir: Path) -> list[TestCase]:
             classname = testcase.get("classname", "").rsplit(".", 1)[-1]
             method_match = METHOD_NAME_RE.match(testcase.get("name", ""))
             method = method_match.group(0) if method_match else testcase.get("name", "")
+            failure = testcase.find("failure")
+            if failure is None:
+                failure = testcase.find("error")
+            detail = ""
             if testcase.find("skipped") is not None:
                 status = "skipped"
-            elif testcase.find("failure") is not None or testcase.find("error") is not None:
+            elif failure is not None:
                 status = "failed"
+                detail = failure.get("message") or ""
+                if not detail and failure.text:
+                    detail = failure.text.strip().splitlines()[0]
             else:
                 status = "passed"
-            results.append(TestCase(classname, method, status))
+            results.append(TestCase(classname, method, status, detail))
     return results
 
 
@@ -474,6 +613,7 @@ def grade_student(
     timeout: int,
     keep_build: bool,
     rubric: dict[str, dict[str, float]] | None,
+    failed_build_root: Path | None = None,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -484,9 +624,11 @@ def grade_student(
         "max_score": 0,
         "passed_tests": "",
         "failed_tests": "",
+        "failure_details": "",
         "student_submitted_tests_passed": 0,
         "student_submitted_tests_total": 0,
         "student_submitted_failed_tests": "",
+        "student_submitted_failure_details": "",
         "notes": "",
     }
     build_dir = None
@@ -498,7 +640,11 @@ def grade_student(
         build_dir, prep_notes = prepare_build_dir(build_key, student_files, test_files, build_root)
         prep_notes = discovery_notes + prep_notes
 
-        compile_result = compile_submission(build_dir, junit_jar, timeout)
+        official_names = {f.name for f in test_files}
+        compile_result, fallback_notes = compile_submission_with_fallback(
+            build_dir, junit_jar, timeout, official_names
+        )
+        prep_notes = prep_notes + fallback_notes
         if not compile_result.success:
             row["notes"] = "; ".join(prep_notes + [f"COMPILE ERROR: {compile_result.output}"]).strip("; ")
             return row
@@ -535,6 +681,9 @@ def grade_student(
         row["tests_total"] = len(passed) + len(failed)
         row["passed_tests"] = "; ".join(f"{tc.classname}.{tc.method}" for tc in passed)
         row["failed_tests"] = "; ".join(f"{tc.classname}.{tc.method}" for tc in failed)
+        row["failure_details"] = "; ".join(
+            f"{tc.classname}.{tc.method}: {tc.detail}" for tc in failed if tc.detail
+        )
 
         extra = []
         if skipped:
@@ -598,6 +747,9 @@ def grade_student(
                     row["student_submitted_failed_tests"] = "; ".join(
                         f"{tc.classname}.{tc.method}" for tc in extra_failed
                     )
+                    row["student_submitted_failure_details"] = "; ".join(
+                        f"{tc.classname}.{tc.method}: {tc.detail}" for tc in extra_failed if tc.detail
+                    )
                     extra.append(
                         f"{len(extra_passed)}/{len(extra_cases)} student-submitted leftover test(s) "
                         f"found (not part of this week's rubric), run isolated (not scored)"
@@ -610,8 +762,21 @@ def grade_student(
         row["notes"] = f"UNEXPECTED ERROR: {exc!r}"
         return row
     finally:
-        if build_dir is not None and build_dir.exists() and not keep_build:
-            shutil.rmtree(build_dir, ignore_errors=True)
+        if build_dir is not None and build_dir.exists():
+            if row["compiled"] == "no" and failed_build_root is not None:
+                # Preserved regardless of --keep-build: submissions/ is
+                # typically cleared out shortly after grading (privacy,
+                # disk space), which is exactly when a TA is most likely to
+                # want to open the actual file that failed to compile. Keyed
+                # by build_key too, not just student_id, so two submissions
+                # that resolve to the same student_id (see the duplicate-id
+                # warning in main()) don't overwrite each other's copy.
+                audit_dir = failed_build_root / f"{student_id}__{build_key}"
+                if audit_dir.exists():
+                    shutil.rmtree(audit_dir, ignore_errors=True)
+                shutil.copytree(build_dir, audit_dir)
+            if not keep_build:
+                shutil.rmtree(build_dir, ignore_errors=True)
 
 
 def sort_rows(rows: list[dict]) -> list[dict]:
@@ -627,8 +792,9 @@ def write_csv(rows: list[dict], out_path: Path) -> None:
     rows_sorted = sort_rows(rows)
     fieldnames = [
         "student_id", "compiled", "tests_passed", "tests_total", "score", "max_score",
-        "passed_tests", "failed_tests", "student_submitted_tests_passed",
-        "student_submitted_tests_total", "student_submitted_failed_tests", "notes",
+        "passed_tests", "failed_tests", "failure_details", "student_submitted_tests_passed",
+        "student_submitted_tests_total", "student_submitted_failed_tests",
+        "student_submitted_failure_details", "notes",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -654,9 +820,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lib", default="lib")
     parser.add_argument("--out", default=str(Path("results") / "grades.csv"),
                          help="detailed CSV: student_id, compiled, tests_passed, tests_total, "
-                              "score, max_score, passed_tests, failed_tests, "
+                              "score, max_score, passed_tests, failed_tests, failure_details, "
                               "student_submitted_tests_passed, student_submitted_tests_total, "
-                              "student_submitted_failed_tests, notes")
+                              "student_submitted_failed_tests, student_submitted_failure_details, "
+                              "notes")
     parser.add_argument("--scores-out", default=str(Path("results") / "scores.csv"),
                          help="simple CSV: student_id, score (e.g. for gradebook upload)")
     parser.add_argument("--timeout", type=int, default=30)
@@ -673,6 +840,7 @@ def main() -> None:
     out_path = Path(args.out).resolve()
     scores_out_path = Path(args.scores_out).resolve()
     build_root = BUILD_ROOT.resolve()
+    failed_build_root = out_path.parent / "failed_builds"
 
     if shutil.which("javac") is None:
         sys.exit("ERROR: javac not found on PATH. Install a JDK (not just a JRE).")
@@ -691,6 +859,10 @@ def main() -> None:
     build_root.mkdir(parents=True)
     extract_root = build_root / "_extracted"
     extract_root.mkdir(parents=True)
+
+    if failed_build_root.exists():
+        shutil.rmtree(failed_build_root)
+    failed_build_root.mkdir(parents=True)
 
     submissions = discover_submissions(submissions_dir, extract_root)
     if not submissions:
@@ -723,7 +895,7 @@ def main() -> None:
         build_key = str(i)
         row = grade_student(
             student_id, build_key, student_files, discovery_notes, test_files, test_classes,
-            junit_jar, build_root, args.timeout, args.keep_build, rubric
+            junit_jar, build_root, args.timeout, args.keep_build, rubric, failed_build_root
         )
         rows.append(row)
         if row["compiled"] == "no":
@@ -754,6 +926,9 @@ def main() -> None:
         f"  compiled: {compiled_count}/{len(rows)}   average score: {avg_score:.2f}   "
         f"0-tests-found: {zero_tests}   timeouts: {timeouts}"
     )
+    failed_count = len(rows) - compiled_count
+    if failed_count:
+        print(f"  {failed_count} submission(s) failed to compile - build dir(s) saved under {failed_build_root}")
 
 
 if __name__ == "__main__":

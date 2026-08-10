@@ -90,6 +90,15 @@ otherwise causes `cannot find symbol` against an unnamed-package test even thoug
 is fine. Both the stripped package and any import cleaned up alongside it are noted in
 `notes`.
 
+If a package is required (like `application` above) but a student's declaration is that
+name *plus an extra prefix* — e.g. `Q1_toStudent.application`, because their IDE inferred
+the package from a source-root folder literally named after the assignment — the grader
+rewrites it down to the required name instead of stripping it, and rewrites any sibling
+file's `import Q1_toStudent.application.Foo;` to match. Deleting it outright would leave
+the official test's own `import application.CPTSMachine;` unable to resolve. This is noted
+in `notes` as "rewrote package declaration ... (nested under an extra prefix ...)", distinct
+from a plain strip.
+
 ### 2b. (Optional) Weighted scoring — some test cases worth more than others
 
 By default every passing test is worth 1 point. If your rubric gives different test cases

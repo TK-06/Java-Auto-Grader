@@ -8,6 +8,11 @@ tests/*
 
 build_tmp/
 results/*.csv
+# extracted student code from failed-to-compile submissions (see grade_student
+# in grade.py) - same privacy category as submissions/, never commit it
+results/failed_builds/
 lib/*.jar
 __pycache__/
 *.pyc
+
+.claude/
