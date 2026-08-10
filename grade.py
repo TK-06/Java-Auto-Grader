@@ -932,14 +932,14 @@ def bare_student_id(student_id: str) -> str:
 
 
 def write_scores_csv(rows: list[dict], out_path: Path) -> None:
-    """Simple 2-column CSV (student_id, score) for gradebook upload -
-    student_id here is always the bare numeric ID (see bare_student_id),
-    regardless of what a submission's own filename was tagged with."""
+    """Simple 2-column CSV (student_id, score), no header row - MyCourseVille's
+    gradebook import reads this directly and doesn't expect one. student_id
+    here is always the bare numeric ID (see bare_student_id), regardless of
+    what a submission's own filename was tagged with."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rows_sorted = sort_rows(rows)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["student_id", "score"])
         for row in rows_sorted:
             writer.writerow([bare_student_id(row["student_id"]), row["score"]])
 
@@ -956,8 +956,8 @@ def parse_args() -> argparse.Namespace:
                               "student_submitted_failed_tests, student_submitted_failure_details, "
                               "notes")
     parser.add_argument("--scores-out", default=str(Path("results") / "mcvScore.csv"),
-                         help="simple CSV: student_id, score (bare numeric ID - e.g. for "
-                              "MyCourseVille gradebook upload)")
+                         help="simple CSV, no header row: student_id, score (bare numeric ID) "
+                              "- for MyCourseVille gradebook upload")
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--keep-build", action="store_true")
     return parser.parse_args()

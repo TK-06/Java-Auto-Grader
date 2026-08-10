@@ -17,8 +17,8 @@ For every student submission, it:
 4. Runs the tests with the JUnit Console Launcher and parses its XML reports (not just the
    printed summary), so it knows the pass/fail result of every individual test method.
 5. Writes one row per student to `results/grades.csv` (detailed, including which named
-   tests passed/failed) and `results/mcvScore.csv` (just `student_id,score`, ID stripped
-   down to the bare number, for quick MyCourseVille gradebook upload).
+   tests passed/failed) and `results/mcvScore.csv` (no header row, just `student_id,score`
+   per line, ID stripped down to the bare number, for quick MyCourseVille gradebook upload).
 
 **Score = number of tests passed** by default (not a percentage) — `max_score` is recorded
 alongside it in `grades.csv` so you can see what it was out of. A submission that doesn't
