@@ -28,6 +28,11 @@ at all - and it wouldn't have.
 - Make the check opt-in per week, authored the same way `tests/rubric.json`
   already is: a TA hands a future Claude session that week's assignment
   materials, and the config gets written from that.
+- Never treat a normal IDE/build-output folder (e.g. IntelliJ's `out/`) as
+  suspicious. A folder submission is walked recursively for `.java` files
+  today (`discover_submissions`); a build-artifact folder that happened to
+  contain a stray `.java` (or a `.git`/`.idea`/`target` folder bundled into
+  an export) would currently get pulled into the build right along with it.
 
 ## Non-goals
 
@@ -46,6 +51,27 @@ at all - and it wouldn't have.
   not computed from starter/reference code.
 
 ## Design
+
+### Discovery skips known build/IDE folders
+
+`discover_submissions` walks with `rglob("*.java")` in two places: directly
+on a folder submission, and on `extract_dir` after unzipping a `.zip`/`.jar`
+submission - either way it currently descends into every subfolder no
+matter its name. `.class` files are already invisible (only `*.java` is
+globbed), which is why a plain `out/` full of compiled classes is already
+harmless today - but the walk itself doesn't know to stay out of it, or out
+of other conventional non-source folders a student's export might contain
+(`.git`, `.idea`, `.vscode`, `.settings`, `target`, `bin`, `build`). Every
+real submission this term is a `.jar` (see `submissions/`), so the
+post-extraction path is the one that matters most in practice - both need
+the fix, not just the plain-folder case.
+
+Fix: skip recursing into directories whose name matches a small, fixed
+denylist, applied at both `rglob` call sites. This is generic and
+unconditional - it applies to every week's grading, not just weeks that opt
+into `structure.json`, and needs no configuration. It's a pure narrowing of
+what already gets collected; a submission with no such folders behaves
+exactly as before.
 
 ### Config: `tests/structure.json` (optional)
 
@@ -120,6 +146,10 @@ threaded through from `main()` the same way `rubric` already is.
 
 ## Testing
 
+- `discover_submissions`: a folder submission containing an `out/` (or
+  `.git`/`.idea`/`target`/etc.) subfolder with a stray `.java` file inside
+  does NOT include that file in the discovered submission; a legitimately
+  nested source folder with a normal name is still walked as before.
 - `load_structure_baseline`: absent file returns `None`; a valid file
   parses correctly; a malformed file exits with a clear error.
 - `check_structure_baseline`: all-required-present-and-nothing-else returns
