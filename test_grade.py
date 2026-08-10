@@ -680,6 +680,17 @@ class TestWriteScoresCsv(unittest.TestCase):
             self.assertIn("6638030021,0", content)
             self.assertNotIn("_w1_q1", content)
 
+    def test_has_no_header_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "mcvScore.csv"
+            rows = [{"student_id": "6638002421_w1_q1", "score": 14.0}]
+
+            write_scores_csv(rows, out_path)
+
+            lines = out_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], "6638002421,14.0")
+            self.assertNotIn("student_id", lines[0])
+
 
 if __name__ == "__main__":
     unittest.main()
