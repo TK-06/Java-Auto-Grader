@@ -2,6 +2,7 @@ import json
 import shutil
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -12,8 +13,10 @@ from grade import (
     check_structure_baseline,
     collect_test_results,
     compile_submission_with_fallback,
+    discover_submissions,
     find_java_files,
     find_junit_jar,
+    find_nested_archives,
     grade_student,
     load_structure_baseline,
     prepare_build_dir,
@@ -690,6 +693,94 @@ class TestWriteScoresCsv(unittest.TestCase):
             lines = out_path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(lines[0], "6638002421,14.0")
             self.assertNotIn("student_id", lines[0])
+
+
+class TestFindNestedArchives(unittest.TestCase):
+    def test_finds_zip_and_jar_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "inner.jar").write_bytes(b"")
+            (root / "sub").mkdir()
+            (root / "sub" / "inner2.zip").write_bytes(b"")
+            (root / "Notes.txt").write_text("x", encoding="utf-8")
+
+            found = find_nested_archives(root)
+
+            self.assertEqual({f.name for f in found}, {"inner.jar", "inner2.zip"})
+
+    def test_empty_when_no_archives_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Item.java").write_text("public class Item {}\n", encoding="utf-8")
+
+            self.assertEqual(find_nested_archives(root), [])
+
+
+class TestDiscoverSubmissionsNestedArchive(unittest.TestCase):
+    def test_recovers_java_files_from_a_zip_wrapping_a_jar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+
+            inner_jar_path = tmp_path / "inner.jar"
+            with zipfile.ZipFile(inner_jar_path, "w") as inner_zf:
+                inner_zf.writestr("logic/Item.java", "package logic;\npublic class Item {}\n")
+
+            outer_path = submissions_dir / "12345678_w1_q2.zip"
+            with zipfile.ZipFile(outer_path, "w") as outer_zf:
+                outer_zf.write(inner_jar_path, "12345678_Q2W1.jar")
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            self.assertEqual(len(submissions), 1)
+            student_id, java_files, notes = submissions[0]
+            self.assertEqual(student_id, "12345678_w1_q2")
+            self.assertEqual([f.name for f in java_files], ["Item.java"])
+            self.assertTrue(any("nested archive" in n for n in notes), notes)
+
+    def test_does_not_touch_a_submission_that_already_has_real_java_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+
+            outer_path = submissions_dir / "87654321_w1_q2.jar"
+            with zipfile.ZipFile(outer_path, "w") as outer_zf:
+                outer_zf.writestr("logic/Item.java", "package logic;\npublic class Item {}\n")
+                # a bundled "library jar" that isn't actually a valid zip - the fallback
+                # must never even be attempted here, since real .java files are already found
+                outer_zf.writestr("lib/junit-jupiter-api-5.14.0.jar", b"not a real jar, just bytes")
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            self.assertEqual(len(submissions), 1)
+            student_id, java_files, notes = submissions[0]
+            self.assertEqual([f.name for f in java_files], ["Item.java"])
+            self.assertEqual(notes, [])
+
+    def test_still_reports_no_java_files_when_nested_archives_dont_help(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+
+            outer_path = submissions_dir / "11112222_w1_q2.zip"
+            with zipfile.ZipFile(outer_path, "w") as outer_zf:
+                outer_zf.writestr("README.txt", "no java here\n")
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            self.assertEqual(len(submissions), 1)
+            student_id, java_files, notes = submissions[0]
+            self.assertEqual(java_files, [])
+            self.assertTrue(any("contained no .java files" in n for n in notes), notes)
 
 
 if __name__ == "__main__":
