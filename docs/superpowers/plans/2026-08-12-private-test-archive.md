@@ -4,15 +4,15 @@
 
 **Goal:** Stand up a private GitHub repo that archives each week+question's official tests, `rubric.json`, and `structure.json`, with two scripts to move content between it and the public grading repo's `tests/` working copy.
 
-**Architecture:** A brand-new, standalone private repo (`TK-06/Java-Auto-Grader-Tests`), cloned locally as a sibling of `grading/` (never nested inside it). Two plain bash scripts inside that repo (`archive-week.sh`, `restore-week.sh`) do a one-way `cp` + (for archive) `git commit`/`push` between `grading/tests/` and `<archive>/weekNN/qN/`. No submodule, no CI, no automatic syncing — every transfer is a deliberate, manually-run command.
+**Architecture:** A brand-new, standalone private repo (`TK-06/TA-test-grading-setup`), cloned locally as a sibling of `grading/` (never nested inside it). Two plain bash scripts inside that repo (`archive-week.sh`, `restore-week.sh`) do a one-way `cp` + (for archive) `git commit`/`push` between `grading/tests/` and `<archive>/weekNN/qN/`. No submodule, no CI, no automatic syncing — every transfer is a deliberate, manually-run command.
 
 **Tech Stack:** `gh` CLI (repo creation), `git`, POSIX `bash` (Git Bash on this machine) — no new runtime dependency, nothing added to `grade.py` or its Python test suite.
 
 ## Global Constraints
 
-- Repo name: `Java-Auto-Grader-Tests`, owner `TK-06`, visibility **private**.
+- Repo name: `TA-test-grading-setup`, owner `TK-06`, visibility **private**.
 - Local clone path: sibling of `grading/`, i.e.
-  `C:\Users\Palan\OneDrive\Documents\computer_programming\Projects\J_Unit_Auto_Grader\grading-tests`
+  `C:\Users\Palan\OneDrive\Documents\computer_programming\Projects\J_Unit_Auto_Grader\TA-test-grading-setup`
   — never a subfolder of `grading/`.
 - Archive layout is flat by week+question:
   `weekNN/qN/{tests/*.java, rubric.json, structure.json}` — no per-term duplication; git history is how a week's content across terms is inspected.
@@ -22,38 +22,45 @@
 
 ---
 
-### Task 1: Create the private archive repo and scaffold it
+### Task 1: Scaffold the (already-created) private archive repo
+
+The repo already exists — the user created `TK-06/TA-test-grading-setup` directly on
+GitHub and handed us the URL. Confirmed via `gh repo view TK-06/TA-test-grading-setup`:
+`isPrivate: true`, `defaultBranchRef.name: ""` (empty, no commits yet). So this task
+skips repo creation and starts from cloning it.
 
 **Files:**
-- Create (new repo root): `Java-Auto-Grader-Tests/README.md`
-- Create (new repo root): `Java-Auto-Grader-Tests/.gitattributes`
+- Create (new repo root): `TA-test-grading-setup/README.md`
+- Create (new repo root): `TA-test-grading-setup/.gitattributes`
 
 **Interfaces:**
-- Produces: a private GitHub repo `TK-06/Java-Auto-Grader-Tests`, cloned locally at
-  `C:\Users\Palan\OneDrive\Documents\computer_programming\Projects\J_Unit_Auto_Grader\grading-tests`
+- Produces: the private GitHub repo `TK-06/TA-test-grading-setup` (pre-existing),
+  cloned locally at
+  `C:\Users\Palan\OneDrive\Documents\computer_programming\Projects\J_Unit_Auto_Grader\TA-test-grading-setup`
   — this exact path is what Tasks 2–4 assume as `$SCRIPT_DIR`'s parent.
 
-- [ ] **Step 1: Create the private repo on GitHub**
+- [ ] **Step 1: Confirm the repo is private before cloning anything into it**
 
 Run:
 ```
-gh repo create TK-06/Java-Auto-Grader-Tests --private --description "Private archive of official weekly tests/rubrics for TK-06/Java-Auto-Grader (never merge into the public repo)"
+gh repo view TK-06/TA-test-grading-setup --json isPrivate,visibility
 ```
-Expected: prints the new repo's URL (`https://github.com/TK-06/Java-Auto-Grader-Tests`), exit code 0.
+Expected: `"isPrivate":true,"visibility":"PRIVATE"`. If this ever comes back `false`/`"PUBLIC"`,
+stop — do not put any test/rubric content anywhere near it until it's confirmed private again.
 
 - [ ] **Step 2: Clone it locally as a sibling of `grading/`**
 
 Run:
 ```
-git clone https://github.com/TK-06/Java-Auto-Grader-Tests.git "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests"
+git clone https://github.com/TK-06/TA-test-grading-setup.git "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup"
 ```
 Expected: "warning: You appear to have cloned an empty repository" (fine — nothing pushed yet), and the directory exists.
 
-Verify: `ls "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/"` shows both `grading` and `grading-tests` as siblings.
+Verify: `ls "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/"` shows both `grading` and `TA-test-grading-setup` as siblings.
 
 - [ ] **Step 3: Add `.gitattributes` forcing LF line endings for the shell scripts**
 
-File: `C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests/.gitattributes`
+File: `C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup/.gitattributes`
 ```
 *.sh text eol=lf
 ```
@@ -61,9 +68,9 @@ This matters because Tasks 2–3 write `#!/usr/bin/env bash` scripts on a Window
 
 - [ ] **Step 4: Add the repo README documenting the layout and script usage**
 
-File: `C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests/README.md`
+File: `C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup/README.md`
 ```markdown
-# Java-Auto-Grader-Tests
+# TA-test-grading-setup
 
 Private archive of each week's official JUnit tests, `rubric.json`, and
 `structure.json` for the Data Structures auto-grader
@@ -85,7 +92,7 @@ across terms rather than duplicating folders per term.
 ## Usage
 
 Assumes this repo is cloned as a sibling folder of `grading/` (i.e.
-`../grading-tests` relative to `grading/`'s own parent folder):
+`../TA-test-grading-setup` relative to `grading/`'s own parent folder):
 
     ./restore-week.sh week01 q1   # archive -> grading/tests/
     ./archive-week.sh week01 q1   # grading/tests/ -> archive, commit, push
@@ -95,14 +102,14 @@ it isn't a sibling folder literally named `grading`.
 
 ## Adding another TA
 
-`gh repo add-collaborator TK-06/Java-Auto-Grader-Tests <username>`, or
+`gh repo add-collaborator TK-06/TA-test-grading-setup <username>`, or
 GitHub → repo → Settings → Collaborators.
 ```
 
 - [ ] **Step 5: Commit and push the scaffold**
 
 ```bash
-cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests"
+cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup"
 git add README.md .gitattributes
 git commit -m "scaffold: repo layout and usage docs"
 git push -u origin main
@@ -114,7 +121,7 @@ Expected: push succeeds (this is the first commit, so it also sets `main` as the
 ### Task 2: `archive-week.sh` — copy `grading/tests/` into the archive, commit, push
 
 **Files:**
-- Create: `grading-tests/archive-week.sh`
+- Create: `TA-test-grading-setup/archive-week.sh`
 
 **Interfaces:**
 - Consumes: nothing from another task's code (reads `grading/tests/*.java`, `rubric.json`, `structure.json` directly off disk).
@@ -122,7 +129,7 @@ Expected: push succeeds (this is the first commit, so it also sets `main` as the
 
 - [ ] **Step 1: Write the script**
 
-File: `C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests/archive-week.sh`
+File: `C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup/archive-week.sh`
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -176,14 +183,14 @@ echo "archived $WEEK/$Q and pushed"
 - [ ] **Step 2: Make it executable**
 
 ```bash
-chmod +x "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests/archive-week.sh"
+chmod +x "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup/archive-week.sh"
 ```
 
 - [ ] **Step 3: Verify the failure case — missing `tests/` dir**
 
 Run:
 ```bash
-cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests"
+cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup"
 ./archive-week.sh week99 q9 /nonexistent-path
 ```
 Expected: exits non-zero, prints `error: tests/ dir not found at /nonexistent-path/tests ...` to stderr.
@@ -203,7 +210,7 @@ Expected: exits non-zero, prints `error: no .java files found directly in /tmp/e
 
 Run:
 ```bash
-cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests"
+cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup"
 ./archive-week.sh week01 q1
 ```
 Expected: prints `archived week01/q1 and pushed`, exit 0.
@@ -235,7 +242,7 @@ git push
 ### Task 3: `restore-week.sh` — copy the archive into `grading/tests/`
 
 **Files:**
-- Create: `grading-tests/restore-week.sh`
+- Create: `TA-test-grading-setup/restore-week.sh`
 
 **Interfaces:**
 - Consumes: the `weekNN/qN/` layout `archive-week.sh` (Task 2) produces — `tests/*.java`, `rubric.json`, optional `structure.json`.
@@ -243,7 +250,7 @@ git push
 
 - [ ] **Step 1: Write the script**
 
-File: `C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests/restore-week.sh`
+File: `C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup/restore-week.sh`
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -283,14 +290,14 @@ echo "restored $WEEK/$Q into $DEST"
 - [ ] **Step 2: Make it executable**
 
 ```bash
-chmod +x "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests/restore-week.sh"
+chmod +x "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup/restore-week.sh"
 ```
 
 - [ ] **Step 3: Verify the failure case — week not archived**
 
 Run:
 ```bash
-cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests"
+cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup"
 ./restore-week.sh week99 q9
 ```
 Expected: exits non-zero, prints `error: no archived setup at .../week99/q9`.
@@ -321,7 +328,7 @@ Expected: `StaleLeftover.java` is gone — only this week's files remain, matchi
 - [ ] **Step 6: Commit the script**
 
 ```bash
-cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/grading-tests"
+cd "C:/Users/Palan/OneDrive/Documents/computer_programming/Projects/J_Unit_Auto_Grader/TA-test-grading-setup"
 git add restore-week.sh
 git commit -m "add restore-week.sh"
 git push
@@ -335,7 +342,7 @@ git push
 - Modify: `grading/.claude/commands/setup-week.md`
 
 **Interfaces:**
-- Consumes: `restore-week.sh <weekNN> <qN>` / `archive-week.sh <weekNN> <qN>` exactly as defined in Tasks 2–3 (same working directory assumption: archive repo cloned as sibling `../grading-tests` of `grading/`'s parent).
+- Consumes: `restore-week.sh <weekNN> <qN>` / `archive-week.sh <weekNN> <qN>` exactly as defined in Tasks 2–3 (same working directory assumption: archive repo cloned as sibling `../TA-test-grading-setup` of `grading/`'s parent).
 
 - [ ] **Step 1: Add a "check the archive first" step before today's step 1, and a reminder at the end**
 
@@ -353,13 +360,13 @@ New:
 Follow these steps:
 
 0. **Check the private archive first.** If
-   `../grading-tests/weekNN/qN/` exists (a sibling folder of this repo's own
-   parent, e.g. `../grading-tests/week01/q1/` for Week 1 Q1 — ask the user
+   `../TA-test-grading-setup/weekNN/qN/` exists (a sibling folder of this repo's own
+   parent, e.g. `../TA-test-grading-setup/week01/q1/` for Week 1 Q1 — ask the user
    for the week/question number if it's not obvious from the lab folder
    path) — this exact week+question was graded in a past term. Run
-   `../grading-tests/restore-week.sh weekNN qN` and skip straight to step 6
+   `../TA-test-grading-setup/restore-week.sh weekNN qN` and skip straight to step 6
    (report back) — no docx parsing needed. If that folder doesn't exist, or
-   `../grading-tests/` itself doesn't exist, proceed with the extraction
+   `../TA-test-grading-setup/` itself doesn't exist, proceed with the extraction
    steps below exactly as before.
 
 1. **Locate the materials.**
@@ -382,7 +389,7 @@ Stop there. Don't run `python grade.py` — the user runs that themselves. Don't
 
 If step 0 didn't already restore this week from the archive (i.e. this was a fresh
 extraction from the lab docx), remind the user to run
-`../grading-tests/archive-week.sh weekNN qN` afterward to save this week's setup for
+`../TA-test-grading-setup/archive-week.sh weekNN qN` afterward to save this week's setup for
 reuse next term — but don't run it yourself unasked, since it commits and pushes to
 the private archive repo.
 ```
