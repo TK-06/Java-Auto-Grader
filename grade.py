@@ -5,22 +5,37 @@ Compiles each student submission together with the week's fixed JUnit tests,
 runs each official test class in its own isolated JVM invocation via the
 JUnit Platform Console Launcher, and writes one row per student to a CSV:
 student_id, compiled, tests_passed, tests_total, score, max_score,
-passed_tests, failed_tests, failure_details, student_submitted_tests_passed,
-student_submitted_tests_total, student_submitted_failed_tests,
-student_submitted_failure_details, notes. Score is 1 point per passed test by
-default, or a weighted sum if tests/rubric.json is present. failure_details
-carries the JUnit assertion message for each failed test (e.g. "expected:
-<0> but was: <-1>"), so a failure can be understood straight from the CSV
-instead of re-reading the test's source. student_submitted_* columns report
-any leftover JUnit test classes still in the student's submission (e.g. from
-an earlier week) - run isolated for visibility, never counted toward the
-score. A submission that fails to compile has its extracted+flattened build
-directory preserved under results/failed_builds/<student_id>__<n>/ for
-manual review, regardless of --keep-build. If tests/structure.json is
-present ({"required_classes": [...]}), a submission missing one of those
-classes is rejected before compiling ("STRUCTURE ERROR" in notes), the
-same way a compile error is - extra classes beyond what's required are
-never flagged.
+uncapped_score, score_cap, passed_tests, failed_tests, failure_details,
+student_submitted_tests_passed, student_submitted_tests_total,
+student_submitted_failed_tests, student_submitted_failure_details, notes.
+Score is 1 point per passed test by default, or a weighted sum if
+tests/rubric.json is present. failure_details carries the JUnit assertion
+message for each failed test (e.g. "expected: <0> but was: <-1>"), so a
+failure can be understood straight from the CSV instead of re-reading the
+test's source. student_submitted_* columns report any leftover JUnit test
+classes still in the student's submission (e.g. from an earlier week) - run
+isolated for visibility, never counted toward the score. A submission that
+fails to compile has its extracted+flattened build directory preserved
+under results/failed_builds/<student_id>__<n>/ for manual review,
+regardless of --keep-build. If tests/structure.json is present
+({"required_classes": [...]}), a submission missing one of those classes as
+BOTH .java and .class is rejected before compiling ("STRUCTURE ERROR" in
+notes), the same way a compile error is - extra classes beyond what's
+required are never flagged.
+
+A submission missing .java source for a class this week's tests actually
+need (structure.json's required_classes, unioned with names automatically
+inferred from what tests/*.java itself imports/instantiates - see
+collect_required_class_names, so this works even without structure.json) is
+still graded from that class's own precompiled .class if one is found
+elsewhere in the submission (a runnable-jar export that dropped source is
+the common case) - capped at 50% of max_score, since there's no source to
+verify. A submission that only yielded gradable content after digging past
+a plain unzip (a .zip wrapping a nested jar, say) is capped at 90%,
+independent of whether source was ultimately found. Both apply together
+multiplicatively (0.5 x 0.9 = 45%) when both are true. uncapped_score always
+records the pre-cap result; score_cap shows the cap percentage applied
+("" when none); notes explains why ("SCORE CAPPED AT n%: ...").
 """
 import argparse
 import csv
@@ -147,6 +162,59 @@ def strip_package_declaration(
 
 
 IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\.(?:\w+|\*)\s*;\s*\n?", re.MULTILINE)
+IMPORT_CLASS_RE = re.compile(r"^\s*import\s+(?!static\s+)([\w.]+)\.(\w+)\s*;", re.MULTILINE)
+NEW_EXPR_RE = re.compile(r"\bnew\s+([A-Z]\w*)\s*[(<]")
+
+NON_STUDENT_IMPORT_PREFIXES = (
+    "java.", "javax.", "org.junit", "org.opentest4j", "org.apiguardian",
+    "org.hamcrest", "org.mockito", "junit.",
+)
+
+COMMON_JDK_TYPE_NAMES = {
+    "String", "Integer", "Double", "Float", "Long", "Short", "Byte", "Character",
+    "Boolean", "Object", "ArrayList", "LinkedList", "HashMap", "TreeMap", "HashSet",
+    "TreeSet", "List", "Map", "Set", "Queue", "Deque", "Stack", "Vector", "Scanner",
+    "Random", "StringBuilder", "StringBuffer", "Exception", "RuntimeException",
+    "IllegalArgumentException", "IllegalStateException", "NullPointerException",
+    "IndexOutOfBoundsException", "Thread", "Optional", "Comparator", "Iterator",
+    "Arrays", "Collections", "Math", "System",
+}
+
+
+def collect_required_class_names(test_files: list[Path]) -> set[str]:
+    """Best-effort inference of which student classes this week's official
+    tests actually exercise - lets the .class-fallback path (see
+    grade_student/find_class_fallback_files) work every week without
+    needing tests/structure.json set up, since that file is optional and
+    the two aren't the same list in general (structure.json is about
+    catching a wrong project layout; this is about knowing which classes
+    a passing-but-source-less submission is even allowed to substitute
+    bytecode for).
+
+    Two signals, unioned: an explicit `import pkg.ClassName;` (the common
+    case - e.g. MisaShopTest2.java imports application.MisaShop,
+    logic.Item, logic.Order, logic.OrderItem explicitly, which is exactly
+    this week's required_classes) naming the exact class; and, for weeks
+    whose tests assume the unnamed package instead (no import at all - see
+    strip_package_declaration), a `new ClassName(...)` constructor call,
+    which a test exercising a student class practically always has at
+    least one of. A name matching a common JDK/collections type (ArrayList,
+    String, ...) is dropped from the second signal to cut down noise; a
+    false positive that slips through anyway is harmless - it only ever
+    matters if a like-named .class also turns up inside the student's own
+    submission, which a JDK class never does."""
+    names: set[str] = set()
+    for tf in test_files:
+        text = tf.read_text(encoding="utf-8", errors="ignore")
+        for pkg, cls in IMPORT_CLASS_RE.findall(text):
+            if pkg.startswith(NON_STUDENT_IMPORT_PREFIXES):
+                continue
+            names.add(cls)
+        for cls in NEW_EXPR_RE.findall(text):
+            if cls in COMMON_JDK_TYPE_NAMES:
+                continue
+            names.add(cls)
+    return names
 
 
 def collect_referenced_packages(test_files: list[Path]) -> set[str]:
@@ -237,6 +305,13 @@ def find_junit_jar(lib_dir: Path) -> Path:
 
 
 SKIP_DIR_NAMES = {"out", "target", "bin", "build", ".git", ".idea", ".vscode", ".settings"}
+# find_class_files' own, smaller exclusion list - out/target/bin/build are exactly
+# where a real IDE/build tool puts its .class output (Eclipse: bin/, Maven: target/,
+# Gradle: build/, IntelliJ: out/), which is precisely what the .class-fallback feature
+# (find_class_fallback_files) needs to be able to see. Reusing SKIP_DIR_NAMES here would
+# make that feature blind to the most common real-world case it exists for. Only VCS/IDE
+# metadata dirs are excluded - never a build-output dir, never a .java-source concern.
+CLASS_SEARCH_SKIP_DIR_NAMES = {".git", ".idea", ".vscode", ".settings"}
 
 
 def find_java_files(root: Path) -> list[Path]:
@@ -258,6 +333,90 @@ def find_java_files(root: Path) -> list[Path]:
     return sorted(found)
 
 
+def find_class_files(root: Path) -> list[Path]:
+    """Like find_java_files, but for *.class - used to locate a student's
+    own precompiled classes (see find_class_fallback_files) when their
+    .java source for a required class is missing. Deliberately NOT the same
+    exclusion list as find_java_files (see CLASS_SEARCH_SKIP_DIR_NAMES) -
+    out/, target/, bin/, build/ are exactly where a real compile actually
+    puts its output, so excluding them here would make the .class-fallback
+    feature blind to the common case it exists for. A discovered
+    submission's extracted tree routinely also contains hundreds of
+    unrelated *.class files from a bundled JUnit library (a "runnable jar
+    with dependencies" export pulls in the whole org.junit.* tree) - this
+    just enumerates everything *.class, the caller (find_class_fallback_files)
+    is what filters that down to names that actually matter."""
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in CLASS_SEARCH_SKIP_DIR_NAMES]
+        for name in filenames:
+            if name.endswith(".class"):
+                found.append(Path(dirpath) / name)
+    return sorted(found)
+
+
+def find_class_fallback_files(class_search_root: Path, class_names: set[str]) -> dict[str, list[Path]]:
+    """For each simple class name in class_names, find its ClassName.class
+    file (plus any ClassName$Inner.class sibling - same outer class, still
+    needed at runtime) somewhere under class_search_root. Returns
+    {class_name: [ClassName.class, ...]}, only for names actually found -
+    the caller checks which requested names are still missing via the
+    returned dict's keys. The path each .class file is found at (relative
+    to class_search_root) is its package for Java's purposes, but may sit
+    under an extra non-package wrapper directory (see
+    resolve_class_fallback_dest for how the caller corrects for that)."""
+    if not class_names:
+        return {}
+    result: dict[str, list[Path]] = {}
+    for class_file in find_class_files(class_search_root):
+        simple = class_file.stem.split("$", 1)[0]
+        if simple in class_names:
+            result.setdefault(simple, []).append(class_file)
+    return result
+
+
+def resolve_class_fallback_dest(rel_path: Path, referenced_packages: set[str]) -> Path:
+    """A fallback .class file's path relative to class_search_root is
+    normally its package for Java's purposes, but may sit under an extra
+    directory level that's a pure extraction/packaging artifact rather than
+    part of the class's actual compiled package - e.g. a student zipping
+    their whole Eclipse project, so the true classpath root is
+    ProjectName/bin/logic/Item.class. If rel_path's directory matches one of
+    referenced_packages as a dotted suffix, this trims it down to just that
+    package, so a class genuinely compiled as `package logic;` is found on
+    the classpath at `logic/Item.class` regardless of what sat above it in
+    the submission's own layout.
+
+    This does NOT rewrite the class - unlike source text (see
+    strip_package_declaration's Q1_toStudent.application example), a
+    compiled .class file's package is baked into its own bytecode (the
+    this_class constant pool entry), not inferred from its file path. A
+    class whose real compiled package genuinely includes the wrapper - e.g.
+    one actually compiled as `package Q2_toStudent.logic;` - still ends up
+    on the classpath at the trimmed location here, but javac's own
+    classfile verification then rejects it ("class file contains wrong
+    class") since the file's internal identity doesn't match. That's
+    correct: if the official test's `import logic.Item;` wouldn't resolve
+    against the student's own actual package on their own machine, it
+    shouldn't resolve here either - this function can only undo an
+    extraction-level accident, not a genuine packaging mistake.
+
+    Returns rel_path unchanged when there's no wrapper to strip (the common
+    case) or no referenced package to match against (the unnamed-package
+    case)."""
+    if not referenced_packages:
+        return rel_path
+    dotted_dir = ".".join(rel_path.parent.parts)
+    canonical = max(
+        (kp for kp in referenced_packages if dotted_dir == kp or dotted_dir.endswith("." + kp)),
+        key=len,
+        default=None,
+    )
+    if canonical is None:
+        return rel_path
+    return Path(*canonical.split(".")) / rel_path.name
+
+
 def find_nested_archives(root: Path) -> list[Path]:
     """.zip/.jar files sitting inside an already-extracted submission - e.g.
     a student who zipped up their built .jar instead of submitting it
@@ -272,13 +431,35 @@ def find_nested_archives(root: Path) -> list[Path]:
     return sorted(root.rglob("*.zip")) + sorted(root.rglob("*.jar"))
 
 
-def discover_submissions(
-    submissions_dir: Path, extract_root: Path
-) -> list[tuple[str, list[Path], list[str]]]:
-    """Each result is (student_id, java_files, notes). A submission may be:
+@dataclass
+class Submission:
+    student_id: str
+    java_files: list[Path]
+    notes: list[str]
+    # Where find_class_fallback_files should look for the student's own
+    # precompiled .class files when .java source for a required class is
+    # missing (see grade_student) - None when there's nowhere meaningful to
+    # search (a single loose .java file submission).
+    class_search_root: Path | None = None
+    # True only when the top-level submission was itself a .zip (not a
+    # .jar - a jar IS the artifact, nothing was "unzipped" to reach it) and
+    # its own first-level extraction alone found no .java - i.e. grading it
+    # required going beyond a plain unzip, whether that eventually turned
+    # up real source (in a nested jar) or only compiled classes. This is
+    # the "improper packaging" score-cap signal in grade_student,
+    # independent of whether source was ultimately found.
+    zip_needed_deeper_extraction: bool = False
+
+
+def discover_submissions(submissions_dir: Path, extract_root: Path) -> list[Submission]:
+    """A submission may be:
     - a folder (e.g. an unzipped Eclipse project - any nesting under it is scanned via
       find_java_files, which both filters to *.java and skips known build/IDE folders)
     - a single loose .java file
+    - a single loose .class file (already-compiled, no source at all) - copied into its
+      own extract_root/<n>/ so find_class_fallback_files has an isolated place to look
+      for it, never the shared submissions_dir (which would risk matching another
+      student's same-named class)
     - a .zip or .jar file (a JAR is just a ZIP file with a manifest, so the same extraction
       works for both - e.g. an Eclipse project exported as a zip, or exported as a runnable
       JAR with sources included) - extracted into extract_root/<n>/ (a plain sequential
@@ -287,13 +468,24 @@ def discover_submissions(
       depth plus a jar's internal package structure, that reliably blows past Windows'
       260-character path limit during extraction) and then scanned like a folder submission.
     """
-    results: list[tuple[str, list[Path], list[str]]] = []
-    for idx, entry in enumerate(sorted(submissions_dir.iterdir())):
+    results: list[Submission] = []
+    entries = sorted(submissions_dir.iterdir())
+    total = len(entries)
+    for idx, entry in enumerate(entries):
+        print(f"  [{idx + 1}/{total}] unpacking {entry.name} ...", flush=True)
         if entry.is_dir():
             java_files = find_java_files(entry)
-            results.append((entry.name, java_files, []))
+            results.append(Submission(entry.name, java_files, [], class_search_root=entry))
         elif entry.is_file() and entry.suffix == ".java":
-            results.append((entry.stem, [entry], []))
+            results.append(Submission(entry.stem, [entry], []))
+        elif entry.is_file() and entry.suffix == ".class":
+            student_id = entry.stem
+            class_dir = extract_root / str(idx)
+            if class_dir.exists():
+                rmtree_with_retry(class_dir)
+            class_dir.mkdir(parents=True)
+            shutil.copy2(entry, class_dir / entry.name)
+            results.append(Submission(student_id, [], [], class_search_root=class_dir))
         elif entry.is_file() and entry.suffix in (".zip", ".jar"):
             student_id = entry.stem
             extract_dir = extract_root / str(idx)
@@ -304,15 +496,16 @@ def discover_submissions(
                 with zipfile.ZipFile(entry) as zf:
                     zf.extractall(extract_dir)
             except zipfile.BadZipFile:
-                results.append((student_id, [], [f"could not open {entry.name}: not a valid zip/jar file"]))
+                results.append(Submission(student_id, [], [f"could not open {entry.name}: not a valid zip/jar file"]))
                 continue
             except OSError as exc:
                 # e.g. Windows path-length limit blown by a long filename/deeply
                 # nested entry inside the archive - must not crash the whole batch.
-                results.append((student_id, [], [f"could not extract {entry.name}: {exc}"]))
+                results.append(Submission(student_id, [], [f"could not extract {entry.name}: {exc}"]))
                 continue
             java_files = find_java_files(extract_dir)
             notes: list[str] = []
+            zip_needed_deeper_extraction = entry.suffix == ".zip" and not java_files
             if not java_files:
                 for nested in find_nested_archives(extract_dir):
                     try:
@@ -329,7 +522,11 @@ def discover_submissions(
                         break
             if not java_files:
                 notes.append(f"{entry.name} extracted OK but contained no .java files")
-            results.append((student_id, java_files, notes))
+            results.append(Submission(
+                student_id, java_files, notes,
+                class_search_root=extract_dir,
+                zip_needed_deeper_extraction=zip_needed_deeper_extraction,
+            ))
     return results
 
 
@@ -517,9 +714,15 @@ def compile_submission(build_dir: Path, junit_jar: Path, timeout: int) -> Compil
     classes_dir.mkdir(exist_ok=True)
     java_files = sorted(build_dir.glob("*.java"))
 
+    # classes_dir is on the compile classpath (not just the -d output target) so that
+    # any precompiled .class files grade_student seeded into it beforehand (see
+    # find_class_fallback_files - a required class missing .java source, substituted
+    # with the student's own bytecode) resolve as a dependency for whatever real .java
+    # files ARE being compiled here. A no-op for the common case where classes_dir
+    # starts out empty.
     cmd = [
         "javac",
-        "-cp", str(junit_jar),
+        "-cp", f"{junit_jar}{os.pathsep}{classes_dir}",
         "-d", str(classes_dir),
         "-encoding", "UTF-8",
         *[str(f) for f in java_files],
@@ -712,7 +915,10 @@ def load_structure_baseline(tests_dir: Path) -> list[str] | None:
 
 
 def check_structure_baseline(
-    build_dir: Path, official_names: set[str], required_classes: list[str]
+    build_dir: Path,
+    official_names: set[str],
+    required_classes: list[str],
+    covered_by_class_fallback: set[str] = frozenset(),
 ) -> list[str]:
     """Compares the submission's flattened, normalized file set (see
     prepare_build_dir - Main.java already excluded, packages already
@@ -728,14 +934,22 @@ def check_structure_baseline(
     required ones doesn't break that, so it isn't a violation. (A name
     COLLISION with an official test file is already handled earlier, in
     prepare_build_dir.) Returns a list of violation messages, empty if
-    every required class is present."""
+    every required class is present.
+
+    covered_by_class_fallback (see find_class_fallback_files in
+    grade_student) is also never a violation: a required class missing its
+    .java but with a matching .class discovered elsewhere in the submission
+    is still gradable, just from bytecode instead of source - that's a
+    score cap applied later in grade_student, not a hard structure
+    rejection here. Default empty set - callers that never pass it keep the
+    exact prior behavior."""
     present_classes = {
         f.stem for f in build_dir.glob("*.java") if f.name not in official_names
     }
     return [
         f"missing required class {name} (expected {name}.java)"
         for name in required_classes
-        if name not in present_classes
+        if name not in present_classes and name not in covered_by_class_fallback
     ]
 
 
@@ -753,6 +967,9 @@ def grade_student(
     rubric: dict[str, dict[str, float]] | None,
     required_classes: list[str] | None,
     failed_build_root: Path | None = None,
+    class_search_root: Path | None = None,
+    zip_needed_deeper_extraction: bool = False,
+    class_fallback_candidates: set[str] | None = None,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -761,6 +978,8 @@ def grade_student(
         "tests_total": 0,
         "score": 0,
         "max_score": 0,
+        "uncapped_score": 0,
+        "score_cap": "",
         "passed_tests": "",
         "failed_tests": "",
         "failure_details": "",
@@ -772,7 +991,7 @@ def grade_student(
     }
     build_dir = None
     try:
-        if not student_files:
+        if not student_files and class_search_root is None:
             row["notes"] = "; ".join(discovery_notes + ["no .java source files found"]).strip("; ")
             return row
 
@@ -781,13 +1000,76 @@ def grade_student(
 
         official_names = {f.name for f in test_files}
 
+        # Which of this week's required classes (structure.json's, unioned with
+        # collect_required_class_names' inference from the official tests - see
+        # main()) are missing .java source, and do we have that class's own
+        # precompiled .class sitting elsewhere in the submission (a fat/runnable-jar
+        # export that dropped source, most commonly)? Computed BEFORE the
+        # structure.json hard-fail check below so a class covered by a class
+        # fallback is never rejected outright - only one missing BOTH forms still is.
+        present_java_classes = {
+            f.stem for f in build_dir.glob("*.java") if f.name not in official_names
+        }
+        missing_source = (class_fallback_candidates or set()) - present_java_classes
+        fallback_matches: dict[str, list[Path]] = {}
+        if missing_source and class_search_root is not None:
+            fallback_matches = find_class_fallback_files(class_search_root, missing_source)
+
+        if not student_files and not fallback_matches:
+            row["notes"] = "; ".join(prep_notes + ["no .java source files found"]).strip("; ")
+            return row
+
         if required_classes is not None:
-            violations = check_structure_baseline(build_dir, official_names, required_classes)
+            violations = check_structure_baseline(
+                build_dir, official_names, required_classes,
+                covered_by_class_fallback=set(fallback_matches),
+            )
             if violations:
                 row["notes"] = "; ".join(
                     prep_notes + [f"STRUCTURE ERROR: {v}" for v in violations]
                 ).strip("; ")
                 return row
+
+        if fallback_matches:
+            # Seed the discovered .class files into classes/ BEFORE compiling -
+            # compile_submission puts classes_dir on javac's own -cp too, so any
+            # remaining .java that references one of these classes as a
+            # dependency still resolves. Each file's destination is resolved
+            # against the official tests' own referenced packages (see
+            # resolve_class_fallback_dest) so an extra wrapper directory in the
+            # submission (e.g. Q2_toStudent/logic/Item.class) doesn't leave the
+            # class undiscoverable on the classpath at package `logic`.
+            referenced_packages = collect_referenced_packages(test_files)
+            classes_dir = build_dir / "classes"
+            classes_dir.mkdir(exist_ok=True)
+            # Two distinct source .class files can resolve to the same classpath
+            # destination - legitimately for a $Inner sibling (same dest dir, different
+            # filename, no collision) but also, rarely, for two unrelated copies of the
+            # same simple name found in different corners of the submission (e.g. a
+            # stale duplicate build folder SKIP_DIR_NAMES doesn't happen to cover).
+            # copy2 would silently let the later one win; note it instead so a TA
+            # reviewing a surprising score knows to check --keep-build.
+            collisions: list[str] = []
+            for files in fallback_matches.values():
+                for f in files:
+                    rel = resolve_class_fallback_dest(f.relative_to(class_search_root), referenced_packages)
+                    dest = classes_dir / rel
+                    if dest.exists():
+                        collisions.append(
+                            f"{rel} (kept {f.relative_to(class_search_root)}, "
+                            f"discarded an earlier duplicate)"
+                        )
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, dest)
+            prep_notes = prep_notes + [
+                "found precompiled .class (no .java source) for required class(es): "
+                + ", ".join(sorted(fallback_matches))
+            ]
+            if collisions:
+                prep_notes = prep_notes + [
+                    "WARNING: multiple .class files resolved to the same classpath "
+                    "location, only the last one found was used: " + "; ".join(collisions)
+                ]
 
         compile_result, fallback_notes = compile_submission_with_fallback(
             build_dir, junit_jar, timeout, official_names
@@ -867,6 +1149,34 @@ def grade_student(
                     + ", ".join(f"{c}.{m}" for c, m in sorted(extras_found))
                 )
 
+        # Score cap policy: a submission graded from precompiled .class instead of
+        # .java (fallback_matches non-empty - see above) is capped at 50% of
+        # max_score, since there's no source to verify; a submission that only
+        # yielded gradable content after digging past a plain unzip
+        # (zip_needed_deeper_extraction - see discover_submissions) is capped at
+        # 90%, for improper packaging independent of whether source was found.
+        # Both apply multiplicatively when both are true (0.5 x 0.9 = 45%).
+        # uncapped_score always records what the raw result would have been, for
+        # audit/appeal purposes, even when no cap ends up binding.
+        cap = 1.0
+        cap_reasons: list[str] = []
+        if fallback_matches:
+            cap *= 0.5
+            cap_reasons.append(
+                "used precompiled .class instead of .java source for required class(es): "
+                + ", ".join(sorted(fallback_matches))
+            )
+        if zip_needed_deeper_extraction:
+            cap *= 0.9
+            cap_reasons.append(
+                "submission required extracting a nested/deeper archive to find gradable content"
+            )
+        row["uncapped_score"] = row["score"]
+        if cap < 1.0:
+            row["score"] = min(row["score"], cap * row["max_score"])
+            row["score_cap"] = f"{cap:.0%}"
+            extra.append(f"SCORE CAPPED AT {cap:.0%}: " + "; ".join(cap_reasons))
+
         # Leftover test classes from the student's own submission (e.g. an old
         # TestCPTSMachine.java sitting next to this week's TestCPTSMachine2.java)
         # are compiled but never --select-class'd above, so they never affect
@@ -935,11 +1245,30 @@ def sort_rows(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=sort_key)
 
 
+def check_output_writable(path: Path) -> str | None:
+    """Probes whether path can be written to, without touching its content -
+    opened in 'a' (append) mode, which creates it if missing but never
+    truncates an existing file, then immediately closed. Meant to be called
+    for every output path BEFORE the (potentially many-minutes-long) grading
+    run starts: an output CSV left open in Excel - which holds an exclusive
+    lock on Windows - would otherwise only surface as a PermissionError on
+    the final write_csv/write_scores_csv call, discarding a completed run's
+    results. Returns None if writable, else a message describing why not."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "a", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        return f"{path} is not writable ({exc}) - likely open in another program (e.g. Excel); close it and try again"
+    return None
+
+
 def write_csv(rows: list[dict], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rows_sorted = sort_rows(rows)
     fieldnames = [
         "student_id", "compiled", "tests_passed", "tests_total", "score", "max_score",
+        "uncapped_score", "score_cap",
         "passed_tests", "failed_tests", "failure_details", "student_submitted_tests_passed",
         "student_submitted_tests_total", "student_submitted_failed_tests",
         "student_submitted_failure_details", "notes",
@@ -981,10 +1310,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lib", default="lib")
     parser.add_argument("--out", default=str(Path("results") / "grades.csv"),
                          help="detailed CSV: student_id, compiled, tests_passed, tests_total, "
-                              "score, max_score, passed_tests, failed_tests, failure_details, "
-                              "student_submitted_tests_passed, student_submitted_tests_total, "
-                              "student_submitted_failed_tests, student_submitted_failure_details, "
-                              "notes")
+                              "score, max_score, uncapped_score, score_cap, passed_tests, "
+                              "failed_tests, failure_details, student_submitted_tests_passed, "
+                              "student_submitted_tests_total, student_submitted_failed_tests, "
+                              "student_submitted_failure_details, notes")
     parser.add_argument("--scores-out", default=str(Path("results") / "mcvScore.csv"),
                          help="simple CSV, no header row: student_id, score (bare numeric ID) "
                               "- for MyCourseVille gradebook upload")
@@ -1010,12 +1339,17 @@ def main() -> None:
         sys.exit(f"ERROR: submissions folder not found: {submissions_dir}")
     if not tests_dir.is_dir():
         sys.exit(f"ERROR: tests folder not found: {tests_dir}")
+    for output_path in (out_path, scores_out_path):
+        problem = check_output_writable(output_path)
+        if problem is not None:
+            sys.exit(f"ERROR: {problem}")
 
     junit_jar = find_junit_jar(lib_dir)
     test_files = discover_test_files(tests_dir)
     test_classes = [test_class_fqcn(tf) for tf in test_files]
     rubric = load_rubric(tests_dir)
     required_classes = load_structure_baseline(tests_dir)
+    class_fallback_candidates = collect_required_class_names(test_files) | set(required_classes or [])
 
     if build_root.exists():
         rmtree_with_retry(build_root)
@@ -1027,11 +1361,12 @@ def main() -> None:
         rmtree_with_retry(failed_build_root)
     failed_build_root.mkdir(parents=True)
 
+    print(f"Auto-Grader for Data Structures - unpacking submissions from {submissions_dir} ...")
     submissions = discover_submissions(submissions_dir, extract_root)
     if not submissions:
         sys.exit(f"ERROR: no student submissions found in {submissions_dir}")
 
-    id_counts = Counter(student_id for student_id, _, _ in submissions)
+    id_counts = Counter(sub.student_id for sub in submissions)
     duplicate_ids = [sid for sid, count in id_counts.items() if count > 1]
     if duplicate_ids:
         print(
@@ -1055,15 +1390,24 @@ def main() -> None:
         print(f"  structure:   {tests_dir / 'structure.json'}  (required classes: {', '.join(required_classes)})")
     else:
         print("  structure:   none (tests/structure.json not found - no structure check)")
+    print(
+        f"  class fallback: {', '.join(sorted(class_fallback_candidates)) or '(none inferred)'} "
+        f"- a submission missing .java for one of these but with a matching .class is still "
+        f"graded, capped at 50% (see README)"
+    )
 
     rows = []
     total = len(submissions)
-    for i, (student_id, student_files, discovery_notes) in enumerate(submissions, start=1):
+    for i, sub in enumerate(submissions, start=1):
+        student_id = sub.student_id
         build_key = str(i)
         row = grade_student(
-            student_id, build_key, student_files, discovery_notes, test_files, test_classes,
+            student_id, build_key, sub.java_files, sub.notes, test_files, test_classes,
             junit_jar, build_root, args.timeout, args.keep_build, rubric, required_classes,
             failed_build_root,
+            class_search_root=sub.class_search_root,
+            zip_needed_deeper_extraction=sub.zip_needed_deeper_extraction,
+            class_fallback_candidates=class_fallback_candidates,
         )
         rows.append(row)
         if row["compiled"] == "no":

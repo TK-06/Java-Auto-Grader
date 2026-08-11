@@ -1,5 +1,6 @@
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -10,20 +11,26 @@ from grade import (
     RMTREE_RETRY_ATTEMPTS,
     CompileResult,
     bare_student_id,
+    check_output_writable,
     check_structure_baseline,
+    collect_required_class_names,
     collect_test_results,
     compile_submission_with_fallback,
     discover_submissions,
+    find_class_fallback_files,
+    find_class_files,
     find_java_files,
     find_junit_jar,
     find_nested_archives,
     grade_student,
     load_structure_baseline,
     prepare_build_dir,
+    resolve_class_fallback_dest,
     rewrite_imports_of_renamed_packages,
     rmtree_with_retry,
     strip_imports_of_packages,
     strip_package_declaration,
+    write_csv,
     write_scores_csv,
 )
 
@@ -736,10 +743,14 @@ class TestDiscoverSubmissionsNestedArchive(unittest.TestCase):
             submissions = discover_submissions(submissions_dir, extract_root)
 
             self.assertEqual(len(submissions), 1)
-            student_id, java_files, notes = submissions[0]
-            self.assertEqual(student_id, "12345678_w1_q2")
-            self.assertEqual([f.name for f in java_files], ["Item.java"])
-            self.assertTrue(any("nested archive" in n for n in notes), notes)
+            sub = submissions[0]
+            self.assertEqual(sub.student_id, "12345678_w1_q2")
+            self.assertEqual([f.name for f in sub.java_files], ["Item.java"])
+            self.assertTrue(any("nested archive" in n for n in sub.notes), sub.notes)
+            # A .zip whose first unzip alone found no .java, even though digging
+            # further into the nested jar did recover source - still an "improper
+            # packaging" case for the 90% cap, independent of the outcome.
+            self.assertTrue(sub.zip_needed_deeper_extraction)
 
     def test_does_not_touch_a_submission_that_already_has_real_java_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -759,9 +770,13 @@ class TestDiscoverSubmissionsNestedArchive(unittest.TestCase):
             submissions = discover_submissions(submissions_dir, extract_root)
 
             self.assertEqual(len(submissions), 1)
-            student_id, java_files, notes = submissions[0]
-            self.assertEqual([f.name for f in java_files], ["Item.java"])
-            self.assertEqual(notes, [])
+            sub = submissions[0]
+            self.assertEqual([f.name for f in sub.java_files], ["Item.java"])
+            self.assertEqual(sub.notes, [])
+            # A .jar submitted directly (not wrapped in a .zip) never triggers the
+            # "improper packaging" flag, even though it's technically also a zip
+            # under the hood - only an actual .zip top-level submission can.
+            self.assertFalse(sub.zip_needed_deeper_extraction)
 
     def test_still_reports_no_java_files_when_nested_archives_dont_help(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -778,9 +793,640 @@ class TestDiscoverSubmissionsNestedArchive(unittest.TestCase):
             submissions = discover_submissions(submissions_dir, extract_root)
 
             self.assertEqual(len(submissions), 1)
-            student_id, java_files, notes = submissions[0]
-            self.assertEqual(java_files, [])
-            self.assertTrue(any("contained no .java files" in n for n in notes), notes)
+            sub = submissions[0]
+            self.assertEqual(sub.java_files, [])
+            self.assertTrue(any("contained no .java files" in n for n in sub.notes), sub.notes)
+            self.assertTrue(sub.zip_needed_deeper_extraction)
+            self.assertEqual(sub.class_search_root, extract_root / "0")
+
+
+class TestDiscoverSubmissionsBareClass(unittest.TestCase):
+    def test_bare_class_file_gets_its_own_isolated_search_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+            (submissions_dir / "55556666.class").write_bytes(b"not real bytecode")
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            self.assertEqual(len(submissions), 1)
+            sub = submissions[0]
+            self.assertEqual(sub.student_id, "55556666")
+            self.assertEqual(sub.java_files, [])
+            self.assertFalse(sub.zip_needed_deeper_extraction)
+            self.assertIsNotNone(sub.class_search_root)
+            self.assertTrue((sub.class_search_root / "55556666.class").exists())
+            # Never searches the shared submissions_dir directly - that would risk
+            # matching another student's same-named class.
+            self.assertNotEqual(sub.class_search_root, submissions_dir)
+
+    def test_folder_submission_gets_itself_as_search_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+            student_dir = submissions_dir / "77778888"
+            student_dir.mkdir()
+            (student_dir / "Item.class").write_bytes(b"")
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            self.assertEqual(len(submissions), 1)
+            self.assertEqual(submissions[0].class_search_root, student_dir)
+
+    def test_loose_java_file_has_no_search_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+            (submissions_dir / "99990000.java").write_text(
+                "public class Foo {}\n", encoding="utf-8"
+            )
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            self.assertIsNone(submissions[0].class_search_root)
+
+
+class TestCollectRequiredClassNames(unittest.TestCase):
+    def test_collects_explicit_imports_ignoring_junit_and_jdk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / "MisaShopTest2.java"
+            tf.write_text(
+                "package test.grader;\n"
+                "import static org.junit.jupiter.api.Assertions.*;\n"
+                "import org.junit.jupiter.api.Test;\n"
+                "import application.MisaShop;\n"
+                "import logic.Order;\n"
+                "import logic.OrderItem;\n"
+                "class MisaShopTest2 {}\n",
+                encoding="utf-8",
+            )
+
+            names = collect_required_class_names([tf])
+
+            self.assertEqual(names, {"MisaShop", "Order", "OrderItem"})
+
+    def test_falls_back_to_constructor_calls_for_unnamed_package_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / "TestStation.java"
+            tf.write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "class TestStation {\n"
+                "    @Test void t() { Station s = new Station(\"A\"); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            names = collect_required_class_names([tf])
+
+            self.assertIn("Station", names)
+
+    def test_excludes_common_jdk_types_from_constructor_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / "TestFoo.java"
+            tf.write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "import java.util.ArrayList;\n"
+                "class TestFoo {\n"
+                "    @Test void t() { ArrayList<String> l = new ArrayList<>(); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            names = collect_required_class_names([tf])
+
+            self.assertNotIn("ArrayList", names)
+
+
+class TestFindClassFiles(unittest.TestCase):
+    def test_descends_into_build_output_dirs_unlike_find_java_files(self):
+        """bin/target/build/out are exactly where a real compile puts its
+        .class output (Eclipse/Maven/Gradle/IntelliJ respectively) - the
+        .class-fallback feature this exists for must be able to see into
+        them, unlike find_java_files which correctly stays out."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for build_dir in ("bin", "target", "build", "out"):
+                d = root / build_dir / "logic"
+                d.mkdir(parents=True)
+                (d / "Item.class").write_bytes(b"")
+
+            found = find_class_files(root)
+
+            self.assertEqual(len(found), 4)
+            for build_dir in ("bin", "target", "build", "out"):
+                self.assertTrue(
+                    any(build_dir in f.parts for f in found),
+                    f"expected a match under {build_dir}/",
+                )
+
+    def test_still_skips_vcs_and_ide_metadata_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git" / "objects").mkdir(parents=True)
+            (root / ".git" / "objects" / "Item.class").write_bytes(b"")
+            (root / "logic").mkdir()
+            (root / "logic" / "Item.class").write_bytes(b"")
+
+            found = find_class_files(root)
+
+            self.assertEqual(len(found), 1)
+            self.assertIn("logic", found[0].parts)
+
+
+class TestFindClassFallbackFiles(unittest.TestCase):
+    def test_finds_top_level_and_inner_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "logic").mkdir()
+            (root / "logic" / "Item.class").write_bytes(b"")
+            (root / "logic" / "Item$1.class").write_bytes(b"")
+            (root / "org").mkdir()
+            (root / "org" / "Assertions.class").write_bytes(b"")  # unrelated library class
+
+            matches = find_class_fallback_files(root, {"Item", "Missing"})
+
+            self.assertEqual(set(matches), {"Item"})
+            self.assertEqual({f.name for f in matches["Item"]}, {"Item.class", "Item$1.class"})
+
+    def test_returns_empty_dict_when_no_names_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(find_class_fallback_files(Path(tmp), set()), {})
+
+    def test_finds_classes_inside_a_build_output_folder(self):
+        """target/ (like bin/, build/, out/) is exactly where a real Maven
+        compile puts its .class output - must be visible to the fallback
+        search, not treated as noise to skip. See find_class_files."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "target").mkdir()
+            (root / "target" / "Item.class").write_bytes(b"")
+
+            matches = find_class_fallback_files(root, {"Item"})
+
+            self.assertEqual(set(matches), {"Item"})
+
+    def test_skips_vcs_and_ide_metadata_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            (root / ".git" / "Item.class").write_bytes(b"")
+
+            matches = find_class_fallback_files(root, {"Item"})
+
+            self.assertEqual(matches, {})
+
+
+class TestResolveClassFallbackDest(unittest.TestCase):
+    def test_strips_extra_prefix_matching_referenced_package(self):
+        rel = Path("Q2_toStudent") / "logic" / "Item.class"
+
+        result = resolve_class_fallback_dest(rel, {"logic", "application"})
+
+        self.assertEqual(result, Path("logic") / "Item.class")
+
+    def test_exact_package_match_is_unchanged(self):
+        rel = Path("logic") / "Item.class"
+
+        result = resolve_class_fallback_dest(rel, {"logic"})
+
+        self.assertEqual(result, rel)
+
+    def test_no_referenced_packages_returns_path_unchanged(self):
+        rel = Path("Item.class")
+
+        result = resolve_class_fallback_dest(rel, set())
+
+        self.assertEqual(result, rel)
+
+    def test_no_matching_suffix_returns_path_unchanged(self):
+        rel = Path("com") / "example" / "Item.class"
+
+        result = resolve_class_fallback_dest(rel, {"logic"})
+
+        self.assertEqual(result, rel)
+
+
+class TestCheckStructureBaselineClassFallback(unittest.TestCase):
+    def test_covered_class_is_not_a_violation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Station.java").write_text("public class Station {}\n", encoding="utf-8")
+
+            violations = check_structure_baseline(
+                build_dir, official_names=set(), required_classes=["Station", "Ticket"],
+                covered_by_class_fallback={"Ticket"},
+            )
+
+            self.assertEqual(violations, [])
+
+    def test_uncovered_class_still_a_violation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+
+            violations = check_structure_baseline(
+                build_dir, official_names=set(), required_classes=["Station"],
+                covered_by_class_fallback={"Ticket"},
+            )
+
+            self.assertEqual(len(violations), 1)
+            self.assertIn("Station", violations[0])
+
+
+class TestGradeStudentScoreCap(unittest.TestCase):
+    """Integration-level: a real javac compile + real JUnit run, same pattern as
+    TestGradeStudentStructureBaseline - the two examples that motivated this
+    feature (a runnable-jar export with no .java, and a .zip wrapping a jar)
+    are reproduced in miniature here rather than mocked."""
+
+    def _junit_jar(self) -> Path:
+        return find_junit_jar(Path(__file__).resolve().parent / "lib")
+
+    def _compile_item_class(self, out_dir: Path) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        src = out_dir / "Item.java"
+        src.write_text(
+            "public class Item { public int getValue() { return 42; } }\n", encoding="utf-8"
+        )
+        result = subprocess.run(
+            ["javac", "-d", str(out_dir), str(src)], capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        src.unlink()  # only the .class remains - matching a real compiled-only submission
+
+    def _item_test_file(self, tmp_path: Path) -> Path:
+        tf = tmp_path / "ItemTest.java"
+        tf.write_text(
+            "import org.junit.jupiter.api.Test;\n"
+            "import static org.junit.jupiter.api.Assertions.*;\n"
+            "class ItemTest {\n"
+            "    @Test void testGetValue() { assertEquals(42, new Item().getValue()); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        return tf
+
+    def test_missing_source_class_fallback_caps_at_50_percent(self):
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            class_dir = tmp_path / "precompiled"
+            self._compile_item_class(class_dir)
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000001", "1", [], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_search_root=class_dir,
+                zip_needed_deeper_extraction=False,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["compiled"], "yes")
+            self.assertEqual(row["tests_passed"], 1)
+            self.assertEqual(row["uncapped_score"], 1)
+            self.assertEqual(row["score"], 0.5)
+            self.assertEqual(row["score_cap"], "50%")
+            self.assertIn("SCORE CAPPED AT 50%", row["notes"])
+            self.assertIn("Item", row["notes"])
+
+    def test_class_fallback_under_extra_wrapper_directory_still_resolves(self):
+        """Covers the case where an extra directory level is a pure extraction/
+        packaging artifact (e.g. a student zipped their whole Eclipse project,
+        so the true classpath root is ProjectName/bin/logic/Item.class) rather
+        than part of the class's actual compiled package - Item.class here is
+        genuinely `package logic;`, just sitting one level deeper on disk than
+        find_class_fallback_files' caller used to assume. Before
+        resolve_class_fallback_dest, the wrapper directory was preserved
+        verbatim into classes/, landing the file outside package `logic` on
+        javac's classpath ("cannot find symbol") even though nothing was
+        actually wrong with the class.
+
+        NOT what this fix rescues: a real grading run turned up two students
+        whose precompiled classes were genuinely compiled under a
+        `Q2_toStudent.logic` package (confirmed via javap - baked into the
+        classfile's own this_class entry, e.g. `class Q2_toStudent.logic.Item`,
+        not just a folder name), the .class equivalent of the
+        Q1_toStudent.application example in strip_package_declaration's
+        docstring. Unlike source text, a compiled class's internal identity
+        can't be rewritten by relocating the file, so those two correctly
+        still fail to compile - now with a "class file contains wrong class"
+        diagnostic instead of a misleading "cannot find symbol", but the same
+        (correct) failing grade."""
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            compiled_root = tmp_path / "compiled"
+            pkg_src_dir = compiled_root / "logic"
+            pkg_src_dir.mkdir(parents=True)
+            src = pkg_src_dir / "Item.java"
+            src.write_text(
+                "package logic;\npublic class Item { public int getValue() { return 42; } }\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["javac", "-d", str(compiled_root), str(src)], capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            class_search_root = tmp_path / "submission"
+            shutil.copytree(compiled_root / "logic", class_search_root / "Q2_toStudent" / "logic")
+
+            test_file = tmp_path / "ItemTest.java"
+            test_file.write_text(
+                "import logic.Item;\n"
+                "import org.junit.jupiter.api.Test;\n"
+                "import static org.junit.jupiter.api.Assertions.*;\n"
+                "class ItemTest {\n"
+                "    @Test void testGetValue() { assertEquals(42, new Item().getValue()); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000005", "1", [], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_search_root=class_search_root,
+                zip_needed_deeper_extraction=False,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["compiled"], "yes", row["notes"])
+            self.assertEqual(row["tests_passed"], 1)
+            self.assertEqual(row["score"], 0.5)
+            self.assertEqual(row["score_cap"], "50%")
+
+    def test_duplicate_class_fallback_matches_are_flagged_not_silently_dropped(self):
+        """Two unrelated copies of Item.class under different wrapper prefixes
+        both trim down to the same classpath destination (logic/Item.class) via
+        resolve_class_fallback_dest. Silently letting the later one win would
+        hide a real ambiguity from whoever reviews this student's row."""
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            compiled_root = tmp_path / "compiled"
+            pkg_src_dir = compiled_root / "logic"
+            pkg_src_dir.mkdir(parents=True)
+            src = pkg_src_dir / "Item.java"
+            src.write_text(
+                "package logic;\npublic class Item { public int getValue() { return 42; } }\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["javac", "-d", str(compiled_root), str(src)], capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            class_search_root = tmp_path / "submission"
+            shutil.copytree(compiled_root / "logic", class_search_root / "WrapperA" / "logic")
+            shutil.copytree(compiled_root / "logic", class_search_root / "WrapperB" / "logic")
+
+            test_file = tmp_path / "ItemTest.java"
+            test_file.write_text(
+                "import logic.Item;\n"
+                "import org.junit.jupiter.api.Test;\n"
+                "import static org.junit.jupiter.api.Assertions.*;\n"
+                "class ItemTest {\n"
+                "    @Test void testGetValue() { assertEquals(42, new Item().getValue()); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000006", "1", [], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_search_root=class_search_root,
+                zip_needed_deeper_extraction=False,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["compiled"], "yes", row["notes"])
+            self.assertEqual(row["tests_passed"], 1)
+            self.assertIn("WARNING: multiple .class files resolved to the same classpath", row["notes"])
+
+    def test_zip_needing_deeper_extraction_caps_at_90_percent_even_with_source(self):
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_dir = tmp_path / "src"
+            src_dir.mkdir()
+            item_file = src_dir / "Item.java"
+            item_file.write_text(
+                "public class Item { public int getValue() { return 42; } }\n", encoding="utf-8"
+            )
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000002", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_search_root=None,
+                zip_needed_deeper_extraction=True,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["compiled"], "yes")
+            self.assertEqual(row["tests_passed"], 1)
+            self.assertEqual(row["uncapped_score"], 1)
+            self.assertEqual(row["score"], 0.9)
+            self.assertEqual(row["score_cap"], "90%")
+            self.assertIn("SCORE CAPPED AT 90%", row["notes"])
+            self.assertIn("nested/deeper archive", row["notes"])
+
+    def test_both_conditions_combine_multiplicatively_to_45_percent(self):
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            class_dir = tmp_path / "precompiled"
+            self._compile_item_class(class_dir)
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000003", "1", [], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_search_root=class_dir,
+                zip_needed_deeper_extraction=True,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["uncapped_score"], 1)
+            self.assertEqual(row["score"], 0.45)
+            self.assertEqual(row["score_cap"], "45%")
+
+    def test_no_cap_when_source_is_present_and_no_deeper_extraction_needed(self):
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_dir = tmp_path / "src"
+            src_dir.mkdir()
+            item_file = src_dir / "Item.java"
+            item_file.write_text(
+                "public class Item { public int getValue() { return 42; } }\n", encoding="utf-8"
+            )
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000004", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["uncapped_score"], 1)
+            self.assertEqual(row["score"], 1)
+            self.assertEqual(row["score_cap"], "")
+            self.assertNotIn("SCORE CAPPED", row["notes"])
+
+    def test_class_missing_entirely_with_no_student_files_at_all(self):
+        # No .java anywhere and nothing to search for a .class fallback either -
+        # stays the same "no .java source files found" short-circuit as before
+        # this feature existed, never a false 50%/90% cap.
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000005", "1", [], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["compiled"], "no")
+            self.assertIn("no .java source files found", row["notes"])
+            self.assertEqual(row["score_cap"], "")
+
+    def test_class_missing_entirely_but_other_source_present_is_a_compile_error(self):
+        # Some unrelated .java IS present (so compilation is actually attempted),
+        # but the required class Item has neither .java nor a matching .class
+        # anywhere - a normal "cannot find symbol" compile error, score 0, and
+        # never treated as a class-fallback (no cap fields set).
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_dir = tmp_path / "src"
+            src_dir.mkdir()
+            unrelated_file = src_dir / "Helper.java"
+            unrelated_file.write_text("public class Helper {}\n", encoding="utf-8")
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000006", "1", [unrelated_file], [], [test_file], ["ItemTest"], junit_jar,
+                build_root, 30, False, None, None, failed_build_root,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["compiled"], "no")
+            self.assertIn("COMPILE ERROR", row["notes"])
+            self.assertEqual(row["score_cap"], "")
+
+
+class TestCheckOutputWritable(unittest.TestCase):
+    def test_none_for_nonexistent_path_and_creates_parent_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "results" / "grades.csv"
+
+            self.assertIsNone(check_output_writable(out_path))
+            self.assertTrue(out_path.exists())
+
+    def test_existing_file_content_is_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "grades.csv"
+            out_path.write_text("previous run's data\n", encoding="utf-8")
+
+            self.assertIsNone(check_output_writable(out_path))
+
+            self.assertEqual(out_path.read_text(encoding="utf-8"), "previous run's data\n")
+
+    def test_returns_message_when_open_raises_oserror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "grades.csv"
+            with mock.patch("builtins.open", side_effect=PermissionError("in use by another process")):
+                problem = check_output_writable(out_path)
+
+            self.assertIsNotNone(problem)
+            self.assertIn(str(out_path), problem)
+            self.assertIn("Excel", problem)
+
+
+class TestWriteCsvNewColumns(unittest.TestCase):
+    def test_includes_uncapped_score_and_score_cap_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "grades.csv"
+            rows = [{
+                "student_id": "1", "compiled": "yes", "tests_passed": 1, "tests_total": 2,
+                "score": 0.5, "max_score": 1, "uncapped_score": 1, "score_cap": "50%",
+                "passed_tests": "", "failed_tests": "", "failure_details": "",
+                "student_submitted_tests_passed": 0, "student_submitted_tests_total": 0,
+                "student_submitted_failed_tests": "", "student_submitted_failure_details": "",
+                "notes": "SCORE CAPPED AT 50%: ...",
+            }]
+
+            write_csv(rows, out_path)
+
+            content = out_path.read_text(encoding="utf-8")
+            header = content.splitlines()[0]
+            self.assertIn("uncapped_score", header)
+            self.assertIn("score_cap", header)
+            self.assertIn("0.5", content)
+            self.assertIn("50%", content)
+
+    def test_blank_score_cap_for_an_uncapped_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "grades.csv"
+            rows = [{
+                "student_id": "1", "compiled": "yes", "tests_passed": 2, "tests_total": 2,
+                "score": 2, "max_score": 2, "uncapped_score": 2, "score_cap": "",
+                "passed_tests": "", "failed_tests": "", "failure_details": "",
+                "student_submitted_tests_passed": 0, "student_submitted_tests_total": 0,
+                "student_submitted_failed_tests": "", "student_submitted_failure_details": "",
+                "notes": "",
+            }]
+
+            write_csv(rows, out_path)
+
+            lines = out_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[1].split(","), [
+                "1", "yes", "2", "2", "2", "2", "2", "", "", "", "", "0", "0", "", "", "",
+            ])
 
 
 if __name__ == "__main__":
