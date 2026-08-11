@@ -5,17 +5,13 @@ Compiles each student submission together with the week's fixed JUnit tests,
 runs each official test class in its own isolated JVM invocation via the
 JUnit Platform Console Launcher, and writes one row per student to a CSV:
 student_id, compiled, tests_passed, tests_total, score, max_score,
-uncapped_score, score_cap, passed_tests, failed_tests, failure_details,
-student_submitted_tests_passed, student_submitted_tests_total,
-student_submitted_failed_tests, student_submitted_failure_details, notes.
+uncapped_score, score_cap, passed_tests, failed_tests, failure_details, notes.
 Score is 1 point per passed test by default, or a weighted sum if
 tests/rubric.json is present. failure_details carries the JUnit assertion
 message for each failed test (e.g. "expected: <0> but was: <-1>"), so a
 failure can be understood straight from the CSV instead of re-reading the
-test's source. student_submitted_* columns report any leftover JUnit test
-classes still in the student's submission (e.g. from an earlier week) - run
-isolated for visibility, never counted toward the score. A submission that
-fails to compile has its extracted+flattened build directory preserved
+test's source. A submission that fails to compile has its
+extracted+flattened build directory preserved
 under results/failed_builds/<student_id>__<n>/ for manual review,
 regardless of --keep-build. If tests/structure.json is present
 ({"required_classes": [...]}), a submission missing one of those classes as
@@ -557,11 +553,9 @@ def find_extra_test_files(build_dir: Path, official_names: set[str]) -> list[Pat
     leftover test class from a prior week (e.g. TestCPTSMachine.java sitting
     next to this week's official TestCPTSMachine2.java). Detected by content
     rather than filename, since there's no naming convention to rely on.
-    Works on source text alone, so it can run either before compiling (to
-    decide what to exclude on a fallback compile - see
-    compile_submission_with_fallback) or after (see
-    discover_extra_test_classes, run separately from the official tests so
-    it can't share static state with them or count toward the score)."""
+    Works on source text alone, so it can run before compiling to decide
+    what to exclude on a fallback compile - see
+    compile_submission_with_fallback."""
     extra: list[Path] = []
     for java_file in sorted(build_dir.glob("*.java")):
         if java_file.name in official_names:
@@ -570,12 +564,6 @@ def find_extra_test_files(build_dir: Path, official_names: set[str]) -> list[Pat
         if JUNIT_IMPORT_RE.search(text):
             extra.append(java_file)
     return extra
-
-
-def discover_extra_test_classes(build_dir: Path, official_names: set[str]) -> list[str]:
-    """FQCNs of find_extra_test_files, for --select-class - see that
-    function for what counts as an "extra" test class and why."""
-    return [test_class_fqcn(f) for f in find_extra_test_files(build_dir, official_names)]
 
 
 def prepare_build_dir(
@@ -983,10 +971,6 @@ def grade_student(
         "passed_tests": "",
         "failed_tests": "",
         "failure_details": "",
-        "student_submitted_tests_passed": 0,
-        "student_submitted_tests_total": 0,
-        "student_submitted_failed_tests": "",
-        "student_submitted_failure_details": "",
         "notes": "",
     }
     build_dir = None
@@ -1177,42 +1161,6 @@ def grade_student(
             row["score_cap"] = f"{cap:.0%}"
             extra.append(f"SCORE CAPPED AT {cap:.0%}: " + "; ".join(cap_reasons))
 
-        # Leftover test classes from the student's own submission (e.g. an old
-        # TestCPTSMachine.java sitting next to this week's TestCPTSMachine2.java)
-        # are compiled but never --select-class'd above, so they never affect
-        # the official score. Still run them here - in their own isolated JVM
-        # per class, same as the official run - purely so their results are
-        # visible; never counted toward tests_passed/tests_total/score.
-        extra_test_classes = discover_extra_test_classes(build_dir, {f.name for f in test_files})
-        if extra_test_classes:
-            extra_reports_dir = build_dir / "reports_extra"
-            extra_reports_dir.mkdir(exist_ok=True)
-            extra_run_result = run_tests(
-                compile_result.classes_dir, extra_reports_dir, junit_jar, timeout, extra_test_classes
-            )
-            if extra_run_result.timed_out:
-                extra.append("student-submitted leftover test file(s) timed out (not scored)")
-            else:
-                try:
-                    extra_cases = collect_test_results(extra_reports_dir)
-                except ET.ParseError:
-                    extra_cases = []
-                if extra_cases:
-                    extra_passed = [tc for tc in extra_cases if tc.status == "passed"]
-                    extra_failed = [tc for tc in extra_cases if tc.status == "failed"]
-                    row["student_submitted_tests_passed"] = len(extra_passed)
-                    row["student_submitted_tests_total"] = len(extra_cases)
-                    row["student_submitted_failed_tests"] = "; ".join(
-                        f"{tc.classname}.{tc.method}" for tc in extra_failed
-                    )
-                    row["student_submitted_failure_details"] = "; ".join(
-                        f"{tc.classname}.{tc.method}: {tc.detail}" for tc in extra_failed if tc.detail
-                    )
-                    extra.append(
-                        f"{len(extra_passed)}/{len(extra_cases)} student-submitted leftover test(s) "
-                        f"found (not part of this week's rubric), run isolated (not scored)"
-                    )
-
         row["notes"] = "; ".join(prep_notes + extra).strip("; ")
         return row
 
@@ -1269,9 +1217,7 @@ def write_csv(rows: list[dict], out_path: Path) -> None:
     fieldnames = [
         "student_id", "compiled", "tests_passed", "tests_total", "score", "max_score",
         "uncapped_score", "score_cap",
-        "passed_tests", "failed_tests", "failure_details", "student_submitted_tests_passed",
-        "student_submitted_tests_total", "student_submitted_failed_tests",
-        "student_submitted_failure_details", "notes",
+        "passed_tests", "failed_tests", "failure_details", "notes",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1311,9 +1257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", default=str(Path("results") / "grades.csv"),
                          help="detailed CSV: student_id, compiled, tests_passed, tests_total, "
                               "score, max_score, uncapped_score, score_cap, passed_tests, "
-                              "failed_tests, failure_details, student_submitted_tests_passed, "
-                              "student_submitted_tests_total, student_submitted_failed_tests, "
-                              "student_submitted_failure_details, notes")
+                              "failed_tests, failure_details, notes")
     parser.add_argument("--scores-out", default=str(Path("results") / "mcvScore.csv"),
                          help="simple CSV, no header row: student_id, score (bare numeric ID) "
                               "- for MyCourseVille gradebook upload")

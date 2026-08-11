@@ -1395,8 +1395,6 @@ class TestWriteCsvNewColumns(unittest.TestCase):
                 "student_id": "1", "compiled": "yes", "tests_passed": 1, "tests_total": 2,
                 "score": 0.5, "max_score": 1, "uncapped_score": 1, "score_cap": "50%",
                 "passed_tests": "", "failed_tests": "", "failure_details": "",
-                "student_submitted_tests_passed": 0, "student_submitted_tests_total": 0,
-                "student_submitted_failed_tests": "", "student_submitted_failure_details": "",
                 "notes": "SCORE CAPPED AT 50%: ...",
             }]
 
@@ -1416,8 +1414,6 @@ class TestWriteCsvNewColumns(unittest.TestCase):
                 "student_id": "1", "compiled": "yes", "tests_passed": 2, "tests_total": 2,
                 "score": 2, "max_score": 2, "uncapped_score": 2, "score_cap": "",
                 "passed_tests": "", "failed_tests": "", "failure_details": "",
-                "student_submitted_tests_passed": 0, "student_submitted_tests_total": 0,
-                "student_submitted_failed_tests": "", "student_submitted_failure_details": "",
                 "notes": "",
             }]
 
@@ -1425,7 +1421,7 @@ class TestWriteCsvNewColumns(unittest.TestCase):
 
             lines = out_path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(lines[1].split(","), [
-                "1", "yes", "2", "2", "2", "2", "2", "", "", "", "", "0", "0", "", "", "",
+                "1", "yes", "2", "2", "2", "2", "2", "", "", "", "", "",
             ])
 
 
