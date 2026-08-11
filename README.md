@@ -282,6 +282,30 @@ itself is a short hash, not the student's ID — long/messy real-world filenames
 Windows' path length limit if used directly for a nested build path, so the actual
 student_id only ever appears in the CSV, never in a filesystem path.)
 
+## Reading the results
+
+`results/grades.csv` has one row per student, with these columns:
+
+| Column | What's in it |
+|---|---|
+| `student_id` | Taken straight from the submission's filename/folder, exactly as submitted (not stripped down to the bare number — see `mcvScore.csv` below for that). |
+| `compiled` | `yes` or `no`. |
+| `tests_passed` | Count of official tests that passed. |
+| `tests_total` | Passed + failed official tests (skipped/`@Disabled` tests aren't counted in either). |
+| `score` | Points earned — 1 per passed test by default, or the weighted sum from `tests/rubric.json` if present — **after** any cap from the Grading policy is applied. |
+| `max_score` | Total points possible this week (test count, or the rubric's point total). |
+| `uncapped_score` | What `score` would have been with no cap applied at all — always populated, even when no cap ends up binding, so the pre-cap number is auditable. |
+| `score_cap` | The cap percentage applied (`50%` / `90%` / `45%`), blank if none applied. |
+| `passed_tests` | `;`-separated `ClassName.testMethod` for every passed test. |
+| `failed_tests` | `;`-separated `ClassName.testMethod` for every failed test. |
+| `failure_details` | `;`-separated `ClassName.testMethod: <assertion message>` for every failed test — the actual JUnit failure reason, so you can see why a test failed straight from the CSV instead of re-running it. |
+| `notes` | Anything unusual about this submission: compile errors, `STRUCTURE ERROR`, skipped/colliding files, why a cap applied, a timed-out test run, etc. Empty when nothing noteworthy happened. |
+
+`results/mcvScore.csv` is deliberately minimal — no header row, just `student_id,score` per
+line, with `student_id` stripped down to the bare numeric ID (dropping any `_w1_q2`-style
+tag a submission's filename carried) so it matches MyCourseVille's own records for direct
+gradebook upload.
+
 ## Known behavior / edge cases handled
 
 - **Compile errors** → score 0, the javac error is saved in `notes` so you can see why at
