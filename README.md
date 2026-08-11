@@ -22,18 +22,62 @@ For every student submission, it:
 
 **Score = number of tests passed** by default (not a percentage) — `max_score` is recorded
 alongside it in `grades.csv` so you can see what it was out of. A submission that doesn't
-compile scores 0.
+compile scores 0. A submission missing `.java` source is still graded from a matching
+`.class` file when one is found, capped at 50%/90%/45% depending on why — see **Compiled-only
+submissions** below.
 
 If different test cases are worth different marks (see **Weighted scoring** below), drop a
 `rubric.json` next to that week's tests and `score`/`max_score` become the weighted point
 total instead — no other change needed.
 
+## Grading policy (SLA)
+
+What every submission can expect, regardless of week:
+
+- **Late submissions are docked 10% per day late**, applied as a cap the same way the rules
+  below are — 1 day late caps the score at **90%** of what it would otherwise be, 2 days at
+  **80%**, and so on down to **0%** at 10+ days late. Combines multiplicatively with any
+  other cap in effect, same as the 50%/90% rules below (e.g. a `.class`-only submission 2
+  days late: 0.5 × 0.8 = **40%**). The script has no deadline awareness of its own — this is
+  a manual step: work out each submission's days-late and apply the cap by hand (or
+  pre-multiply the `score` column before writing `mcvScore.csv`) before uploading.
+- **Missing a required class entirely** (no `.java` *and* no `.class` anywhere in the
+  submission) → **0**, rejected before compiling with `STRUCTURE ERROR` in `notes`, listing
+  every class that's missing. See [2c. Required project
+  structure](#2c-optional-required-project-structure).
+- **Submitted only a compiled `.class`** for a required class, no `.java` source anywhere →
+  still graded, from the bytecode, but capped at **50%** of that week's max score, since
+  there's no source to verify. See [2d. Compiled-only
+  submissions](#2d-compiled-only-submissions-class-instead-of-java).
+- **Submitted a `.zip` that needed extra digging** to find anything gradable (e.g. a `.zip`
+  wrapping a `.jar` instead of the project directly) → capped at **90%**, regardless of
+  whether what was eventually found was source or compiled classes. Combines
+  multiplicatively with the 50% rule above when both apply (**45%** total).
+- **Doesn't compile** (with the official tests dropped in, replacing any copy the student
+  bundled) → **0**, with the exact `javac` error saved in `notes` so the reason is always
+  visible, not just the score.
+- **Target Java 17 language level, even if compiled with a newer JDK.** Grading runs on
+  **JDK 25** — a student's `.class` file compiled to a *newer* bytecode version than JDK 25
+  supports can't be loaded at all (`UnsupportedClassVersionError` on every test, or a `bad
+  class file`/`wrong version` compile error) and scores **0**, same as any other
+  compile/run failure. Setting the project's compiler compliance/source-target level to 17
+  (Eclipse: Project Properties → Java Compiler) keeps the submission's bytecode version well
+  under that ceiling regardless of which JDK a student has installed locally.
+
+Every cap and rejection is explained in that student's `notes` column, and `uncapped_score`
+always records what the result would have been with no cap applied, so the pre-cap number is
+auditable even when a cap brought the final `score` down.
+
 ## One-time setup
 
-1. **Install a JDK** (not just a JRE) — `javac` must be on PATH. Check with:
+1. **Install JDK 25** (not just a JRE) — `javac` must be on PATH. Check with:
    ```
    javac -version
    ```
+   JDK 25 is the grading environment's own requirement (see **Grading policy** above) — a
+   student submission is expected to target Java 17, well under it. Grading with an older
+   JDK than 25 risks incorrectly failing a compliant student whose IDE's default project
+   settings still embedded a slightly newer bytecode version than your compiler supports.
 2. **Get the JUnit Console Launcher jar** and put it in `lib/` — see `lib/README.md` for
    the download link. Only keep one jar in that folder.
 
@@ -174,6 +218,38 @@ missing class, not just the first.
 
 **No `tests/structure.json`?** Nothing changes — no structure check runs, exactly as
 before. Entirely opt-in, per week.
+
+### 2d. Compiled-only submissions (`.class` instead of `.java`)
+
+A submission that's missing `.java` source for one of the classes this week's tests
+actually need — but does include that class's own precompiled `.class` somewhere inside
+it (a runnable-jar export that forgot to include source is the usual cause) — is still
+graded from the bytecode instead of being rejected. "Which classes are actually needed"
+comes from `tests/structure.json`'s `required_classes` when you've set that up, **and**
+is inferred automatically from what `tests/*.java` itself imports/constructs either way —
+so this works every week, with or without `structure.json`. A class missing *both* forms
+(no `.java` and no `.class` anywhere) is unaffected by any of this — still a normal
+`STRUCTURE ERROR` (if `structure.json` is set up) or compile error, exactly as before.
+
+Two independent penalties apply to the final score when this kicks in, since there's no
+source to actually verify:
+
+- **Capped at 50%** — one or more required classes had no `.java` source at all, only a
+  `.class` we found and used.
+- **Capped at 90%** — the submission was a `.zip` whose *first* unzip alone didn't turn up
+  anything gradable, meaning we had to dig further (e.g. a `.zip` wrapping a single `.jar`)
+  to find usable content — regardless of whether what we eventually found was source or
+  compiled classes. A `.jar`/`.class` submitted directly (no `.zip` wrapper) never triggers
+  this one, only the 50% rule above can apply to it.
+- **Both at once → 45%** (0.5 × 0.9) — e.g. a `.zip` wrapping a jar that's *also* missing
+  source for a required class.
+
+`grades.csv` gets two new columns for this: `uncapped_score` (what the row would have
+scored with no cap applied, always populated) and `score_cap` (`50%` / `90%` / `45%`, blank
+when no cap applied). `notes` explains why, e.g. `SCORE CAPPED AT 50%: used precompiled
+.class instead of .java source for required class(es): Item, MisaShop`. `mcvScore.csv` is
+unaffected in format — it just carries through whatever the final (already-capped) `score`
+ended up being, same as always.
 
 ### 3. Run it
 
