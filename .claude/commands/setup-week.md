@@ -10,8 +10,8 @@ If no path was given, ask for the path to this week's lab folder (or directly to
 Follow these steps:
 
 0. **Check the private archive first.** If
-   `../TA-test-grading-setup/weekNN/qN/` exists (a sibling folder of this repo's own
-   parent, e.g. `../TA-test-grading-setup/week01/q1/` for Week 1 Q1 — ask the user
+   `../TA-test-grading-setup/weekNN/qN/` exists (a sibling folder of this repo,
+   e.g. `../TA-test-grading-setup/week01/q1/` for Week 1 Q1 — ask the user
    for the week/question number if it's not obvious from the lab folder
    path) — this exact week+question was graded in a past term. Run
    `../TA-test-grading-setup/restore-week.sh weekNN qN` and skip straight to step 6

@@ -42,9 +42,9 @@ again from scratch.
 
 ## Design
 
-### A second, private repo: `Java-Auto-Grader-Tests`
+### A second, private repo: `TA-test-grading-setup`
 
-Created via `gh repo create Java-Auto-Grader-Tests --private` under the
+Created via `gh repo create TA-test-grading-setup --private` under the
 `TK-06` account. Entirely separate from `Java-Auto-Grader` - no submodule
 link, no shared history - so the public repo's visibility can never leak
 into it and vice versa.
@@ -53,7 +53,7 @@ Internal layout, flat by week and question, git history carrying how a
 week's content changed over time rather than parallel per-term folders:
 
 ```
-Java-Auto-Grader-Tests/
+TA-test-grading-setup/
   week01/
     q1/
       tests/
@@ -72,11 +72,11 @@ Java-Auto-Grader-Tests/
 
 ### Local clone location: sibling of `grading/`, never nested inside it
 
-Cloned to `J_Unit_Auto_Grader/grading-tests/` - a sibling of `grading/`, not
+Cloned to `J_Unit_Auto_Grader/TA-test-grading-setup/` - a sibling of `grading/`, not
 a subfolder of it. `tests/` inside `grading/` is already gitignored, so
 nesting the archive clone there wouldn't leak it either, but keeping it
 fully outside the public repo's working tree removes the possibility
-entirely (no accidental `git add -A` inside `grading-tests/` could ever
+entirely (no accidental `git add -A` inside `TA-test-grading-setup/` could ever
 touch `grading`'s history, and vice versa).
 
 ### Two helper scripts, living in the private repo
@@ -85,12 +85,12 @@ Since automatic syncing is a non-goal, these just turn the manual
 clone-and-copy into one command instead of several:
 
 - `restore-week.sh weekNN qN` - copies
-  `grading-tests/weekNN/qN/{tests/*,rubric.json,structure.json}` into
+  `TA-test-grading-setup/weekNN/qN/{tests/*,rubric.json,structure.json}` into
   `grading/tests/`, replacing whatever's there (matching the "whatever was
   there from last week gets replaced" policy `README.md` already documents
   for `tests/`).
 - `archive-week.sh weekNN qN` - the reverse: copies `grading/tests/*` into
-  `grading-tests/weekNN/qN/`, then `git add`/`commit`/`push` in the archive
+  `TA-test-grading-setup/weekNN/qN/`, then `git add`/`commit`/`push` in the archive
   repo.
 
 Both are plain shell scripts with no dependency beyond `cp`/`git`, callable
@@ -99,7 +99,7 @@ from either repo's root.
 ### `setup-week` skill gets one new step at the front
 
 Before extracting anything from the lab docx, check whether
-`grading-tests/weekNN/qN/` already exists. If it does (this exact
+`TA-test-grading-setup/weekNN/qN/` already exists. If it does (this exact
 week+question was graded in a past term), run `restore-week.sh` and skip
 straight to reporting the rubric back - no docx parsing needed. If it
 doesn't, proceed with today's extraction flow exactly as-is, and finish by
@@ -113,7 +113,7 @@ repo, untouched by which week's tests happen to be loaded locally.
 ### TA access
 
 Private repos support collaborators from creation - `Settings →
-Collaborators` on GitHub, or `gh repo add-collaborator Java-Auto-Grader-Tests
+Collaborators` on GitHub, or `gh repo add-collaborator TK-06/TA-test-grading-setup
 <username>`. Not exercised as part of this setup (no TA usernames given
 yet); left for the repo owner to do whenever another TA needs access.
 
