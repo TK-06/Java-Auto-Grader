@@ -2,14 +2,15 @@
 
 Compiles every student's submission together with the week's official JUnit tests, runs
 the tests, and writes the results to a CSV. Built for TAs grading a Data Structures course
-where students submit either a full Eclipse project (zipped or exported as a `.jar`) or a
-single `.java` file.
+where students submit a full Eclipse project, packaged as either a `.zip` or a `.jar`.
 
 ## What it does
 
 For every student submission, it:
-1. Finds all their `.java` files (inside a folder, a `.zip`, a `.jar`, or a single loose
-   file — a JAR is just a ZIP file with a manifest, so both archive types work the same way).
+1. Finds all their `.java` files inside the archive (a `.zip` or a `.jar` — a JAR is just a
+   ZIP file with a manifest, so both work the same way). A submission that isn't a packaged
+   archive at all — a loose `.java` file, or an unpackaged folder, dropped straight into
+   `submissions/` — is rejected before compiling; see **Grading policy** below.
 2. Drops in the week's official test file(s), **overwriting any copy of the same file the
    student bundled in their own submission** — so the official test always wins even though
    Eclipse projects normally ship with the test file already in `src/`.
@@ -41,6 +42,12 @@ What every submission can expect, regardless of week:
   days late: 0.5 × 0.8 = **40%**). The script has no deadline awareness of its own — this is
   a manual step: work out each submission's days-late and apply the cap by hand (or
   pre-multiply the `score` column before writing `mcvScore.csv`) before uploading.
+- **Submitted as bare `.java` source instead of a packaged archive** (a loose `.java` file,
+  or an unpackaged folder of them, dropped straight into `submissions/` — commonly an LMS
+  bulk-download artifact bundling two individually-uploaded files together) → **0**, rejected
+  before compiling with `STRUCTURE ERROR` in `notes`, regardless of whether the source itself
+  would otherwise compile and pass. See [2. Put student submissions in
+  `submissions/`](#2-put-student-submissions-in-submissions).
 - **Missing a required class entirely** (no `.java` *and* no `.class` anywhere in the
   submission) → **0**, rejected before compiling with `STRUCTURE ERROR` in `notes`, listing
   every class that's missing. See [2c. Required project
@@ -92,17 +99,29 @@ thing you change week to week.
 ### 2. Put student submissions in `submissions/`
 
 `submissions/` is **gitignored** on purpose — real student code should never end up
-committed to this shared repo. Each student's submission can be any of these four
-shapes, mixed freely in the same folder:
+committed to this shared repo. **Every submission must be a packaged archive** — a `.zip`
+or a `.jar` — dropped straight into `submissions/` exactly as received, don't unzip or
+extract it yourself:
 
 | What the student sent you | Where it goes | Example |
 |---|---|---|
 | A zipped Eclipse project (`.zip`) | Drop the `.zip` straight into `submissions/`, don't unzip it | `submissions/20304050.zip` |
 | A `.jar` export of an Eclipse project (some students export as JAR instead of ZIP) | Drop the `.jar` straight into `submissions/`, don't extract it | `submissions/20304050.jar` |
-| An unzipped project folder | Drop the whole folder in, any nesting/structure inside is fine | `submissions/20304050/src/Calculator.java` |
-| A single `.java` file (some weeks you'll only ask for one file) | Drop the file straight in | `submissions/20304050.java` |
 
-**Name the zip/jar/folder/file after the student's ID or username** — that's how the script
+**Anything else is rejected outright** — scored 0 with `STRUCTURE ERROR` in `notes`, even if
+the code itself is fine:
+- **An unzipped project folder** dropped directly into `submissions/`
+- **A loose `.java` file** dropped directly into `submissions/`
+
+This mainly shows up as an LMS bulk-download artifact rather than something a student did
+on purpose: a student who uploads two separate `.java` files instead of one archive often
+gets them bundled by the download tool into a same-named folder (e.g.
+`submissions/20304050/` containing `Bot-1237131-....java` and `Part-1237131-....java`) -
+which is exactly what this catches. Submitting a packaged archive is part of the
+assignment's required format, not just a convenience for this grader, so this is never
+fixed by hand on your end — have the student resubmit as a `.zip`/`.jar`.
+
+**Name the zip/jar after the student's ID or username** — that's how the script
 identifies whose grade is whose, and it becomes the `student_id` column in the CSV. If
 your Canvas/Gradescope bulk download already names things that way, you can usually
 point `--submissions` straight at the extracted download folder.

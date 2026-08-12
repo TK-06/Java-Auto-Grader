@@ -17,12 +17,14 @@ from grade import (
     collect_test_results,
     compile_submission_with_fallback,
     discover_submissions,
+    filter_unusable_fallback_matches,
     find_class_fallback_files,
     find_class_files,
     find_java_files,
     find_junit_jar,
     find_nested_archives,
     grade_student,
+    infer_unnamed_package_classes,
     load_structure_baseline,
     prepare_build_dir,
     resolve_class_fallback_dest,
@@ -822,6 +824,9 @@ class TestDiscoverSubmissionsBareClass(unittest.TestCase):
             # Never searches the shared submissions_dir directly - that would risk
             # matching another student's same-named class.
             self.assertNotEqual(sub.class_search_root, submissions_dir)
+            # A loose .class file is its own, separate, intentional path - never
+            # the bare-source format violation.
+            self.assertFalse(sub.not_an_archive)
 
     def test_folder_submission_gets_itself_as_search_root(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -839,6 +844,25 @@ class TestDiscoverSubmissionsBareClass(unittest.TestCase):
             self.assertEqual(len(submissions), 1)
             self.assertEqual(submissions[0].class_search_root, student_dir)
 
+    def test_folder_submission_is_flagged_as_not_an_archive(self):
+        """A directory sitting directly in submissions/ - e.g. an LMS bulk
+        download bundling two individually-uploaded loose files together,
+        such as Bot-<id>-<ts>.java and Part-<id>-<ts>.java - was never a
+        packaged .zip/.jar, regardless of what's found inside it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+            student_dir = submissions_dir / "77778888"
+            student_dir.mkdir()
+            (student_dir / "Bot-1-999.java").write_text("public class Bot {}\n", encoding="utf-8")
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            self.assertTrue(submissions[0].not_an_archive)
+
     def test_loose_java_file_has_no_search_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -853,6 +877,22 @@ class TestDiscoverSubmissionsBareClass(unittest.TestCase):
             submissions = discover_submissions(submissions_dir, extract_root)
 
             self.assertIsNone(submissions[0].class_search_root)
+            self.assertTrue(submissions[0].not_an_archive)
+
+    def test_zip_submission_is_not_flagged_as_bare_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+            zip_path = submissions_dir / "11112222.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("Foo.java", "public class Foo {}\n")
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            self.assertFalse(submissions[0].not_an_archive)
 
 
 class TestCollectRequiredClassNames(unittest.TestCase):
@@ -1015,6 +1055,119 @@ class TestResolveClassFallbackDest(unittest.TestCase):
         self.assertEqual(result, rel)
 
 
+class TestInferUnnamedPackageClasses(unittest.TestCase):
+    def test_unqualified_new_expr_is_unnamed_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / "TestBot.java"
+            tf.write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "class TestBot {\n"
+                "    @Test void t() { Bot b = new Bot(); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(infer_unnamed_package_classes([tf]), {"Bot"})
+
+    def test_qualified_import_is_excluded_even_with_unqualified_new_elsewhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / "ItemTest.java"
+            tf.write_text(
+                "import logic.Item;\n"
+                "import org.junit.jupiter.api.Test;\n"
+                "class ItemTest {\n"
+                "    @Test void t() { Item i = new Item(); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(infer_unnamed_package_classes([tf]), set())
+
+    def test_common_jdk_type_never_included(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / "T.java"
+            tf.write_text(
+                "class T { void t() { Object o = new ArrayList(); } }\n", encoding="utf-8"
+            )
+
+            self.assertEqual(infer_unnamed_package_classes([tf]), set())
+
+
+class TestFilterUnusableFallbackMatches(unittest.TestCase):
+    def _test_file(self, tmp_path: Path) -> Path:
+        tf = tmp_path / "ItemTest.java"
+        tf.write_text(
+            "import org.junit.jupiter.api.Test;\n"
+            "class ItemTest {\n"
+            "    @Test void t() { Item i = new Item(); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        return tf
+
+    def test_drops_candidate_baked_under_mismatched_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            class_search_root = tmp_path / "submission"
+            candidate = class_search_root / "main" / "java" / "Item.class"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"")  # relative_to() never reads file contents
+            test_file = self._test_file(tmp_path)
+
+            kept, notes = filter_unusable_fallback_matches(
+                {"Item": [candidate]}, class_search_root, [test_file]
+            )
+
+            self.assertEqual(kept, {})
+            self.assertEqual(len(notes), 1)
+            self.assertIn("Item.class", notes[0])
+            self.assertIn("main.java", notes[0])
+
+    def test_keeps_candidate_found_at_unnamed_package_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            class_search_root = tmp_path / "submission"
+            class_search_root.mkdir()
+            candidate = class_search_root / "Item.class"
+            candidate.write_bytes(b"")
+            test_file = self._test_file(tmp_path)
+
+            kept, notes = filter_unusable_fallback_matches(
+                {"Item": [candidate]}, class_search_root, [test_file]
+            )
+
+            self.assertEqual(kept, {"Item": [candidate]})
+            self.assertEqual(notes, [])
+
+    def test_leaves_qualified_import_case_untouched(self):
+        # Item required via `import logic.Item;` (not the unnamed-package case) -
+        # this filter must not touch it even though the candidate is still nested;
+        # resolve_class_fallback_dest's own trimming (or correct rejection at
+        # compile time) owns that case, not this filter.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            class_search_root = tmp_path / "submission"
+            candidate = class_search_root / "Q2_toStudent" / "logic" / "Item.class"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"")
+            test_file = tmp_path / "ItemTest.java"
+            test_file.write_text(
+                "import logic.Item;\n"
+                "import org.junit.jupiter.api.Test;\n"
+                "class ItemTest {\n"
+                "    @Test void t() { Item i = new Item(); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            kept, notes = filter_unusable_fallback_matches(
+                {"Item": [candidate]}, class_search_root, [test_file]
+            )
+
+            self.assertEqual(kept, {"Item": [candidate]})
+            self.assertEqual(notes, [])
+
+
 class TestCheckStructureBaselineClassFallback(unittest.TestCase):
     def test_covered_class_is_not_a_violation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1061,6 +1214,24 @@ class TestGradeStudentScoreCap(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         src.unlink()  # only the .class remains - matching a real compiled-only submission
+
+    def _compile_item_class_with_package(self, out_dir: Path, package: str) -> None:
+        """Like _compile_item_class, but the source declares `package <package>;`
+        first - javac itself nests the compiled Item.class under out_dir per the
+        package (e.g. out_dir/main/java/Item.class), matching how a real IDE
+        build output looks for a non-default-package class."""
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as src_tmp:
+            src = Path(src_tmp) / "Item.java"
+            src.write_text(
+                f"package {package};\n"
+                "public class Item { public int getValue() { return 42; } }\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["javac", "-d", str(out_dir), str(src)], capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def _item_test_file(self, tmp_path: Path) -> Path:
         tf = tmp_path / "ItemTest.java"
@@ -1357,6 +1528,83 @@ class TestGradeStudentScoreCap(unittest.TestCase):
             self.assertEqual(row["compiled"], "no")
             self.assertIn("COMPILE ERROR", row["notes"])
             self.assertEqual(row["score_cap"], "")
+
+    def test_fallback_class_baked_under_mismatched_package_is_a_clear_structure_error(self):
+        """The real case this feature targets: a runnable-jar export whose
+        Item.class genuinely declares `package main.java;` (a common IDE
+        default in this course - see strip_package_declaration), alongside
+        some unrelated .java source, for a test that needs Item unqualified.
+        Before this fix, this candidate got seeded into classes/ anyway and
+        only failed once javac ran, as a generic "cannot find symbol" -
+        indistinguishable in the CSV from any other compile error. Now it's
+        dropped up front with a specific note, and - since Item is also in
+        required_classes - correctly reported as a STRUCTURE ERROR instead."""
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            class_search_root = tmp_path / "submission"
+            self._compile_item_class_with_package(class_search_root, "main.java")
+            unrelated_file = class_search_root / "Helper.java"
+            unrelated_file.write_text("public class Helper {}\n", encoding="utf-8")
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000007", "1", [unrelated_file], [], [test_file], ["ItemTest"], junit_jar,
+                build_root, 30, False, None, ["Item"], failed_build_root,
+                class_search_root=class_search_root,
+                zip_needed_deeper_extraction=False,
+                class_fallback_candidates={"Item"},
+            )
+
+            self.assertEqual(row["compiled"], "no")
+            self.assertIn("STRUCTURE ERROR: missing required class Item", row["notes"])
+            self.assertIn("compiled under package 'main.java'", row["notes"])
+            self.assertNotIn("cannot find symbol", row["notes"])
+
+
+class TestGradeStudentNotAnArchive(unittest.TestCase):
+    def test_bare_java_source_is_rejected_even_though_it_would_pass(self):
+        """not_an_archive=True must short-circuit before compiling at all - proven
+        here by giving it genuinely correct, compilable source (matching a real
+        case: a student's Bot.java/Part.java were fine, but bundled by the LMS as
+        loose uploads instead of a .zip/.jar) and confirming it still scores 0
+        with a STRUCTURE ERROR, never actually reaching javac."""
+        junit_jar = find_junit_jar(Path(__file__).resolve().parent / "lib")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            item_file = tmp_path / "Item.java"
+            item_file.write_text(
+                "public class Item { public int getValue() { return 42; } }\n",
+                encoding="utf-8",
+            )
+            test_file = tmp_path / "ItemTest.java"
+            test_file.write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "import static org.junit.jupiter.api.Assertions.*;\n"
+                "class ItemTest {\n"
+                "    @Test void testGetValue() { assertEquals(42, new Item().getValue()); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000008", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar,
+                build_root, 30, False, None, None, failed_build_root,
+                not_an_archive=True,
+            )
+
+            self.assertEqual(row["compiled"], "no")
+            self.assertEqual(row["score"], 0)
+            self.assertIn("STRUCTURE ERROR", row["notes"])
+            self.assertIn("bare .java source", row["notes"])
 
 
 class TestCheckOutputWritable(unittest.TestCase):

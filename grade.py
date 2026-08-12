@@ -17,7 +17,11 @@ regardless of --keep-build. If tests/structure.json is present
 ({"required_classes": [...]}), a submission missing one of those classes as
 BOTH .java and .class is rejected before compiling ("STRUCTURE ERROR" in
 notes), the same way a compile error is - extra classes beyond what's
-required are never flagged.
+required are never flagged. A submission that isn't a packaged .zip/.jar at
+all - a bare loose .java file, or a folder of them (e.g. an LMS bulk
+download bundling separately-uploaded files together) - is likewise a hard
+"STRUCTURE ERROR", regardless of whether the loose source would otherwise
+compile and pass; see the Submission.not_an_archive field.
 
 A submission missing .java source for a class this week's tests actually
 need (structure.json's required_classes, unioned with names automatically
@@ -26,7 +30,12 @@ collect_required_class_names, so this works even without structure.json) is
 still graded from that class's own precompiled .class if one is found
 elsewhere in the submission (a runnable-jar export that dropped source is
 the common case) - capped at 50% of max_score, since there's no source to
-verify. A submission that only yielded gradable content after digging past
+verify. A found .class whose own compiled package could never satisfy the
+official tests (e.g. baked as `package main.java;` when the tests need the
+class unqualified) is excluded up front with a specific note instead of
+being seeded to fail compilation with an unrelated "cannot find symbol" -
+see filter_unusable_fallback_matches. A submission that only yielded
+gradable content after digging past
 a plain unzip (a .zip wrapping a nested jar, say) is capped at 90%,
 independent of whether source was ultimately found. Both apply together
 multiplicatively (0.5 x 0.9 = 45%) when both are true. uncapped_score always
@@ -211,6 +220,36 @@ def collect_required_class_names(test_files: list[Path]) -> set[str]:
                 continue
             names.add(cls)
     return names
+
+
+def infer_unnamed_package_classes(test_files: list[Path]) -> set[str]:
+    """Subset of collect_required_class_names' inferred names that the
+    official tests can ONLY ever see in the unnamed/default package - i.e.
+    named exclusively via a bare `new ClassName(...)` and never via a
+    qualified `import pkg.ClassName;` for that same class anywhere in this
+    week's tests. Used by filter_unusable_fallback_matches to know, before
+    ever seeding a found .class into classes/, whether a candidate that
+    resolve_class_fallback_dest left nested under some directory can
+    possibly work: a class the tests reference unqualified needs to land
+    at the classpath root, full stop, so a candidate that's still nested
+    after resolve_class_fallback_dest's own trimming never will (see that
+    function's docstring for why a compiled .class's real package can't be
+    rewritten the way source text can). A class instead reached via a
+    qualified import is left alone here - resolve_class_fallback_dest
+    already knows how to place (or correctly reject) that case."""
+    qualified: set[str] = set()
+    unqualified: set[str] = set()
+    for tf in test_files:
+        text = tf.read_text(encoding="utf-8", errors="ignore")
+        for pkg, cls in IMPORT_CLASS_RE.findall(text):
+            if pkg.startswith(NON_STUDENT_IMPORT_PREFIXES):
+                continue
+            qualified.add(cls)
+        for cls in NEW_EXPR_RE.findall(text):
+            if cls in COMMON_JDK_TYPE_NAMES:
+                continue
+            unqualified.add(cls)
+    return unqualified - qualified
 
 
 def collect_referenced_packages(test_files: list[Path]) -> set[str]:
@@ -413,6 +452,58 @@ def resolve_class_fallback_dest(rel_path: Path, referenced_packages: set[str]) -
     return Path(*canonical.split(".")) / rel_path.name
 
 
+def filter_unusable_fallback_matches(
+    fallback_matches: dict[str, list[Path]],
+    class_search_root: Path,
+    test_files: list[Path],
+) -> tuple[dict[str, list[Path]], list[str]]:
+    """Drop a found fallback .class candidate that resolve_class_fallback_dest
+    could never place correctly, and say specifically why, instead of
+    silently seeding it and letting compilation fail downstream with an
+    unrelated "cannot find symbol" - the same end score either way (still
+    ungradable), but a note a TA can act on without a manual javap dig.
+
+    Only checked for classes infer_unnamed_package_classes says the tests
+    need in the unnamed package: a class instead reached via a qualified
+    import is left untouched, since resolve_class_fallback_dest's own
+    canonical-package trimming already handles (or correctly rejects) that
+    case on its own. Does NOT change resolve_class_fallback_dest's actual
+    trimming logic or catch a class whose baked-in package merely happens
+    to share a prefix with what's required (e.g. a genuine
+    `package Q2_toStudent.logic;` for a test needing `logic`) - that's
+    still left to run and fail at compile time with "class file contains
+    wrong class", exactly as documented in resolve_class_fallback_dest.
+
+    Returns the filtered {class_name: [files]} dict (a class with zero
+    usable files left is dropped entirely, so it no longer counts as
+    "covered" for check_structure_baseline's covered_by_class_fallback) and
+    the list of explanatory notes for whatever got dropped."""
+    referenced_packages = collect_referenced_packages(test_files)
+    unnamed_required = infer_unnamed_package_classes(test_files)
+    kept: dict[str, list[Path]] = {}
+    notes: list[str] = []
+    for class_name, files in fallback_matches.items():
+        usable: list[Path] = []
+        bad_packages: set[str] = set()
+        for f in files:
+            rel = f.relative_to(class_search_root)
+            dest_rel = resolve_class_fallback_dest(rel, referenced_packages)
+            if class_name in unnamed_required and dest_rel.parent != Path("."):
+                bad_packages.add(".".join(dest_rel.parent.parts))
+                continue
+            usable.append(f)
+        if usable:
+            kept[class_name] = usable
+        else:
+            notes.append(
+                f"found precompiled {class_name}.class elsewhere in the submission, but "
+                f"it's compiled under package '{', '.join(sorted(bad_packages))}' - the "
+                f"official tests need it in the default (unnamed) package, so it can't "
+                f"be used as a substitute"
+            )
+    return kept, notes
+
+
 def find_nested_archives(root: Path) -> list[Path]:
     """.zip/.jar files sitting inside an already-extracted submission - e.g.
     a student who zipped up their built .jar instead of submitting it
@@ -445,13 +536,28 @@ class Submission:
     # the "improper packaging" score-cap signal in grade_student,
     # independent of whether source was ultimately found.
     zip_needed_deeper_extraction: bool = False
+    # True when the raw top-level submissions/ entry was a bare .java file or
+    # a directory of loose files, rather than a .zip/.jar - i.e. the student
+    # never packaged their submission at all (a real case: an LMS bulk
+    # download bundling two individually-uploaded files, e.g.
+    # Bot-<id>-<ts>.java and Part-<id>-<ts>.java, into a folder). Graded as a
+    # hard STRUCTURE ERROR in grade_student regardless of whether the loose
+    # source would otherwise compile and pass - submitting a packaged archive
+    # is part of the assignment's required format, not just a convenience for
+    # this grader. Deliberately does NOT cover a loose .class file - that's
+    # find_class_fallback_files' own, separate, intentional path for a
+    # runnable-jar export that dropped its source, not a format violation.
+    not_an_archive: bool = False
 
 
 def discover_submissions(submissions_dir: Path, extract_root: Path) -> list[Submission]:
     """A submission may be:
-    - a folder (e.g. an unzipped Eclipse project - any nesting under it is scanned via
-      find_java_files, which both filters to *.java and skips known build/IDE folders)
-    - a single loose .java file
+    - a folder (e.g. an LMS bulk download bundling multiple individually-uploaded loose
+      files together - any nesting under it is scanned via find_java_files, which both
+      filters to *.java and skips known build/IDE folders) - graded as a hard
+      STRUCTURE ERROR in grade_student (not_an_archive=True): the assignment requires a
+      packaged .zip/.jar, so this is a format violation regardless of what's inside
+    - a single loose .java file - same STRUCTURE ERROR treatment as a folder, above
     - a single loose .class file (already-compiled, no source at all) - copied into its
       own extract_root/<n>/ so find_class_fallback_files has an isolated place to look
       for it, never the shared submissions_dir (which would risk matching another
@@ -471,9 +577,11 @@ def discover_submissions(submissions_dir: Path, extract_root: Path) -> list[Subm
         print(f"  [{idx + 1}/{total}] unpacking {entry.name} ...", flush=True)
         if entry.is_dir():
             java_files = find_java_files(entry)
-            results.append(Submission(entry.name, java_files, [], class_search_root=entry))
+            results.append(Submission(
+                entry.name, java_files, [], class_search_root=entry, not_an_archive=True,
+            ))
         elif entry.is_file() and entry.suffix == ".java":
-            results.append(Submission(entry.stem, [entry], []))
+            results.append(Submission(entry.stem, [entry], [], not_an_archive=True))
         elif entry.is_file() and entry.suffix == ".class":
             student_id = entry.stem
             class_dir = extract_root / str(idx)
@@ -958,6 +1066,7 @@ def grade_student(
     class_search_root: Path | None = None,
     zip_needed_deeper_extraction: bool = False,
     class_fallback_candidates: set[str] | None = None,
+    not_an_archive: bool = False,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -984,6 +1093,19 @@ def grade_student(
 
         official_names = {f.name for f in test_files}
 
+        if not_an_archive:
+            # Hard fail before ever attempting to compile, regardless of whether the
+            # loose source is otherwise correct - see the Submission.not_an_archive
+            # field for why this is treated as a format violation, not a convenience.
+            row["notes"] = "; ".join(
+                prep_notes + [
+                    "STRUCTURE ERROR: submitted as bare .java source, not a packaged "
+                    ".zip/.jar - the assignment requires an archive submission, "
+                    "regardless of whether the source itself would compile"
+                ]
+            ).strip("; ")
+            return row
+
         # Which of this week's required classes (structure.json's, unioned with
         # collect_required_class_names' inference from the official tests - see
         # main()) are missing .java source, and do we have that class's own
@@ -998,6 +1120,16 @@ def grade_student(
         fallback_matches: dict[str, list[Path]] = {}
         if missing_source and class_search_root is not None:
             fallback_matches = find_class_fallback_files(class_search_root, missing_source)
+            if fallback_matches:
+                # Drop any candidate that could never actually resolve for the
+                # official tests (see filter_unusable_fallback_matches) BEFORE the
+                # structure-baseline check below, so an unusable candidate never
+                # counts as "covered" and masks a real STRUCTURE ERROR behind a
+                # confusing downstream COMPILE ERROR instead.
+                fallback_matches, unusable_notes = filter_unusable_fallback_matches(
+                    fallback_matches, class_search_root, test_files
+                )
+                prep_notes = prep_notes + unusable_notes
 
         if not student_files and not fallback_matches:
             row["notes"] = "; ".join(prep_notes + ["no .java source files found"]).strip("; ")
@@ -1352,6 +1484,7 @@ def main() -> None:
             class_search_root=sub.class_search_root,
             zip_needed_deeper_extraction=sub.zip_needed_deeper_extraction,
             class_fallback_candidates=class_fallback_candidates,
+            not_an_archive=sub.not_an_archive,
         )
         rows.append(row)
         if row["compiled"] == "no":
