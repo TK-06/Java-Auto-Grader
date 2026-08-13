@@ -270,6 +270,46 @@ when no cap applied). `notes` explains why, e.g. `SCORE CAPPED AT 50%: used prec
 unaffected in format — it just carries through whatever the final (already-capped) `score`
 ended up being, same as always.
 
+### 2e. (Optional) Manual-review flags for things JUnit can't catch
+
+Some weeks' marking guides call out a check that can't be expressed as a test assertion —
+e.g. *"reject solutions that re-implement behaviour with instanceof chains instead of
+overriding."* A student who does this can still pass every test (the behavior looks
+identical from the outside), so no `@Test` method can ever catch it — it needs a human to
+actually read the code. If you want that flagged automatically instead of eyeballing every
+submission yourself, create `tests/manual_review.json`:
+
+```json
+{
+    "checks": [
+        {
+            "pattern": "instanceof",
+            "reason": "possible instanceof-chain workaround instead of proper overriding",
+            "exclude_classes": ["Boss"]
+        }
+    ]
+}
+```
+
+- `pattern` — a regex, searched against each student `.java` file's raw source.
+- `reason` — free text, copied straight into the note so you don't have to re-open this
+  file to remember why something got flagged.
+- `exclude_classes` (optional) — class names exempt from *this* check, e.g. a class whose
+  own game rules legitimately require `instanceof` (the `Boss` example above).
+
+`checks` is a list, so one week can flag more than one unrelated pattern (e.g. `instanceof`
+*and* a banned import) without needing a second file.
+
+A match appends `MANUAL REVIEW: <reason> - found in <File.java> (line N), ...` to that
+student's `notes` — **and nothing else**. It never touches `compiled`, `tests_passed`,
+`score`, or any cap; it's purely a flag for you to read and decide on, the same way a TA
+would circle something suspicious on a printed page. A submission can be flagged and still
+score full marks, or fail to compile and also be flagged — the two are completely
+independent.
+
+**No `tests/manual_review.json`?** Nothing changes — no scan runs, exactly as before.
+Entirely opt-in, per week.
+
 ### 3. Run it
 
 ```
@@ -318,7 +358,7 @@ student_id only ever appears in the CSV, never in a filesystem path.)
 | `passed_tests` | `;`-separated `ClassName.testMethod` for every passed test. |
 | `failed_tests` | `;`-separated `ClassName.testMethod` for every failed test. |
 | `failure_details` | `;`-separated `ClassName.testMethod: <assertion message>` for every failed test — the actual JUnit failure reason, so you can see why a test failed straight from the CSV instead of re-running it. |
-| `notes` | Anything unusual about this submission: compile errors, `STRUCTURE ERROR`, skipped/colliding files, why a cap applied, a timed-out test run, etc. Empty when nothing noteworthy happened. |
+| `notes` | Anything unusual about this submission: compile errors, `STRUCTURE ERROR`, skipped/colliding files, why a cap applied, a timed-out test run, `MANUAL REVIEW` flags (see [2e](#2e-optional-manual-review-flags-for-things-junit-cant-catch), score-neutral), etc. Empty when nothing noteworthy happened. |
 
 `results/mcvScore.csv` is deliberately minimal — no header row, just `student_id,score` per
 line, with `student_id` stripped down to the bare numeric ID (dropping any `_w1_q2`-style

@@ -25,11 +25,13 @@ from grade import (
     find_nested_archives,
     grade_student,
     infer_unnamed_package_classes,
+    load_manual_review_checks,
     load_structure_baseline,
     prepare_build_dir,
     resolve_class_fallback_dest,
     rewrite_imports_of_renamed_packages,
     rmtree_with_retry,
+    run_manual_review_checks,
     strip_imports_of_packages,
     strip_package_declaration,
     write_csv,
@@ -491,6 +493,202 @@ class TestCheckStructureBaseline(unittest.TestCase):
             )
 
             self.assertEqual(len(violations), 2)
+
+
+class TestLoadManualReviewChecks(unittest.TestCase):
+    def test_returns_none_when_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(load_manual_review_checks(Path(tmp)))
+
+    def test_parses_a_valid_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(
+                json.dumps({"checks": [
+                    {"pattern": "instanceof", "reason": "possible workaround",
+                     "exclude_classes": ["Boss"]},
+                ]}),
+                encoding="utf-8",
+            )
+
+            result = load_manual_review_checks(tests_dir)
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["pattern"], "instanceof")
+            self.assertEqual(result[0]["exclude_classes"], ["Boss"])
+
+    def test_exclude_classes_defaults_to_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(
+                json.dumps({"checks": [{"pattern": "instanceof", "reason": "x"}]}),
+                encoding="utf-8",
+            )
+
+            result = load_manual_review_checks(tests_dir)
+
+            self.assertNotIn("exclude_classes", result[0])
+
+    def test_exits_loudly_on_empty_checks_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(
+                json.dumps({"checks": []}), encoding="utf-8"
+            )
+
+            with self.assertRaises(SystemExit):
+                load_manual_review_checks(tests_dir)
+
+    def test_exits_loudly_on_missing_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(
+                json.dumps({"checks": [{"pattern": "instanceof"}]}), encoding="utf-8"
+            )
+
+            with self.assertRaises(SystemExit):
+                load_manual_review_checks(tests_dir)
+
+    def test_exits_loudly_on_invalid_regex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(
+                json.dumps({"checks": [{"pattern": "(unclosed", "reason": "x"}]}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(SystemExit):
+                load_manual_review_checks(tests_dir)
+
+
+class TestRunManualReviewChecks(unittest.TestCase):
+    def test_flags_a_matching_file_with_line_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_text(
+                "public class Unit {\n"
+                "    void attack(Unit target) {\n"
+                "        if (target instanceof Warrior) { }\n"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            checks = [{"pattern": "instanceof", "reason": "possible workaround"}]
+
+            notes = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertEqual(len(notes), 1)
+            self.assertIn("possible workaround", notes[0])
+            self.assertIn("Unit.java (line 3)", notes[0])
+
+    def test_excluded_class_is_never_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Boss.java").write_text(
+                "public class Boss {\n"
+                "    void attack(Unit target) {\n"
+                "        if (target instanceof Warrior) { }\n"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            checks = [{
+                "pattern": "instanceof", "reason": "possible workaround",
+                "exclude_classes": ["Boss"],
+            }]
+
+            notes = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertEqual(notes, [])
+
+    def test_official_test_files_are_never_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "UnitHierarchyTest.java").write_text(
+                "class UnitHierarchyTest { boolean b(Object o) { return o instanceof String; } }\n",
+                encoding="utf-8",
+            )
+            checks = [{"pattern": "instanceof", "reason": "possible workaround"}]
+
+            notes = run_manual_review_checks(
+                build_dir, official_names={"UnitHierarchyTest.java"}, checks=checks
+            )
+
+            self.assertEqual(notes, [])
+
+    def test_no_match_produces_no_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_text("public class Unit {}\n", encoding="utf-8")
+            checks = [{"pattern": "instanceof", "reason": "possible workaround"}]
+
+            notes = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertEqual(notes, [])
+
+    def test_only_matching_checks_produce_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_text(
+                "public class Unit { void f(Object o) { boolean b = o instanceof String; } }\n",
+                encoding="utf-8",
+            )
+            checks = [
+                {"pattern": "instanceof", "reason": "instanceof workaround"},
+                {"pattern": "System\\.exit", "reason": "should never call System.exit"},
+            ]
+
+            notes = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertEqual(len(notes), 1)
+            self.assertIn("instanceof workaround", notes[0])
+
+
+class TestGradeStudentManualReview(unittest.TestCase):
+    def test_flag_is_appended_to_notes_without_touching_score(self):
+        """The core guarantee: a manual-review match changes notes only -
+        compiled/tests_passed/score are identical to the same submission
+        graded with no manual_review_checks at all."""
+        junit_jar = find_junit_jar(Path(__file__).resolve().parent / "lib")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            item_file = tmp_path / "Item.java"
+            item_file.write_text(
+                "public class Item {\n"
+                "    public int getValue() { return getValue(new Object()); }\n"
+                "    private int getValue(Object o) { return o instanceof String ? 1 : 42; }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            test_file = tmp_path / "ItemTest.java"
+            test_file.write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "import static org.junit.jupiter.api.Assertions.*;\n"
+                "class ItemTest {\n"
+                "    @Test void testGetValue() { assertEquals(42, new Item().getValue()); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            checks = [{"pattern": "instanceof", "reason": "possible instanceof workaround"}]
+
+            def run(manual_review_checks):
+                build_root = tmp_path / f"build_{manual_review_checks is not None}"
+                build_root.mkdir()
+                failed_build_root = tmp_path / f"failed_{manual_review_checks is not None}"
+                failed_build_root.mkdir()
+                return grade_student(
+                    "10000009", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar,
+                    build_root, 30, False, None, None, failed_build_root,
+                    manual_review_checks=manual_review_checks,
+                )
+
+            flagged_row = run(checks)
+            plain_row = run(None)
+
+            self.assertIn("MANUAL REVIEW", flagged_row["notes"])
+            self.assertIn("Item.java", flagged_row["notes"])
+            for key in ("compiled", "tests_passed", "tests_total", "score", "max_score"):
+                self.assertEqual(flagged_row[key], plain_row[key], key)
 
 
 class TestGradeStudentPreservesFailedBuilds(unittest.TestCase):
