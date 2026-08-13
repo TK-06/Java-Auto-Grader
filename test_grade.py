@@ -10,14 +10,15 @@ from unittest import mock
 from grade import (
     RMTREE_RETRY_ATTEMPTS,
     CompileResult,
+    add_imports,
     bare_student_id,
     check_output_writable,
     check_structure_baseline,
     collect_required_class_names,
     collect_test_results,
     compile_submission_with_fallback,
+    compile_with_class_fallback,
     discover_submissions,
-    filter_unusable_fallback_matches,
     find_class_fallback_files,
     find_class_files,
     find_java_files,
@@ -27,6 +28,7 @@ from grade import (
     infer_unnamed_package_classes,
     load_manual_review_checks,
     load_structure_baseline,
+    partition_fallback_matches,
     prepare_build_dir,
     resolve_class_fallback_dest,
     rewrite_imports_of_renamed_packages,
@@ -1291,7 +1293,7 @@ class TestInferUnnamedPackageClasses(unittest.TestCase):
             self.assertEqual(infer_unnamed_package_classes([tf]), set())
 
 
-class TestFilterUnusableFallbackMatches(unittest.TestCase):
+class TestPartitionFallbackMatches(unittest.TestCase):
     def _test_file(self, tmp_path: Path) -> Path:
         tf = tmp_path / "ItemTest.java"
         tf.write_text(
@@ -1303,7 +1305,7 @@ class TestFilterUnusableFallbackMatches(unittest.TestCase):
         )
         return tf
 
-    def test_drops_candidate_baked_under_mismatched_package(self):
+    def test_candidate_baked_under_mismatched_package_needs_import(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             class_search_root = tmp_path / "submission"
@@ -1312,16 +1314,14 @@ class TestFilterUnusableFallbackMatches(unittest.TestCase):
             candidate.write_bytes(b"")  # relative_to() never reads file contents
             test_file = self._test_file(tmp_path)
 
-            kept, notes = filter_unusable_fallback_matches(
+            safe, needs_import = partition_fallback_matches(
                 {"Item": [candidate]}, class_search_root, [test_file]
             )
 
-            self.assertEqual(kept, {})
-            self.assertEqual(len(notes), 1)
-            self.assertIn("Item.class", notes[0])
-            self.assertIn("main.java", notes[0])
+            self.assertEqual(safe, {})
+            self.assertEqual(needs_import, {"Item": (candidate, "main.java.Item")})
 
-    def test_keeps_candidate_found_at_unnamed_package_root(self):
+    def test_candidate_found_at_unnamed_package_root_is_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             class_search_root = tmp_path / "submission"
@@ -1330,18 +1330,18 @@ class TestFilterUnusableFallbackMatches(unittest.TestCase):
             candidate.write_bytes(b"")
             test_file = self._test_file(tmp_path)
 
-            kept, notes = filter_unusable_fallback_matches(
+            safe, needs_import = partition_fallback_matches(
                 {"Item": [candidate]}, class_search_root, [test_file]
             )
 
-            self.assertEqual(kept, {"Item": [candidate]})
-            self.assertEqual(notes, [])
+            self.assertEqual(safe, {"Item": [candidate]})
+            self.assertEqual(needs_import, {})
 
     def test_leaves_qualified_import_case_untouched(self):
         # Item required via `import logic.Item;` (not the unnamed-package case) -
-        # this filter must not touch it even though the candidate is still nested;
+        # this must stay "safe" even though the candidate is still nested;
         # resolve_class_fallback_dest's own trimming (or correct rejection at
-        # compile time) owns that case, not this filter.
+        # compile time) owns that case, not this function.
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             class_search_root = tmp_path / "submission"
@@ -1358,12 +1358,47 @@ class TestFilterUnusableFallbackMatches(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            kept, notes = filter_unusable_fallback_matches(
+            safe, needs_import = partition_fallback_matches(
                 {"Item": [candidate]}, class_search_root, [test_file]
             )
 
-            self.assertEqual(kept, {"Item": [candidate]})
-            self.assertEqual(notes, [])
+            self.assertEqual(safe, {"Item": [candidate]})
+            self.assertEqual(needs_import, {})
+
+
+class TestAddImports(unittest.TestCase):
+    def test_inserts_after_last_existing_import(self):
+        text = (
+            "import static org.junit.jupiter.api.Assertions.*;\n"
+            "import org.junit.jupiter.api.Test;\n\n"
+            "public class TestBot02 {\n"
+        )
+
+        result = add_imports(text, ["main.java.Bot", "main.java.Part"])
+
+        self.assertEqual(
+            result,
+            "import static org.junit.jupiter.api.Assertions.*;\n"
+            "import org.junit.jupiter.api.Test;\n"
+            "import main.java.Bot;\n"
+            "import main.java.Part;\n\n"
+            "public class TestBot02 {\n",
+        )
+
+    def test_inserts_at_top_when_no_existing_imports(self):
+        text = "public class TestBot02 {\n"
+
+        result = add_imports(text, ["main.java.Bot"])
+
+        self.assertEqual(result, "import main.java.Bot;\npublic class TestBot02 {\n")
+
+    def test_does_not_duplicate_an_existing_import(self):
+        text = "import main.java.Bot;\npublic class TestBot02 {\n"
+
+        result = add_imports(text, ["main.java.Bot"])
+
+        self.assertEqual(result, text)
+        self.assertEqual(result.count("import main.java.Bot;"), 1)
 
 
 class TestCheckStructureBaselineClassFallback(unittest.TestCase):
@@ -1727,16 +1762,21 @@ class TestGradeStudentScoreCap(unittest.TestCase):
             self.assertIn("COMPILE ERROR", row["notes"])
             self.assertEqual(row["score_cap"], "")
 
-    def test_fallback_class_baked_under_mismatched_package_is_a_clear_structure_error(self):
+    def test_fallback_class_baked_under_mismatched_package_recovers_via_import_adjustment(self):
         """The real case this feature targets: a runnable-jar export whose
         Item.class genuinely declares `package main.java;` (a common IDE
         default in this course - see strip_package_declaration), alongside
         some unrelated .java source, for a test that needs Item unqualified.
-        Before this fix, this candidate got seeded into classes/ anyway and
-        only failed once javac ran, as a generic "cannot find symbol" -
-        indistinguishable in the CSV from any other compile error. Now it's
-        dropped up front with a specific note, and - since Item is also in
-        required_classes - correctly reported as a STRUCTURE ERROR instead."""
+        Earlier, this candidate got seeded into classes/ anyway and only
+        failed once javac ran, as a generic "cannot find symbol". Then it was
+        dropped up front with a clear note instead, reported as a
+        STRUCTURE ERROR. Now compile_with_class_fallback gets a genuine
+        chance: it compiles a copy of ItemTest.java with `import
+        main.java.Item;` added, which resolves against this exact real
+        class file, so the test actually runs against real behavior and
+        lands at the normal 50%-cap - the score this student is actually
+        entitled to under the course's own "no source = half credit" policy,
+        not a hard 0."""
         junit_jar = self._junit_jar()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1758,10 +1798,52 @@ class TestGradeStudentScoreCap(unittest.TestCase):
                 class_fallback_candidates={"Item"},
             )
 
+            self.assertEqual(row["compiled"], "yes", row["notes"])
+            self.assertEqual(row["tests_passed"], 1)
+            self.assertEqual(row["uncapped_score"], 1)
+            self.assertEqual(row["score"], 0.5)
+            self.assertEqual(row["score_cap"], "50%")
+            self.assertIn("adjusted the official test's import", row["notes"])
+
+    def test_fallback_class_needing_import_but_genuinely_wrong_package_falls_back_cleanly(self):
+        """The import-adjustment guess is derived from the .class file's own
+        LOCATION in the submission (main/java/), not its actual baked-in
+        package - if those two disagree (a genuine packaging mismatch, not
+        just an extraction wrapper), the generous attempt itself fails to
+        compile (javac's own classfile verification catches it: "class file
+        contains wrong class"), and everything must cleanly revert to
+        today's plain "can't be used" rejection - never a corrupted,
+        half-modified build_dir, and never a false pass."""
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            real_compile_root = tmp_path / "real"
+            self._compile_item_class_with_package(real_compile_root, "different.pkg")
+            real_class = real_compile_root / "different" / "pkg" / "Item.class"
+
+            class_search_root = tmp_path / "submission"
+            misplaced = class_search_root / "main" / "java" / "Item.class"
+            misplaced.parent.mkdir(parents=True)
+            shutil.copy2(real_class, misplaced)
+            unrelated_file = class_search_root / "Helper.java"
+            unrelated_file.write_text("public class Helper {}\n", encoding="utf-8")
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000011", "1", [unrelated_file], [], [test_file], ["ItemTest"], junit_jar,
+                build_root, 30, False, None, ["Item"], failed_build_root,
+                class_search_root=class_search_root,
+                zip_needed_deeper_extraction=False,
+                class_fallback_candidates={"Item"},
+            )
+
             self.assertEqual(row["compiled"], "no")
             self.assertIn("STRUCTURE ERROR: missing required class Item", row["notes"])
-            self.assertIn("compiled under package 'main.java'", row["notes"])
-            self.assertNotIn("cannot find symbol", row["notes"])
+            self.assertIn("still didn't compile", row["notes"])
 
 
 class TestGradeStudentNotAnArchive(unittest.TestCase):

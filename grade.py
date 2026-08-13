@@ -30,13 +30,15 @@ collect_required_class_names, so this works even without structure.json) is
 still graded from that class's own precompiled .class if one is found
 elsewhere in the submission (a runnable-jar export that dropped source is
 the common case) - capped at 50% of max_score, since there's no source to
-verify. A found .class whose own compiled package could never satisfy the
-official tests (e.g. baked as `package main.java;` when the tests need the
-class unqualified) is excluded up front with a specific note instead of
-being seeded to fail compilation with an unrelated "cannot find symbol" -
-see filter_unusable_fallback_matches. A submission that only yielded
-gradable content after digging past
-a plain unzip (a .zip wrapping a nested jar, say) is capped at 90%,
+verify. A found .class whose own compiled package doesn't match what the
+official tests naively expect (e.g. baked as `package main.java;` when the
+tests need the class unqualified) still gets a genuine attempt via an
+import-adjusted copy of just the official test - never the real
+tests/*.java - falling back to a clear "can't be used" note only if that
+attempt itself doesn't compile; see compile_with_class_fallback and
+partition_fallback_matches. A submission that only yielded gradable content
+after digging past a plain unzip (a .zip wrapping a nested jar, say) is
+capped at 90%,
 independent of whether source was ultimately found. Both apply together
 multiplicatively (0.5 x 0.9 = 45%) when both are true. uncapped_score always
 records the pre-cap result; score_cap shows the cap percentage applied
@@ -235,16 +237,15 @@ def infer_unnamed_package_classes(test_files: list[Path]) -> set[str]:
     official tests can ONLY ever see in the unnamed/default package - i.e.
     named exclusively via a bare `new ClassName(...)` and never via a
     qualified `import pkg.ClassName;` for that same class anywhere in this
-    week's tests. Used by filter_unusable_fallback_matches to know, before
-    ever seeding a found .class into classes/, whether a candidate that
-    resolve_class_fallback_dest left nested under some directory can
-    possibly work: a class the tests reference unqualified needs to land
-    at the classpath root, full stop, so a candidate that's still nested
-    after resolve_class_fallback_dest's own trimming never will (see that
-    function's docstring for why a compiled .class's real package can't be
-    rewritten the way source text can). A class instead reached via a
-    qualified import is left alone here - resolve_class_fallback_dest
-    already knows how to place (or correctly reject) that case."""
+    week's tests. Used by partition_fallback_matches to know which candidate
+    a found .class needs an import-adjusted test copy to reach: a class the
+    tests reference unqualified needs to land at the classpath root or be
+    imported by fully-qualified name, one or the other, so a candidate left
+    nested under some directory after resolve_class_fallback_dest's own
+    trimming needs the latter (see compile_with_class_fallback). A class
+    instead reached via a qualified import is left alone here -
+    resolve_class_fallback_dest already knows how to place (or correctly
+    reject) that case on its own."""
     qualified: set[str] = set()
     unqualified: set[str] = set()
     for tf in test_files:
@@ -313,6 +314,26 @@ def rewrite_imports_of_renamed_packages(text: str, renamed_packages: dict[str, s
         return match.group(0).replace(f"{old_pkg}.", f"{new_pkg}.", 1)
 
     return IMPORT_RE.sub(_rename, text)
+
+
+IMPORT_LINE_RE = re.compile(r"^[ \t]*import\s+(?:static\s+)?([\w.*]+)\s*;[ \t]*\r?\n?", re.MULTILINE)
+
+
+def add_imports(text: str, imports: list[str]) -> str:
+    """Inserts `import <fqcn>;` for each entry in imports right after the
+    last existing top-level import statement in text (or at the very top if
+    there are none), skipping any entry text already imports verbatim so
+    calling this twice is harmless. Used only by compile_with_class_fallback
+    to build a throwaway, in-memory copy of an official test file for one
+    compile attempt - see that function for why this never touches the
+    actual file on disk that test_files points at."""
+    matches = list(IMPORT_LINE_RE.finditer(text))
+    existing = {m.group(1) for m in matches}
+    to_add = [f"import {fqcn};\n" for fqcn in imports if fqcn not in existing]
+    if not to_add:
+        return text
+    insert_at = matches[-1].end() if matches else 0
+    return text[:insert_at] + "".join(to_add) + text[insert_at:]
 
 
 def truncate(text: str) -> str:
@@ -460,56 +481,54 @@ def resolve_class_fallback_dest(rel_path: Path, referenced_packages: set[str]) -
     return Path(*canonical.split(".")) / rel_path.name
 
 
-def filter_unusable_fallback_matches(
+def partition_fallback_matches(
     fallback_matches: dict[str, list[Path]],
     class_search_root: Path,
     test_files: list[Path],
-) -> tuple[dict[str, list[Path]], list[str]]:
-    """Drop a found fallback .class candidate that resolve_class_fallback_dest
-    could never place correctly, and say specifically why, instead of
-    silently seeding it and letting compilation fail downstream with an
-    unrelated "cannot find symbol" - the same end score either way (still
-    ungradable), but a note a TA can act on without a manual javap dig.
+) -> tuple[dict[str, list[Path]], dict[str, tuple[Path, str]]]:
+    """Splits fallback_matches into (safe, needs_import).
 
-    Only checked for classes infer_unnamed_package_classes says the tests
-    need in the unnamed package: a class instead reached via a qualified
-    import is left untouched, since resolve_class_fallback_dest's own
-    canonical-package trimming already handles (or correctly rejects) that
-    case on its own. Does NOT change resolve_class_fallback_dest's actual
-    trimming logic or catch a class whose baked-in package merely happens
-    to share a prefix with what's required (e.g. a genuine
-    `package Q2_toStudent.logic;` for a test needing `logic`) - that's
-    still left to run and fail at compile time with "class file contains
-    wrong class", exactly as documented in resolve_class_fallback_dest.
+    safe candidates resolve_class_fallback_dest already places correctly on
+    its own - found directly at the unnamed-package root, or reached via a
+    qualified import that its canonical-package trimming handles (or
+    correctly rejects with "class file contains wrong class" at compile
+    time, exactly as documented in resolve_class_fallback_dest) - unchanged
+    from before this function existed.
 
-    Returns the filtered {class_name: [files]} dict (a class with zero
-    usable files left is dropped entirely, so it no longer counts as
-    "covered" for check_structure_baseline's covered_by_class_fallback) and
-    the list of explanatory notes for whatever got dropped."""
+    needs_import holds a class infer_unnamed_package_classes says the tests
+    need UNQUALIFIED whose only candidate(s) are compiled under some other
+    real named package instead (e.g. `main.java`, a common IDE default this
+    exact cohort's SOURCE submissions already get forgiven for via
+    strip_package_declaration - this is the .class-only equivalent): one
+    representative (file, fully-qualified class name) per class name,
+    worth a genuine attempt via add_imports + compile_with_class_fallback
+    rather than an outright rejection, since the class file itself may be
+    entirely correct and just sitting somewhere the test wasn't written to
+    import from. Never modifies resolve_class_fallback_dest's own trimming
+    logic - a class whose real package merely SHARES a prefix with what's
+    required is still left to that function and to compile-time
+    verification, not decided here."""
     referenced_packages = collect_referenced_packages(test_files)
     unnamed_required = infer_unnamed_package_classes(test_files)
-    kept: dict[str, list[Path]] = {}
-    notes: list[str] = []
+    safe: dict[str, list[Path]] = {}
+    needs_import: dict[str, tuple[Path, str]] = {}
     for class_name, files in fallback_matches.items():
-        usable: list[Path] = []
-        bad_packages: set[str] = set()
+        safe_files: list[Path] = []
+        candidate: tuple[Path, str] | None = None
         for f in files:
             rel = f.relative_to(class_search_root)
             dest_rel = resolve_class_fallback_dest(rel, referenced_packages)
             if class_name in unnamed_required and dest_rel.parent != Path("."):
-                bad_packages.add(".".join(dest_rel.parent.parts))
+                if candidate is None:
+                    package = ".".join(dest_rel.parent.parts)
+                    candidate = (f, f"{package}.{class_name}")
                 continue
-            usable.append(f)
-        if usable:
-            kept[class_name] = usable
-        else:
-            notes.append(
-                f"found precompiled {class_name}.class elsewhere in the submission, but "
-                f"it's compiled under package '{', '.join(sorted(bad_packages))}' - the "
-                f"official tests need it in the default (unnamed) package, so it can't "
-                f"be used as a substitute"
-            )
-    return kept, notes
+            safe_files.append(f)
+        if safe_files:
+            safe[class_name] = safe_files
+        elif candidate is not None:
+            needs_import[class_name] = candidate
+    return safe, needs_import
 
 
 def find_nested_archives(root: Path) -> list[Path]:
@@ -1145,6 +1164,79 @@ def run_manual_review_checks(
     return notes
 
 
+def compile_with_class_fallback(
+    build_dir: Path,
+    junit_jar: Path,
+    timeout: int,
+    official_names: set[str],
+    test_files: list[Path],
+    needs_import: dict[str, tuple[Path, str]],
+) -> tuple[CompileResult, list[str], list[str]]:
+    """Official test .java files are already sitting in build_dir as verbatim
+    copies (see prepare_build_dir) when this runs. needs_import (see
+    partition_fallback_matches) names classes whose only fallback .class is
+    compiled under a real package the official tests weren't written to
+    import from - e.g. `main.java`, baked permanently into that .class's own
+    bytecode (see resolve_class_fallback_dest's docstring for why that can
+    never be changed by moving the file). The class itself may be entirely
+    correct; only the test's own import is missing.
+
+    For each such class, every official test file that references it via a
+    bare `new ClassName(...)` gets add_imports applied to an IN-MEMORY copy
+    of its text, OVERWRITING the copy already sitting in build_dir - never
+    the file test_files itself points at, which this function never opens
+    for writing. A single compile is then attempted with those adjustments
+    in place. If it succeeds, that's the final answer: the class genuinely
+    works once the test can see it, so it's graded for real against the
+    student's real, unmodified bytecode - the caller still applies the
+    normal 50%-cap policy on top, since there's still no .java source to
+    verify. If it fails, every adjusted file is restored to its exact
+    original content (byte-for-byte, so a second failed guess can never
+    leave build_dir in a worse state than before this function ran) and one
+    plain compile is attempted with no adjustment at all, matching exactly
+    what would have happened had needs_import been empty from the start.
+
+    Returns (compile_result, used_names, notes): used_names is which
+    needs_import class names the successful attempt actually resolved
+    (list(needs_import) on success, empty list if nothing was attempted or
+    the attempt failed and was reverted) - the caller uses an empty
+    used_names to know it must re-derive structure/compile-error reporting
+    without treating needs_import as covered."""
+    if not needs_import:
+        result, notes = compile_submission_with_fallback(build_dir, junit_jar, timeout, official_names)
+        return result, [], notes
+
+    imports_by_test_file: dict[Path, list[str]] = {}
+    for class_name, (_file, fqcn) in needs_import.items():
+        for tf in test_files:
+            text = tf.read_text(encoding="utf-8", errors="ignore")
+            if re.search(rf"\bnew\s+{re.escape(class_name)}\s*[(<]", text):
+                imports_by_test_file.setdefault(build_dir / tf.name, []).append(fqcn)
+
+    originals: dict[Path, str] = {}
+    for dest, fqcns in imports_by_test_file.items():
+        original_text = dest.read_text(encoding="utf-8", errors="ignore")
+        originals[dest] = original_text
+        dest.write_text(add_imports(original_text, fqcns), encoding="utf-8")
+
+    result, notes = compile_submission_with_fallback(build_dir, junit_jar, timeout, official_names)
+    if result.success:
+        used_names = sorted(needs_import)
+        notes = notes + [
+            f"found precompiled {name}.class elsewhere in the submission, compiled "
+            f"under a different package than the official tests expect - adjusted "
+            f"the official test's import to reach it directly (no .java source to "
+            f"verify, so still capped)"
+            for name in used_names
+        ]
+        return result, used_names, notes
+
+    for dest, original_text in originals.items():
+        dest.write_text(original_text, encoding="utf-8")
+    result, notes = compile_submission_with_fallback(build_dir, junit_jar, timeout, official_names)
+    return result, [], notes
+
+
 def grade_student(
     student_id: str,
     build_key: str,
@@ -1220,27 +1312,36 @@ def grade_student(
         }
         missing_source = (class_fallback_candidates or set()) - present_java_classes
         fallback_matches: dict[str, list[Path]] = {}
+        needs_import: dict[str, tuple[Path, str]] = {}
         if missing_source and class_search_root is not None:
-            fallback_matches = find_class_fallback_files(class_search_root, missing_source)
-            if fallback_matches:
-                # Drop any candidate that could never actually resolve for the
-                # official tests (see filter_unusable_fallback_matches) BEFORE the
-                # structure-baseline check below, so an unusable candidate never
-                # counts as "covered" and masks a real STRUCTURE ERROR behind a
-                # confusing downstream COMPILE ERROR instead.
-                fallback_matches, unusable_notes = filter_unusable_fallback_matches(
-                    fallback_matches, class_search_root, test_files
+            raw_matches = find_class_fallback_files(class_search_root, missing_source)
+            if raw_matches:
+                # Split into candidates resolve_class_fallback_dest already places
+                # correctly (fallback_matches) and ones compiled under a real
+                # package the official tests weren't written to import from
+                # (needs_import) - see partition_fallback_matches. The latter
+                # still get a genuine compile attempt below (see
+                # compile_with_class_fallback) rather than being rejected
+                # outright, since the class file itself may be entirely correct.
+                fallback_matches, needs_import = partition_fallback_matches(
+                    raw_matches, class_search_root, test_files
                 )
-                prep_notes = prep_notes + unusable_notes
 
-        if not student_files and not fallback_matches:
+        # Both fallback_matches and needs_import count as "something was found"
+        # for the checks below - whether a needs_import candidate truly resolves
+        # is only known once compile_with_class_fallback actually tries it.
+        all_candidates: dict[str, list[Path]] = {k: list(v) for k, v in fallback_matches.items()}
+        for name, (f, _fqcn) in needs_import.items():
+            all_candidates.setdefault(name, []).append(f)
+
+        if not student_files and not all_candidates:
             row["notes"] = "; ".join(prep_notes + ["no .java source files found"]).strip("; ")
             return row
 
         if required_classes is not None:
             violations = check_structure_baseline(
                 build_dir, official_names, required_classes,
-                covered_by_class_fallback=set(fallback_matches),
+                covered_by_class_fallback=set(all_candidates),
             )
             if violations:
                 row["notes"] = "; ".join(
@@ -1248,15 +1349,14 @@ def grade_student(
                 ).strip("; ")
                 return row
 
-        if fallback_matches:
-            # Seed the discovered .class files into classes/ BEFORE compiling -
-            # compile_submission puts classes_dir on javac's own -cp too, so any
-            # remaining .java that references one of these classes as a
-            # dependency still resolves. Each file's destination is resolved
-            # against the official tests' own referenced packages (see
-            # resolve_class_fallback_dest) so an extra wrapper directory in the
-            # submission (e.g. Q2_toStudent/logic/Item.class) doesn't leave the
-            # class undiscoverable on the classpath at package `logic`.
+        if all_candidates:
+            # Seed every discovered .class file into classes/ BEFORE compiling, at
+            # its own natural resolved location - compile_submission puts
+            # classes_dir on javac's own -cp too, so any remaining .java that
+            # references one of these classes as a dependency still resolves. A
+            # needs_import candidate sitting here with nothing importing it yet
+            # is harmless either way: compile_with_class_fallback decides next
+            # whether an adjusted test import can actually reach it.
             referenced_packages = collect_referenced_packages(test_files)
             classes_dir = build_dir / "classes"
             classes_dir.mkdir(exist_ok=True)
@@ -1268,7 +1368,7 @@ def grade_student(
             # copy2 would silently let the later one win; note it instead so a TA
             # reviewing a surprising score knows to check --keep-build.
             collisions: list[str] = []
-            for files in fallback_matches.values():
+            for files in all_candidates.values():
                 for f in files:
                     rel = resolve_class_fallback_dest(f.relative_to(class_search_root), referenced_packages)
                     dest = classes_dir / rel
@@ -1279,23 +1379,52 @@ def grade_student(
                         )
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(f, dest)
-            prep_notes = prep_notes + [
-                "found precompiled .class (no .java source) for required class(es): "
-                + ", ".join(sorted(fallback_matches))
-            ]
+            if fallback_matches:
+                prep_notes = prep_notes + [
+                    "found precompiled .class (no .java source) for required class(es): "
+                    + ", ".join(sorted(fallback_matches))
+                ]
             if collisions:
                 prep_notes = prep_notes + [
                     "WARNING: multiple .class files resolved to the same classpath "
                     "location, only the last one found was used: " + "; ".join(collisions)
                 ]
 
-        compile_result, fallback_notes = compile_submission_with_fallback(
-            build_dir, junit_jar, timeout, official_names
+        compile_result, used_needs_import, compile_notes = compile_with_class_fallback(
+            build_dir, junit_jar, timeout, official_names, test_files, needs_import
         )
-        prep_notes = prep_notes + fallback_notes
+        prep_notes = prep_notes + compile_notes
+
         if not compile_result.success:
+            if needs_import and not used_needs_import:
+                # The generous, import-adjusted attempt didn't pan out and has
+                # already been fully reverted inside compile_with_class_fallback -
+                # re-derive whether this is now a genuine STRUCTURE ERROR (the
+                # class truly has no usable form at all) using only fallback_matches
+                # as "covered", exactly as if needs_import had never been found.
+                prep_notes = prep_notes + [
+                    f"found precompiled {name}.class elsewhere in the submission, but "
+                    f"using it (via an adjusted test import) still didn't compile, so "
+                    f"it can't be used as a substitute"
+                    for name in sorted(needs_import)
+                ]
+                if required_classes is not None:
+                    violations = check_structure_baseline(
+                        build_dir, official_names, required_classes,
+                        covered_by_class_fallback=set(fallback_matches),
+                    )
+                    if violations:
+                        row["notes"] = "; ".join(
+                            prep_notes + [f"STRUCTURE ERROR: {v}" for v in violations]
+                        ).strip("; ")
+                        return row
             row["notes"] = "; ".join(prep_notes + [f"COMPILE ERROR: {compile_result.output}"]).strip("; ")
             return row
+
+        if used_needs_import:
+            fallback_matches = {**fallback_matches}
+            for name in used_needs_import:
+                fallback_matches[name] = [needs_import[name][0]]
 
         reports_dir = build_dir / "reports"
         reports_dir.mkdir(exist_ok=True)
