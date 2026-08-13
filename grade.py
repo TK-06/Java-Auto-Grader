@@ -41,6 +41,14 @@ independent of whether source was ultimately found. Both apply together
 multiplicatively (0.5 x 0.9 = 45%) when both are true. uncapped_score always
 records the pre-cap result; score_cap shows the cap percentage applied
 ("" when none); notes explains why ("SCORE CAPPED AT n%: ...").
+
+If tests/manual_review.json is present ({"checks": [{"pattern": <regex>,
+"reason": <str>, "exclude_classes": [...]}, ...]}), every student .java file
+is scanned against each pattern and a match appends a "MANUAL REVIEW: ..."
+note - purely a flag for a TA to read, never a score change. For behavior
+JUnit's tests structurally can't tell apart from the real thing, e.g. a
+submission that fakes polymorphic dispatch with an instanceof chain instead
+of overriding; see load_manual_review_checks / run_manual_review_checks.
 """
 import argparse
 import csv
@@ -1010,6 +1018,60 @@ def load_structure_baseline(tests_dir: Path) -> list[str] | None:
     return required
 
 
+def load_manual_review_checks(tests_dir: Path) -> list[dict] | None:
+    """Optional tests/manual_review.json: {"checks": [{"pattern": <regex>,
+    "reason": <str>, "exclude_classes": [<class name>, ...]}, ...]}. When
+    present, run_manual_review_checks scans every student .java file for
+    each pattern and appends a non-scoring "MANUAL REVIEW: ..." note to
+    notes when one matches - never touches compiled/tests_passed/score,
+    purely a flag for a TA to read. For things JUnit's behavioral tests
+    structurally can't catch - e.g. a submission that reimplements
+    polymorphic dispatch with an instanceof chain instead of overriding
+    passes the exact same tests either way, so the tests alone can't tell
+    the two apart. Absent by default so weeks without one behave exactly
+    as before. Malformed (not just absent) fails loudly at startup, the
+    same way tests/structure.json does - a broken config for the whole
+    run should never be discovered one student at a time. "exclude_classes"
+    is optional per check (defaults to none exempted) - e.g. a week whose
+    game rules legitimately require one specific class to use instanceof."""
+    checks_path = tests_dir / "manual_review.json"
+    if not checks_path.exists():
+        return None
+    with open(checks_path, encoding="utf-8") as f:
+        data = json.load(f)
+    checks = data.get("checks")
+    if not isinstance(checks, list) or not checks:
+        sys.exit(
+            f'ERROR: {checks_path} must contain a non-empty "checks" list, e.g. '
+            f'{{"checks": [{{"pattern": "instanceof", "reason": "...", '
+            f'"exclude_classes": ["Boss"]}}]}}.'
+        )
+    for check in checks:
+        if (
+            not isinstance(check, dict)
+            or not isinstance(check.get("pattern"), str)
+            or not isinstance(check.get("reason"), str)
+        ):
+            sys.exit(
+                f'ERROR: every entry in {checks_path}\'s "checks" list needs a string '
+                f'"pattern" and a string "reason".'
+            )
+        exclude = check.get("exclude_classes", [])
+        if not isinstance(exclude, list) or not all(isinstance(c, str) for c in exclude):
+            sys.exit(
+                f'ERROR: "exclude_classes" in {checks_path} must be a list of class '
+                f"name strings."
+            )
+        try:
+            re.compile(check["pattern"])
+        except re.error as exc:
+            sys.exit(
+                f'ERROR: invalid regex "pattern" in {checks_path}: '
+                f"{check['pattern']!r} ({exc})"
+            )
+    return checks
+
+
 def check_structure_baseline(
     build_dir: Path,
     official_names: set[str],
@@ -1049,6 +1111,40 @@ def check_structure_baseline(
     ]
 
 
+def run_manual_review_checks(
+    build_dir: Path, official_names: set[str], checks: list[dict]
+) -> list[str]:
+    """Scans every student .java file already flattened into build_dir (see
+    prepare_build_dir - Main.java already excluded, packages already
+    resolved to their canonical names) against each tests/manual_review.json
+    check, skipping a file for a given check when that file's own resolved
+    class name is in the check's "exclude_classes". A match produces one
+    note PER CHECK (not per file), listing every matching file and the
+    1-based line number of its first match, e.g. "MANUAL REVIEW: <reason> -
+    found in Unit.java (line 14), Warrior.java (line 22)". Purely additive -
+    the caller folds this into notes alongside everything else; it never
+    touches compiled, tests_passed, or score itself."""
+    student_files = sorted(
+        f for f in build_dir.glob("*.java") if f.name not in official_names
+    )
+    notes: list[str] = []
+    for check in checks:
+        pattern = re.compile(check["pattern"])
+        excluded = set(check.get("exclude_classes", []))
+        hits: list[str] = []
+        for f in student_files:
+            if f.stem in excluded:
+                continue
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            match = pattern.search(text)
+            if match:
+                line_no = text.count("\n", 0, match.start()) + 1
+                hits.append(f"{f.name} (line {line_no})")
+        if hits:
+            notes.append(f"MANUAL REVIEW: {check['reason']} - found in {', '.join(hits)}")
+    return notes
+
+
 def grade_student(
     student_id: str,
     build_key: str,
@@ -1067,6 +1163,7 @@ def grade_student(
     zip_needed_deeper_extraction: bool = False,
     class_fallback_candidates: set[str] | None = None,
     not_an_archive: bool = False,
+    manual_review_checks: list[dict] | None = None,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -1092,6 +1189,11 @@ def grade_student(
         prep_notes = discovery_notes + prep_notes
 
         official_names = {f.name for f in test_files}
+
+        if manual_review_checks:
+            prep_notes = prep_notes + run_manual_review_checks(
+                build_dir, official_names, manual_review_checks
+            )
 
         if not_an_archive:
             # Hard fail before ever attempting to compile, regardless of whether the
@@ -1425,6 +1527,7 @@ def main() -> None:
     test_classes = [test_class_fqcn(tf) for tf in test_files]
     rubric = load_rubric(tests_dir)
     required_classes = load_structure_baseline(tests_dir)
+    manual_review_checks = load_manual_review_checks(tests_dir)
     class_fallback_candidates = collect_required_class_names(test_files) | set(required_classes or [])
 
     if build_root.exists():
@@ -1466,6 +1569,13 @@ def main() -> None:
         print(f"  structure:   {tests_dir / 'structure.json'}  (required classes: {', '.join(required_classes)})")
     else:
         print("  structure:   none (tests/structure.json not found - no structure check)")
+    if manual_review_checks is not None:
+        print(
+            f"  manual review: {tests_dir / 'manual_review.json'}  "
+            f"({len(manual_review_checks)} check(s) - notes only, never affects score)"
+        )
+    else:
+        print("  manual review: none (tests/manual_review.json not found)")
     print(
         f"  class fallback: {', '.join(sorted(class_fallback_candidates)) or '(none inferred)'} "
         f"- a submission missing .java for one of these but with a matching .class is still "
@@ -1485,6 +1595,7 @@ def main() -> None:
             zip_needed_deeper_extraction=sub.zip_needed_deeper_extraction,
             class_fallback_candidates=class_fallback_candidates,
             not_an_archive=sub.not_an_archive,
+            manual_review_checks=manual_review_checks,
         )
         rows.append(row)
         if row["compiled"] == "no":
