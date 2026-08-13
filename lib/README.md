@@ -1,6 +1,9 @@
 ## JUnit Console Launcher jar
 
 `grade.py` needs the JUnit Platform Console Launcher standalone jar in this folder.
+`junit-platform-console-standalone-1.14.0.jar` is already committed here, so a fresh
+clone works with no setup step. The instructions below are only for bumping to a newer
+version later.
 
 **Option A — Maven Central (recommended):**
 Download a `junit-platform-console-standalone-*.jar` from
