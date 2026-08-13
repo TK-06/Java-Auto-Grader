@@ -85,8 +85,9 @@ auditable even when a cap brought the final `score` down.
    student submission is expected to target Java 17, well under it. Grading with an older
    JDK than 25 risks incorrectly failing a compliant student whose IDE's default project
    settings still embedded a slightly newer bytecode version than your compiler supports.
-2. **Get the JUnit Console Launcher jar** and put it in `lib/` — see `lib/README.md` for
-   the download link. Only keep one jar in that folder.
+2. **The JUnit Console Launcher jar is already committed in `lib/`** — a fresh clone works
+   with no download step. See `lib/README.md` only if you need to bump it to a newer version
+   later; keep just the one jar in that folder either way.
 
 ## Weekly workflow
 
@@ -270,6 +271,19 @@ when no cap applied). `notes` explains why, e.g. `SCORE CAPPED AT 50%: used prec
 unaffected in format — it just carries through whatever the final (already-capped) `score`
 ended up being, same as always.
 
+**When the found `.class` is compiled under a different package than the test expects**
+(e.g. baked as `package main.java;` — the same common IDE default that source submissions
+already get forgiven for, just with no source left to strip it from) it still gets a real
+shot: a throwaway copy of just the affected official test file gets a matching `import`
+added (never the real `tests/*.java` — deleted along with the rest of that student's build
+directory once grading moves on) and compilation is attempted against that. If it compiles,
+the class evidently works fine once the test can actually see it, so it's graded for real
+against the student's real, unmodified bytecode and capped at 50% exactly as above — this
+is what recovers credit that's rightfully earned instead of scoring a correct submission 0
+over an import path. If it doesn't compile, everything reverts and the submission falls
+back to exactly the STRUCTURE ERROR / compile error it would have gotten otherwise, with a
+note explaining the attempt was made and didn't pan out.
+
 ### 2e. (Optional) Manual-review flags for things JUnit can't catch
 
 Some weeks' marking guides call out a check that can't be expressed as a test assertion —
@@ -399,10 +413,11 @@ grading/                  <- repo root
   grade.py
   README.md
   lib/
-    junit-platform-console-standalone-*.jar   <- you download this, not committed
+    junit-platform-console-standalone-*.jar   <- committed; see lib/README.md to update it
     README.md
   submissions/             <- gitignored; this week's real student work goes here
-  tests/                   <- gitignored; this week's official test file(s) + rubric.json
+  tests/                   <- gitignored; this week's official test file(s), plus optional
+                              rubric.json / structure.json / manual_review.json
   results/
     grades.csv              <- gitignored output
     mcvScore.csv             <- gitignored output, bare student IDs for MyCourseVille
