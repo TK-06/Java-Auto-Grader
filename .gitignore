@@ -2,6 +2,10 @@
 submissions/*
 !submissions/.gitkeep
 
+# scratch copies of submissions for local testing - never commit these either
+submissions2/*
+!submissions2/.gitkeep
+
 # this week's official test cases / rubric - course material, never commit these either
 tests/*
 !tests/.gitkeep
