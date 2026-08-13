@@ -11,7 +11,11 @@ results/*.csv
 # extracted student code from failed-to-compile submissions (see grade_student
 # in grade.py) - same privacy category as submissions/, never commit it
 results/failed_builds/
+# junit-platform-console-standalone is committed on purpose (see lib/README.md)
+# so a fresh clone works without a manual download - ignore any OTHER jar
+# someone drops in here instead (e.g. a stray version bump left alongside it)
 lib/*.jar
+!lib/junit-platform-console-standalone-1.14.0.jar
 __pycache__/
 *.pyc
 
