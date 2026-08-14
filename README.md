@@ -25,7 +25,9 @@ For every student submission, it:
 alongside it in `grades.csv` so you can see what it was out of. A submission that doesn't
 compile scores 0. A submission missing `.java` source is still graded from a matching
 `.class` file when one is found, capped at 50%/90%/45% depending on why — see **Compiled-only
-submissions** below.
+submissions** below. A submission can also be capped at 0% despite compiling and passing
+every test, if a `tests/manual_review.json` check with `"auto_reject": true` matched — see
+**Manual-review flags** below.
 
 If different test cases are worth different marks (see **Weighted scoring** below), drop a
 `rubric.json` next to that week's tests and `score`/`max_score` become the weighted point
@@ -60,6 +62,11 @@ What every submission can expect, regardless of week:
   wrapping a `.jar` instead of the project directly) → capped at **90%**, regardless of
   whether what was eventually found was source or compiled classes. Combines
   multiplicatively with the 50% rule above when both apply (**45%** total).
+- **Matched a `tests/manual_review.json` check with `"auto_reject": true`** (opt-in, per
+  week — e.g. a marking guide that says to reject an instanceof-chain workaround) → capped
+  at **0%**, even though it compiled and passed every test. Combines multiplicatively with
+  the other caps too, but since it's ×0 it always wins regardless. See [2e. Manual-review
+  flags](#2e-optional-manual-review-flags-for-things-junit-cant-catch).
 - **Doesn't compile** (with the official tests dropped in, replacing any copy the student
   bundled) → **0**, with the exact `javac` error saved in `notes` so the reason is always
   visible, not just the score.
@@ -263,13 +270,18 @@ source to actually verify:
   this one, only the 50% rule above can apply to it.
 - **Both at once → 45%** (0.5 × 0.9) — e.g. a `.zip` wrapping a jar that's *also* missing
   source for a required class.
+- **Capped at 0%** — a `tests/manual_review.json` check with `"auto_reject": true` matched
+  (see [2e](#2e-optional-manual-review-flags-for-things-junit-cant-catch)). Multiplies in
+  with the other two exactly the same way, but since it's ×0 it always wins outright
+  regardless of what else applied.
 
 `grades.csv` gets two new columns for this: `uncapped_score` (what the row would have
-scored with no cap applied, always populated) and `score_cap` (`50%` / `90%` / `45%`, blank
-when no cap applied). `notes` explains why, e.g. `SCORE CAPPED AT 50%: used precompiled
+scored with no cap applied, always populated) and `score_cap` (`50%` / `90%` / `45%` / `0%`,
+blank when no cap applied). `notes` explains why, e.g. `SCORE CAPPED AT 50%: used precompiled
 .class instead of .java source for required class(es): Item, MisaShop`. `mcvScore.csv` is
 unaffected in format — it just carries through whatever the final (already-capped) `score`
-ended up being, same as always.
+ended up being, same as always, so a `0%`-capped student uploads as an actual 0 with no
+extra step on your part.
 
 **When the found `.class` is compiled under a different package than the test expects**
 (e.g. baked as `package main.java;` — the same common IDE default that source submissions
@@ -299,7 +311,8 @@ submission yourself, create `tests/manual_review.json`:
         {
             "pattern": "instanceof",
             "reason": "possible instanceof-chain workaround instead of proper overriding",
-            "exclude_classes": ["Boss"]
+            "exclude_classes": ["Boss"],
+            "auto_reject": true
         }
     ]
 }
@@ -310,16 +323,35 @@ submission yourself, create `tests/manual_review.json`:
   file to remember why something got flagged.
 - `exclude_classes` (optional) — class names exempt from *this* check, e.g. a class whose
   own game rules legitimately require `instanceof` (the `Boss` example above).
+- `auto_reject` (optional, defaults to `false`) — see below.
 
 `checks` is a list, so one week can flag more than one unrelated pattern (e.g. `instanceof`
 *and* a banned import) without needing a second file.
 
-A match appends `MANUAL REVIEW: <reason> - found in <File.java> (line N), ...` to that
-student's `notes` — **and nothing else**. It never touches `compiled`, `tests_passed`,
-`score`, or any cap; it's purely a flag for you to read and decide on, the same way a TA
-would circle something suspicious on a printed page. A submission can be flagged and still
-score full marks, or fail to compile and also be flagged — the two are completely
-independent.
+A match always appends `MANUAL REVIEW: <reason> - found in <File.java> (line N), ...` to
+that student's `notes`. What happens to the score depends on `auto_reject`:
+
+- **`auto_reject` absent or `false` (the default)** — the note is **all** that happens. It
+  never touches `compiled`, `tests_passed`, `score`, or any cap; it's purely a flag for you
+  to read and decide on, the same way a TA would circle something suspicious on a printed
+  page. A submission can be flagged and still score full marks, or fail to compile and also
+  be flagged — the two are completely independent. Use this when the marking guide says
+  something like "flag for review" or the call genuinely needs human judgment.
+- **`auto_reject: true`** — a match *also* forces a hard 0% score cap, same mechanism as the
+  50%/90% caps in [2d](#2d-compiled-only-submissions-class-instead-of-java) (multiplies in
+  with any other cap already in play, and since it's ×0 it always wins). `uncapped_score`
+  still records what the score would have been, `score_cap` shows `0%`, and `notes` gets a
+  second line, `SCORE CAPPED AT 0%: manual review check(s) require rejection: ...`, right
+  after the `MANUAL REVIEW` one. `mcvScore.csv` picks up the real 0 automatically, so there's
+  no separate manual step before uploading. Use this only when the marking guide is
+  unambiguous ("reject", "0 for this") **and** no legitimate solution could ever trigger the
+  pattern — a false positive here silently zeroes a real student with no review step, so
+  when in doubt leave it `false` instead.
+
+The console progress line also gets a short inline reason whenever any cap (50%/90%/0%)
+applies, e.g. `... (score 0/11) (capped at 0%: rejected by manual review)` — the full detail
+still only lives in `grades.csv`'s `notes` column; this is just a quick heads-up while a run
+is in progress.
 
 **No `tests/manual_review.json`?** Nothing changes — no scan runs, exactly as before.
 Entirely opt-in, per week.
@@ -368,11 +400,11 @@ student_id only ever appears in the CSV, never in a filesystem path.)
 | `score` | Points earned — 1 per passed test by default, or the weighted sum from `tests/rubric.json` if present — **after** any cap from the Grading policy is applied. |
 | `max_score` | Total points possible this week (test count, or the rubric's point total). |
 | `uncapped_score` | What `score` would have been with no cap applied at all — always populated, even when no cap ends up binding, so the pre-cap number is auditable. |
-| `score_cap` | The cap percentage applied (`50%` / `90%` / `45%`), blank if none applied. |
+| `score_cap` | The cap percentage applied (`50%` / `90%` / `45%` / `0%`), blank if none applied. |
 | `passed_tests` | `;`-separated `ClassName.testMethod` for every passed test. |
 | `failed_tests` | `;`-separated `ClassName.testMethod` for every failed test. |
 | `failure_details` | `;`-separated `ClassName.testMethod: <assertion message>` for every failed test — the actual JUnit failure reason, so you can see why a test failed straight from the CSV instead of re-running it. |
-| `notes` | Anything unusual about this submission: compile errors, `STRUCTURE ERROR`, skipped/colliding files, why a cap applied, a timed-out test run, `MANUAL REVIEW` flags (see [2e](#2e-optional-manual-review-flags-for-things-junit-cant-catch), score-neutral), etc. Empty when nothing noteworthy happened. |
+| `notes` | Anything unusual about this submission: compile errors, `STRUCTURE ERROR`, skipped/colliding files, why a cap applied, a timed-out test run, `MANUAL REVIEW` flags (see [2e](#2e-optional-manual-review-flags-for-things-junit-cant-catch) — score-neutral unless that check has `auto_reject: true`, in which case there's also a `SCORE CAPPED AT 0%` line), etc. Empty when nothing noteworthy happened. |
 
 `results/mcvScore.csv` is deliberately minimal — no header row, just `student_id,score` per
 line, with `student_id` stripped down to the bare numeric ID (dropping any `_w1_q2`-style
