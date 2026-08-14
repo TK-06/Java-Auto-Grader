@@ -562,6 +562,45 @@ class TestLoadManualReviewChecks(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 load_manual_review_checks(tests_dir)
 
+    def test_auto_reject_defaults_to_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(
+                json.dumps({"checks": [{"pattern": "instanceof", "reason": "x"}]}),
+                encoding="utf-8",
+            )
+
+            result = load_manual_review_checks(tests_dir)
+
+            self.assertNotIn("auto_reject", result[0])
+
+    def test_parses_auto_reject_true(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(
+                json.dumps({"checks": [
+                    {"pattern": "instanceof", "reason": "x", "auto_reject": True},
+                ]}),
+                encoding="utf-8",
+            )
+
+            result = load_manual_review_checks(tests_dir)
+
+            self.assertTrue(result[0]["auto_reject"])
+
+    def test_exits_loudly_on_non_boolean_auto_reject(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(
+                json.dumps({"checks": [
+                    {"pattern": "instanceof", "reason": "x", "auto_reject": "yes"},
+                ]}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(SystemExit):
+                load_manual_review_checks(tests_dir)
+
 
 class TestRunManualReviewChecks(unittest.TestCase):
     def test_flags_a_matching_file_with_line_number(self):
@@ -577,11 +616,12 @@ class TestRunManualReviewChecks(unittest.TestCase):
             )
             checks = [{"pattern": "instanceof", "reason": "possible workaround"}]
 
-            notes = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+            notes, reject_reasons = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
 
             self.assertEqual(len(notes), 1)
             self.assertIn("possible workaround", notes[0])
             self.assertIn("Unit.java (line 3)", notes[0])
+            self.assertEqual(reject_reasons, [])
 
     def test_excluded_class_is_never_flagged(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -599,9 +639,10 @@ class TestRunManualReviewChecks(unittest.TestCase):
                 "exclude_classes": ["Boss"],
             }]
 
-            notes = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+            notes, reject_reasons = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
 
             self.assertEqual(notes, [])
+            self.assertEqual(reject_reasons, [])
 
     def test_official_test_files_are_never_scanned(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -612,11 +653,12 @@ class TestRunManualReviewChecks(unittest.TestCase):
             )
             checks = [{"pattern": "instanceof", "reason": "possible workaround"}]
 
-            notes = run_manual_review_checks(
+            notes, reject_reasons = run_manual_review_checks(
                 build_dir, official_names={"UnitHierarchyTest.java"}, checks=checks
             )
 
             self.assertEqual(notes, [])
+            self.assertEqual(reject_reasons, [])
 
     def test_no_match_produces_no_notes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -624,9 +666,10 @@ class TestRunManualReviewChecks(unittest.TestCase):
             (build_dir / "Unit.java").write_text("public class Unit {}\n", encoding="utf-8")
             checks = [{"pattern": "instanceof", "reason": "possible workaround"}]
 
-            notes = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+            notes, reject_reasons = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
 
             self.assertEqual(notes, [])
+            self.assertEqual(reject_reasons, [])
 
     def test_only_matching_checks_produce_notes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -640,10 +683,45 @@ class TestRunManualReviewChecks(unittest.TestCase):
                 {"pattern": "System\\.exit", "reason": "should never call System.exit"},
             ]
 
-            notes = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+            notes, reject_reasons = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
 
             self.assertEqual(len(notes), 1)
             self.assertIn("instanceof workaround", notes[0])
+            self.assertEqual(reject_reasons, [])
+
+    def test_auto_reject_check_populates_reject_reasons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_text(
+                "public class Unit {\n"
+                "    void attack(Unit target) {\n"
+                "        if (target instanceof Warrior) { }\n"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            checks = [{"pattern": "instanceof", "reason": "possible workaround", "auto_reject": True}]
+
+            notes, reject_reasons = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertEqual(len(notes), 1)
+            self.assertEqual(len(reject_reasons), 1)
+            self.assertIn("possible workaround", reject_reasons[0])
+            self.assertIn("Unit.java (line 3)", reject_reasons[0])
+
+    def test_auto_reject_false_never_populates_reject_reasons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_text(
+                "public class Unit { boolean b(Object o) { return o instanceof String; } }\n",
+                encoding="utf-8",
+            )
+            checks = [{"pattern": "instanceof", "reason": "possible workaround", "auto_reject": False}]
+
+            notes, reject_reasons = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertEqual(len(notes), 1)
+            self.assertEqual(reject_reasons, [])
 
 
 class TestGradeStudentManualReview(unittest.TestCase):
@@ -691,6 +769,56 @@ class TestGradeStudentManualReview(unittest.TestCase):
             self.assertIn("Item.java", flagged_row["notes"])
             for key in ("compiled", "tests_passed", "tests_total", "score", "max_score"):
                 self.assertEqual(flagged_row[key], plain_row[key], key)
+
+    def test_auto_reject_check_forces_score_to_zero(self):
+        """A check with "auto_reject": true still compiles/runs the tests and
+        reports real tests_passed/tests_total, but score is capped to 0 (like
+        the existing 50%/90% caps) while uncapped_score preserves what the
+        score would have been without the reject."""
+        junit_jar = find_junit_jar(Path(__file__).resolve().parent / "lib")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            item_file = tmp_path / "Item.java"
+            item_file.write_text(
+                "public class Item {\n"
+                "    public int getValue() { return getValue(new Object()); }\n"
+                "    private int getValue(Object o) { return o instanceof String ? 1 : 42; }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            test_file = tmp_path / "ItemTest.java"
+            test_file.write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "import static org.junit.jupiter.api.Assertions.*;\n"
+                "class ItemTest {\n"
+                "    @Test void testGetValue() { assertEquals(42, new Item().getValue()); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            checks = [{
+                "pattern": "instanceof", "reason": "possible instanceof workaround",
+                "auto_reject": True,
+            }]
+            build_root = tmp_path / "build"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000009", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar,
+                build_root, 30, False, None, None, failed_build_root,
+                manual_review_checks=checks,
+            )
+
+            self.assertEqual(row["compiled"], "yes")
+            self.assertEqual(row["tests_passed"], 1)
+            self.assertEqual(row["tests_total"], 1)
+            self.assertEqual(row["score"], 0)
+            self.assertEqual(row["uncapped_score"], 1)
+            self.assertEqual(row["score_cap"], "0%")
+            self.assertIn("MANUAL REVIEW", row["notes"])
+            self.assertIn("SCORE CAPPED AT 0%", row["notes"])
+            self.assertIn("possible instanceof workaround", row["notes"])
 
 
 class TestGradeStudentPreservesFailedBuilds(unittest.TestCase):

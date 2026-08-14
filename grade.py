@@ -45,12 +45,16 @@ records the pre-cap result; score_cap shows the cap percentage applied
 ("" when none); notes explains why ("SCORE CAPPED AT n%: ...").
 
 If tests/manual_review.json is present ({"checks": [{"pattern": <regex>,
-"reason": <str>, "exclude_classes": [...]}, ...]}), every student .java file
-is scanned against each pattern and a match appends a "MANUAL REVIEW: ..."
-note - purely a flag for a TA to read, never a score change. For behavior
-JUnit's tests structurally can't tell apart from the real thing, e.g. a
-submission that fakes polymorphic dispatch with an instanceof chain instead
-of overriding; see load_manual_review_checks / run_manual_review_checks.
+"reason": <str>, "exclude_classes": [...], "auto_reject": <bool>}, ...]}),
+every student .java file is scanned against each pattern and a match appends
+a "MANUAL REVIEW: ..." note - a flag for a TA to read, and, only for a check
+with "auto_reject": true, also a hard 0% score cap (same mechanism as the
+50%/90% caps above - uncapped_score still records what it would have been).
+"auto_reject" defaults to false, so an older manual_review.json with no such
+checks behaves exactly as before: notes only. For behavior JUnit's tests
+structurally can't tell apart from the real thing, e.g. a submission that
+fakes polymorphic dispatch with an instanceof chain instead of overriding;
+see load_manual_review_checks / run_manual_review_checks.
 """
 import argparse
 import csv
@@ -1039,20 +1043,26 @@ def load_structure_baseline(tests_dir: Path) -> list[str] | None:
 
 def load_manual_review_checks(tests_dir: Path) -> list[dict] | None:
     """Optional tests/manual_review.json: {"checks": [{"pattern": <regex>,
-    "reason": <str>, "exclude_classes": [<class name>, ...]}, ...]}. When
-    present, run_manual_review_checks scans every student .java file for
-    each pattern and appends a non-scoring "MANUAL REVIEW: ..." note to
-    notes when one matches - never touches compiled/tests_passed/score,
-    purely a flag for a TA to read. For things JUnit's behavioral tests
-    structurally can't catch - e.g. a submission that reimplements
-    polymorphic dispatch with an instanceof chain instead of overriding
-    passes the exact same tests either way, so the tests alone can't tell
-    the two apart. Absent by default so weeks without one behave exactly
-    as before. Malformed (not just absent) fails loudly at startup, the
-    same way tests/structure.json does - a broken config for the whole
-    run should never be discovered one student at a time. "exclude_classes"
-    is optional per check (defaults to none exempted) - e.g. a week whose
-    game rules legitimately require one specific class to use instanceof."""
+    "reason": <str>, "exclude_classes": [<class name>, ...],
+    "auto_reject": <bool>}, ...]}. When present, run_manual_review_checks
+    scans every student .java file for each pattern and appends a
+    "MANUAL REVIEW: ..." note to notes when one matches - by default that's
+    purely a flag for a TA to read, never touching compiled/tests_passed/
+    score. For things JUnit's behavioral tests structurally can't catch -
+    e.g. a submission that reimplements polymorphic dispatch with an
+    instanceof chain instead of overriding passes the exact same tests
+    either way, so the tests alone can't tell the two apart. Absent by
+    default so weeks without one behave exactly as before. Malformed (not
+    just absent) fails loudly at startup, the same way tests/structure.json
+    does - a broken config for the whole run should never be discovered one
+    student at a time. "exclude_classes" is optional per check (defaults to
+    none exempted) - e.g. a week whose game rules legitimately require one
+    specific class to use instanceof. "auto_reject" is also optional per
+    check (defaults to false) - when true, a match doesn't just leave a
+    note, it also forces a hard 0% score cap in grade_student (see the
+    score-cap section there), for a check whose marking guide says a match
+    should be rejected outright rather than just flagged for a human to
+    look at."""
     checks_path = tests_dir / "manual_review.json"
     if not checks_path.exists():
         return None
@@ -1081,6 +1091,8 @@ def load_manual_review_checks(tests_dir: Path) -> list[dict] | None:
                 f'ERROR: "exclude_classes" in {checks_path} must be a list of class '
                 f"name strings."
             )
+        if "auto_reject" in check and not isinstance(check["auto_reject"], bool):
+            sys.exit(f'ERROR: "auto_reject" in {checks_path} must be a boolean.')
         try:
             re.compile(check["pattern"])
         except re.error as exc:
@@ -1132,7 +1144,7 @@ def check_structure_baseline(
 
 def run_manual_review_checks(
     build_dir: Path, official_names: set[str], checks: list[dict]
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Scans every student .java file already flattened into build_dir (see
     prepare_build_dir - Main.java already excluded, packages already
     resolved to their canonical names) against each tests/manual_review.json
@@ -1140,13 +1152,20 @@ def run_manual_review_checks(
     class name is in the check's "exclude_classes". A match produces one
     note PER CHECK (not per file), listing every matching file and the
     1-based line number of its first match, e.g. "MANUAL REVIEW: <reason> -
-    found in Unit.java (line 14), Warrior.java (line 22)". Purely additive -
-    the caller folds this into notes alongside everything else; it never
-    touches compiled, tests_passed, or score itself."""
+    found in Unit.java (line 14), Warrior.java (line 22)".
+
+    Returns (notes, reject_reasons): notes is purely additive - the caller
+    folds it into notes alongside everything else, and it never by itself
+    touches compiled/tests_passed/score. reject_reasons lists the "reason"
+    (plus the same "found in ..." detail) of every check that both matched
+    AND has "auto_reject": true - the caller uses a non-empty list to force
+    a 0% score cap (see the score-cap section in grade_student), same as
+    the note but with real scoring consequence."""
     student_files = sorted(
         f for f in build_dir.glob("*.java") if f.name not in official_names
     )
     notes: list[str] = []
+    reject_reasons: list[str] = []
     for check in checks:
         pattern = re.compile(check["pattern"])
         excluded = set(check.get("exclude_classes", []))
@@ -1160,8 +1179,11 @@ def run_manual_review_checks(
                 line_no = text.count("\n", 0, match.start()) + 1
                 hits.append(f"{f.name} (line {line_no})")
         if hits:
-            notes.append(f"MANUAL REVIEW: {check['reason']} - found in {', '.join(hits)}")
-    return notes
+            detail = f"{check['reason']} - found in {', '.join(hits)}"
+            notes.append(f"MANUAL REVIEW: {detail}")
+            if check.get("auto_reject"):
+                reject_reasons.append(detail)
+    return notes, reject_reasons
 
 
 def compile_with_class_fallback(
@@ -1282,10 +1304,12 @@ def grade_student(
 
         official_names = {f.name for f in test_files}
 
+        manual_review_reject_reasons: list[str] = []
         if manual_review_checks:
-            prep_notes = prep_notes + run_manual_review_checks(
+            review_notes, manual_review_reject_reasons = run_manual_review_checks(
                 build_dir, official_names, manual_review_checks
             )
+            prep_notes = prep_notes + review_notes
 
         if not_an_archive:
             # Hard fail before ever attempting to compile, regardless of whether the
@@ -1501,10 +1525,15 @@ def grade_student(
         # max_score, since there's no source to verify; a submission that only
         # yielded gradable content after digging past a plain unzip
         # (zip_needed_deeper_extraction - see discover_submissions) is capped at
-        # 90%, for improper packaging independent of whether source was found.
-        # Both apply multiplicatively when both are true (0.5 x 0.9 = 45%).
-        # uncapped_score always records what the raw result would have been, for
-        # audit/appeal purposes, even when no cap ends up binding.
+        # 90%, for improper packaging independent of whether source was found;
+        # a submission that tripped an "auto_reject": true manual_review.json
+        # check (manual_review_reject_reasons - see run_manual_review_checks)
+        # is capped at 0%, for a marking-guide rule that says a match should be
+        # rejected outright, not merely flagged for a human to look at later.
+        # All apply multiplicatively when more than one is true (0.5 x 0.9 =
+        # 45%; anything x 0% = 0%). uncapped_score always records what the raw
+        # result would have been, for audit/appeal purposes, even when no cap
+        # ends up binding.
         cap = 1.0
         cap_reasons: list[str] = []
         if fallback_matches:
@@ -1517,6 +1546,12 @@ def grade_student(
             cap *= 0.9
             cap_reasons.append(
                 "submission required extracting a nested/deeper archive to find gradable content"
+            )
+        if manual_review_reject_reasons:
+            cap *= 0.0
+            cap_reasons.append(
+                "manual review check(s) require rejection: "
+                + "; ".join(manual_review_reject_reasons)
             )
         row["uncapped_score"] = row["score"]
         if cap < 1.0:
@@ -1597,6 +1632,33 @@ def bare_student_id(student_id: str) -> str:
     unchanged if it doesn't start with digits at all, rather than guessing."""
     match = STUDENT_ID_RE.match(student_id)
     return match.group(0) if match else student_id
+
+
+# Short, human-readable label for each distinct score-cap reason grade_student can
+# produce (see the score-cap section there) - matched by a substring of the reason
+# text that's always present in that case, checked in this order so the first hit
+# wins if a submission somehow triggered more than one. Used only for the console
+# progress line; grades.csv's own "notes" column keeps the full detail regardless.
+CAP_REASON_LABELS = [
+    ("manual review check(s) require rejection", "rejected by manual review"),
+    ("used precompiled .class instead of .java source", "failed to include source file"),
+    ("submission required extracting a nested/deeper archive", "failed to submit as .jar"),
+]
+
+
+def short_cap_reason(notes: str) -> str:
+    """Best-effort short label for the console (e.g. "rejected by manual review")
+    derived from grades.csv's own full "SCORE CAPPED AT n%: <reason(s)>" notes
+    segment - falls back to that segment verbatim if the reason doesn't match any
+    known label (e.g. a future cap case this list hasn't been updated for yet)."""
+    idx = notes.find("SCORE CAPPED AT")
+    if idx == -1:
+        return ""
+    segment = notes[idx:]
+    for marker, label in CAP_REASON_LABELS:
+        if marker in segment:
+            return label
+    return segment
 
 
 def write_scores_csv(rows: list[dict], out_path: Path) -> None:
@@ -1699,9 +1761,17 @@ def main() -> None:
     else:
         print("  structure:   none (tests/structure.json not found - no structure check)")
     if manual_review_checks is not None:
+        reject_count = sum(1 for c in manual_review_checks if c.get("auto_reject"))
+        if reject_count:
+            review_summary = (
+                f"{len(manual_review_checks)} check(s) - {reject_count} auto-reject on "
+                f"match (0% score cap), {len(manual_review_checks) - reject_count} notes-only"
+            )
+        else:
+            review_summary = f"{len(manual_review_checks)} check(s) - notes only, never affects score"
         print(
             f"  manual review: {tests_dir / 'manual_review.json'}  "
-            f"({len(manual_review_checks)} check(s) - notes only, never affects score)"
+            f"({review_summary})"
         )
     else:
         print("  manual review: none (tests/manual_review.json not found)")
@@ -1736,10 +1806,13 @@ def main() -> None:
                 status = "NO SOURCE FILES"
             print(f"[{i}/{total}] {student_id}: {status} (score {row['score']})")
         else:
+            cap_suffix = ""
+            if row["score_cap"]:
+                cap_suffix = f" (capped at {row['score_cap']}: {short_cap_reason(row['notes'])})"
             print(
                 f"[{i}/{total}] {student_id}: compiled, "
                 f"{row['tests_passed']}/{row['tests_total']} tests passed "
-                f"(score {row['score']:g}/{row['max_score']:g})"
+                f"(score {row['score']:g}/{row['max_score']:g}){cap_suffix}"
             )
         if args.keep_build:
             print(f"         build dir: {build_root / build_key}")
