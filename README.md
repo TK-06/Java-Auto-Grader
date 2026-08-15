@@ -362,6 +362,38 @@ deliberate (see the docstring on `load_manual_review_checks` in `grade.py`): a b
 for the whole run should fail loudly at startup, not get discovered one student in. When a
 new week needs no manual-review check, delete the file entirely rather than emptying it out.
 
+### 2f. (Optional) Stub-only submissions — "Stubs only = 0"
+
+Some marking guides say explicitly that submitting the unedited starter template (no attempt
+made) scores zero, not whatever partial credit the official tests happen to award by accident —
+a stub can still legitimately pass a base-behavior test that doesn't depend on anything the
+student was supposed to implement. If you want that enforced automatically, create
+`tests/starter/`, one file per required class named exactly `ClassName.java`, containing that
+class's content **exactly as given to students** (straight from the week's `toStudent` zip,
+untouched):
+
+```
+tests/starter/
+  Unit.java
+  Warrior.java
+  Mage.java
+  Boss.java
+```
+
+With this in place, a submission is capped at **0%** only if **every** file in `tests/starter/`
+matches the student's corresponding class byte-for-byte (after normalizing line endings and
+trailing whitespace — nothing else). A student who implemented even one of the tracked classes
+for real is never touched by this, no matter how broken the rest of their submission is. A
+required class the check can't find at all in the submission is not treated as a match either —
+that's `structure.json`'s or the `.class`-fallback path's call, not this one's.
+
+`notes` gets a `STUB-ONLY SUBMISSION: ...` line and, since this reuses the same cap mechanism as
+`manual_review.json`'s `auto_reject`, also a `SCORE CAPPED AT 0%` line — `uncapped_score` still
+records what the raw JUnit result would have been.
+
+**No `tests/starter/` folder (or an empty one)?** Nothing changes — no comparison runs, exactly
+as before. Entirely opt-in, per week.
+
 ### 3. Run it
 
 ```
@@ -455,7 +487,7 @@ grading/                  <- repo root
     README.md
   submissions/             <- gitignored; this week's real student work goes here
   tests/                   <- gitignored; this week's official test file(s), plus optional
-                              rubric.json / structure.json / manual_review.json
+                              rubric.json / structure.json / manual_review.json / starter/
   results/
     grades.csv              <- gitignored output
     mcvScore.csv             <- gitignored output, bare student IDs for MyCourseVille
