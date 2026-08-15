@@ -11,6 +11,10 @@ tests/*
 !tests/.gitkeep
 
 build_tmp/
+# JVM crash dumps from a javac subprocess that ran out of memory/died -
+# land in the repo root (JDK's own default location), never commit these
+hs_err_pid*.log
+replay_pid*.log
 results/*.csv
 # extracted student code from failed-to-compile submissions (see grade_student
 # in grade.py) - same privacy category as submissions/, never commit it

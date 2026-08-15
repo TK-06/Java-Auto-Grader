@@ -354,7 +354,13 @@ still only lives in `grades.csv`'s `notes` column; this is just a quick heads-up
 is in progress.
 
 **No `tests/manual_review.json`?** Nothing changes — no scan runs, exactly as before.
-Entirely opt-in, per week.
+Entirely opt-in, per week. **The file must be absent, not present with an empty `checks`
+list** — a leftover `{"checks": []}` from a previous week that no longer needs any check is
+treated as a malformed config, the same as a `checks` entry missing `pattern`/`reason`, and
+`grade.py` exits immediately with an error instead of silently running zero checks. This is
+deliberate (see the docstring on `load_manual_review_checks` in `grade.py`): a broken config
+for the whole run should fail loudly at startup, not get discovered one student in. When a
+new week needs no manual-review check, delete the file entirely rather than emptying it out.
 
 ### 3. Run it
 
