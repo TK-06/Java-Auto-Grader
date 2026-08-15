@@ -380,31 +380,54 @@ def find_junit_jar(lib_dir: Path) -> Path:
     )
 
 
-SKIP_DIR_NAMES = {"out", "target", "bin", "build", ".git", ".idea", ".vscode", ".settings"}
+SKIP_DIR_NAMES = {"out", "target", "bin", "build", ".git", ".idea", ".vscode", ".settings", "__MACOSX"}
 # find_class_files' own, smaller exclusion list - out/target/bin/build are exactly
 # where a real IDE/build tool puts its .class output (Eclipse: bin/, Maven: target/,
 # Gradle: build/, IntelliJ: out/), which is precisely what the .class-fallback feature
 # (find_class_fallback_files) needs to be able to see. Reusing SKIP_DIR_NAMES here would
 # make that feature blind to the most common real-world case it exists for. Only VCS/IDE
 # metadata dirs are excluded - never a build-output dir, never a .java-source concern.
-CLASS_SEARCH_SKIP_DIR_NAMES = {".git", ".idea", ".vscode", ".settings"}
+# __MACOSX is the one exception included here too: it's never a build-output location
+# under any tool, ever - only macOS's own zip/Compress adds it, holding AppleDouble
+# resource-fork companions (see find_java_files), so excluding it can never hide a real
+# compiled class.
+CLASS_SEARCH_SKIP_DIR_NAMES = {".git", ".idea", ".vscode", ".settings", "__MACOSX"}
+
+
+def _is_apple_double_file(name: str) -> bool:
+    """True for a macOS AppleDouble companion file (e.g. "._Unit.java" next to
+    the real "Unit.java") - metadata macOS's own Finder "Compress" / Archive
+    Utility silently adds to a zip, holding resource-fork/extended-attribute
+    data, never real content. No legal Java source or class file can start
+    with '.', so this can never exclude something a student actually wrote.
+    Usually these land inside a __MACOSX/ sibling folder (already excluded via
+    SKIP_DIR_NAMES/CLASS_SEARCH_SKIP_DIR_NAMES), but some zip tools/OS versions
+    place them inline next to the real file instead - checked here too so
+    javac never sees one and fails the whole submission over a stray binary
+    metadata file that isn't source at all (real incident: a submission's only
+    compile error was "illegal character" inside a "._Unit.java" sitting right
+    next to a perfectly fine real Unit.java)."""
+    return name.startswith("._")
 
 
 def find_java_files(root: Path) -> list[Path]:
     """Like root.rglob("*.java"), but never descends into a directory whose
     name is a known build-output or IDE-metadata folder (out, target, bin,
-    build, .git, .idea, .vscode, .settings). A build-artifact folder's
-    .class files are already invisible to a *.java glob, but the walk
-    itself doesn't otherwise know to stay out of one - and a student's
+    build, .git, .idea, .vscode, .settings, __MACOSX). A build-artifact
+    folder's .class files are already invisible to a *.java glob, but the
+    walk itself doesn't otherwise know to stay out of one - and a student's
     export sometimes bundles one in (an IntelliJ out/, a stray .git),
     along with whatever else. Nothing under one of these was ever part of
     what the student actually wrote, so it's excluded before anything else
-    even sees it - not just ignored by extension."""
+    even sees it - not just ignored by extension. Also skips any individual
+    macOS AppleDouble file (see _is_apple_double_file) even outside
+    __MACOSX/, since its name still ends in ".java" but its content is
+    binary metadata that only breaks compilation, never real source."""
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES]
         for name in filenames:
-            if name.endswith(".java"):
+            if name.endswith(".java") and not _is_apple_double_file(name):
                 found.append(Path(dirpath) / name)
     return sorted(found)
 
@@ -426,7 +449,7 @@ def find_class_files(root: Path) -> list[Path]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in CLASS_SEARCH_SKIP_DIR_NAMES]
         for name in filenames:
-            if name.endswith(".class"):
+            if name.endswith(".class") and not _is_apple_double_file(name):
                 found.append(Path(dirpath) / name)
     return sorted(found)
 
@@ -1117,6 +1140,42 @@ def load_manual_review_checks(tests_dir: Path) -> list[dict] | None:
     return checks
 
 
+def normalize_for_stub_compare(text: str) -> str:
+    """Collapses cosmetic differences (line-ending style, trailing whitespace,
+    leading/trailing blank lines) before comparing a submission's file against
+    the week's starter template - see check_stub_only_submission. Never strips
+    anything a real edit would produce (comments, reordered members, renamed
+    variables all still count as a difference); only the kind of no-op churn a
+    student's own IDE/OS can introduce just by opening and re-saving the file
+    unedited (e.g. LF -> CRLF - this repo's own git config already warns about
+    exactly that on every commit)."""
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    return "\n".join(lines).strip("\n")
+
+
+def load_stub_starter_files(tests_dir: Path) -> dict[str, str] | None:
+    """Optional tests/starter/*.java: unedited copies of the classes this
+    week's students were GIVEN (the toStudent starter), one file per required
+    class, named ClassName.java. When present, check_stub_only_submission
+    compares each against the submission's own file of the same name (see
+    prepare_build_dir - resolved to its real public type name by then, so a
+    plain ClassName.java lookup is enough) to catch a submission that never
+    touched one or more required classes at all - "Stubs only = 0" in a
+    marking guide's own words is common, but nothing JUnit's behavioral tests
+    run can ever catch on its own: an unmodified stub can still legitimately
+    pass whichever base-behavior tests don't require any of the unimplemented
+    parts, earning partial credit a marking guide never intended. Absent by
+    default (no starter/ folder, or an empty one) so weeks without one behave
+    exactly as before - entirely opt-in, same as rubric/structure/manual_review."""
+    starter_dir = tests_dir / "starter"
+    if not starter_dir.is_dir():
+        return None
+    files = sorted(starter_dir.glob("*.java"))
+    if not files:
+        return None
+    return {f.stem: normalize_for_stub_compare(f.read_text(encoding="utf-8")) for f in files}
+
+
 def check_structure_baseline(
     build_dir: Path,
     official_names: set[str],
@@ -1154,6 +1213,35 @@ def check_structure_baseline(
         for name in required_classes
         if name not in present_classes and name not in covered_by_class_fallback
     ]
+
+
+def check_stub_only_submission(build_dir: Path, starter_sources: dict[str, str]) -> str | None:
+    """Compares each tests/starter/*.java file (see load_stub_starter_files)
+    against the submission's own file of the same class name, already
+    flattened into build_dir by prepare_build_dir. Returns a reject reason
+    string only when EVERY starter-tracked class matches byte-for-byte (after
+    normalize_for_stub_compare) - a submission that genuinely implemented even
+    one of them is never flagged, regardless of how broken the rest is. A
+    starter-tracked class that's missing its .java entirely here is NOT
+    treated as a stub match - that's check_structure_baseline's or the
+    class-fallback path's call to make, not this one's; this function only
+    ever answers "did the student touch every required class at all," never
+    "is a class missing." Returns None (no verdict) if starter_sources is
+    empty or any comparison can't be made."""
+    if not starter_sources:
+        return None
+    for class_name, starter_text in starter_sources.items():
+        student_file = build_dir / f"{class_name}.java"
+        if not student_file.exists():
+            return None
+        student_text = normalize_for_stub_compare(student_file.read_text(encoding="utf-8", errors="ignore"))
+        if student_text != starter_text:
+            return None
+    names = ", ".join(sorted(starter_sources))
+    return (
+        f"submission matches the unedited starter template exactly for every required "
+        f'class ({names}) - marking guide says "Stubs only = 0"'
+    )
 
 
 def run_manual_review_checks(
@@ -1292,6 +1380,7 @@ def grade_student(
     class_fallback_candidates: set[str] | None = None,
     not_an_archive: bool = False,
     manual_review_checks: list[dict] | None = None,
+    stub_starter_files: dict[str, str] | None = None,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -1324,6 +1413,10 @@ def grade_student(
                 build_dir, official_names, manual_review_checks
             )
             prep_notes = prep_notes + review_notes
+
+        stub_reject_reason = check_stub_only_submission(build_dir, stub_starter_files or {})
+        if stub_reject_reason:
+            prep_notes = prep_notes + [f"STUB-ONLY SUBMISSION: {stub_reject_reason}"]
 
         if not_an_archive:
             # Hard fail before ever attempting to compile, regardless of whether the
@@ -1542,8 +1635,10 @@ def grade_student(
         # 90%, for improper packaging independent of whether source was found;
         # a submission that tripped an "auto_reject": true manual_review.json
         # check (manual_review_reject_reasons - see run_manual_review_checks)
-        # is capped at 0%, for a marking-guide rule that says a match should be
-        # rejected outright, not merely flagged for a human to look at later.
+        # or matched tests/starter/ exactly for every required class
+        # (stub_reject_reason - see check_stub_only_submission) is capped at
+        # 0%, for a marking-guide rule that says a match should be rejected
+        # outright, not merely flagged for a human to look at later.
         # All apply multiplicatively when more than one is true (0.5 x 0.9 =
         # 45%; anything x 0% = 0%). uncapped_score always records what the raw
         # result would have been, for audit/appeal purposes, even when no cap
@@ -1567,6 +1662,9 @@ def grade_student(
                 "manual review check(s) require rejection: "
                 + "; ".join(manual_review_reject_reasons)
             )
+        if stub_reject_reason:
+            cap *= 0.0
+            cap_reasons.append(stub_reject_reason)
         row["uncapped_score"] = row["score"]
         if cap < 1.0:
             row["score"] = min(row["score"], cap * row["max_score"])
@@ -1655,6 +1753,7 @@ def bare_student_id(student_id: str) -> str:
 # progress line; grades.csv's own "notes" column keeps the full detail regardless.
 CAP_REASON_LABELS = [
     ("manual review check(s) require rejection", "rejected by manual review"),
+    ("matches the unedited starter template", "stub-only submission"),
     ("used precompiled .class instead of .java source", "failed to include source file"),
     ("submission required extracting a nested/deeper archive", "failed to submit as .jar"),
 ]
@@ -1733,6 +1832,7 @@ def main() -> None:
     rubric = load_rubric(tests_dir)
     required_classes = load_structure_baseline(tests_dir)
     manual_review_checks = load_manual_review_checks(tests_dir)
+    stub_starter_files = load_stub_starter_files(tests_dir)
     class_fallback_candidates = collect_required_class_names(test_files) | set(required_classes or [])
 
     if build_root.exists():
@@ -1789,6 +1889,14 @@ def main() -> None:
         )
     else:
         print("  manual review: none (tests/manual_review.json not found)")
+    if stub_starter_files is not None:
+        print(
+            f"  stub check:  {tests_dir / 'starter'}  "
+            f"({len(stub_starter_files)} required class(es) tracked - a submission "
+            f"matching ALL of them exactly is capped at 0%)"
+        )
+    else:
+        print("  stub check:  none (tests/starter/ not found - no stub-only check)")
     print(
         f"  class fallback: {', '.join(sorted(class_fallback_candidates)) or '(none inferred)'} "
         f"- a submission missing .java for one of these but with a matching .class is still "
@@ -1809,6 +1917,7 @@ def main() -> None:
             class_fallback_candidates=class_fallback_candidates,
             not_an_archive=sub.not_an_archive,
             manual_review_checks=manual_review_checks,
+            stub_starter_files=stub_starter_files,
         )
         rows.append(row)
         if row["compiled"] == "no":

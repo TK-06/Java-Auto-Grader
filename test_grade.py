@@ -15,6 +15,7 @@ from grade import (
     bare_student_id,
     check_output_writable,
     check_structure_baseline,
+    check_stub_only_submission,
     collect_required_class_names,
     collect_test_results,
     compile_submission,
@@ -29,7 +30,9 @@ from grade import (
     grade_student,
     infer_unnamed_package_classes,
     load_manual_review_checks,
+    load_stub_starter_files,
     load_structure_baseline,
+    normalize_for_stub_compare,
     partition_fallback_matches,
     prepare_build_dir,
     resolve_class_fallback_dest,
@@ -865,6 +868,193 @@ class TestGradeStudentManualReview(unittest.TestCase):
             self.assertIn("possible instanceof workaround", row["notes"])
 
 
+class TestNormalizeForStubCompare(unittest.TestCase):
+    def test_treats_crlf_and_lf_as_identical(self):
+        self.assertEqual(
+            normalize_for_stub_compare("public class Unit {\r\n    int hp;\r\n}\r\n"),
+            normalize_for_stub_compare("public class Unit {\n    int hp;\n}\n"),
+        )
+
+    def test_ignores_trailing_whitespace_and_trailing_blank_lines(self):
+        self.assertEqual(
+            normalize_for_stub_compare("public class Unit {   \n    int hp;\t\n}\n\n\n"),
+            normalize_for_stub_compare("public class Unit {\n    int hp;\n}\n"),
+        )
+
+    def test_a_real_edit_still_differs(self):
+        self.assertNotEqual(
+            normalize_for_stub_compare("public class Unit {\n    int hp = 5;\n}\n"),
+            normalize_for_stub_compare("public class Unit {\n    int hp;\n}\n"),
+        )
+
+
+class TestLoadStubStarterFiles(unittest.TestCase):
+    def test_returns_none_when_starter_dir_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(load_stub_starter_files(Path(tmp)))
+
+    def test_returns_none_when_starter_dir_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "starter").mkdir()
+            self.assertIsNone(load_stub_starter_files(Path(tmp)))
+
+    def test_loads_one_entry_per_java_file_keyed_by_class_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            starter = Path(tmp) / "starter"
+            starter.mkdir()
+            (starter / "Unit.java").write_text("public class Unit {}\n", encoding="utf-8")
+            (starter / "Warrior.java").write_text("public class Warrior extends Unit {}\n", encoding="utf-8")
+
+            found = load_stub_starter_files(Path(tmp))
+
+            self.assertEqual(set(found), {"Unit", "Warrior"})
+            self.assertEqual(found["Unit"], "public class Unit {}")
+
+
+class TestCheckStubOnlySubmission(unittest.TestCase):
+    def test_flags_when_every_tracked_class_matches_exactly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_text("public class Unit {}\n", encoding="utf-8")
+            (build_dir / "Warrior.java").write_text("public class Warrior extends Unit {}\n", encoding="utf-8")
+            starter = {
+                "Unit": normalize_for_stub_compare("public class Unit {}\n"),
+                "Warrior": normalize_for_stub_compare("public class Warrior extends Unit {}\n"),
+            }
+
+            reason = check_stub_only_submission(build_dir, starter)
+
+            self.assertIsNotNone(reason)
+            self.assertIn("Unit", reason)
+            self.assertIn("Warrior", reason)
+            self.assertIn("Stubs only = 0", reason)
+
+    def test_none_when_at_least_one_tracked_class_was_actually_implemented(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_text("public class Unit {}\n", encoding="utf-8")
+            (build_dir / "Warrior.java").write_text(
+                "public class Warrior extends Unit { void special() { /* real code */ } }\n",
+                encoding="utf-8",
+            )
+            starter = {
+                "Unit": normalize_for_stub_compare("public class Unit {}\n"),
+                "Warrior": normalize_for_stub_compare("public class Warrior extends Unit {}\n"),
+            }
+
+            self.assertIsNone(check_stub_only_submission(build_dir, starter))
+
+    def test_none_when_a_tracked_class_is_missing_from_the_submission(self):
+        """Missing entirely is check_structure_baseline's/class-fallback's call,
+        not a stub verdict - this function only ever compares what's there."""
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_text("public class Unit {}\n", encoding="utf-8")
+            starter = {
+                "Unit": normalize_for_stub_compare("public class Unit {}\n"),
+                "Warrior": normalize_for_stub_compare("public class Warrior extends Unit {}\n"),
+            }
+
+            self.assertIsNone(check_stub_only_submission(build_dir, starter))
+
+    def test_none_when_no_starter_sources_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(check_stub_only_submission(Path(tmp), {}))
+
+    def test_flags_even_when_only_cosmetic_differences_exist(self):
+        """A student who just re-saved the starter (different line endings,
+        trailing whitespace) still counts as an unedited stub. Written with
+        write_bytes, not write_text - text mode would re-translate the literal
+        \\r\\n on Windows and corrupt the exact bytes this test needs on disk."""
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Unit.java").write_bytes(b"public class Unit {   \r\n}   \r\n\r\n")
+            starter = {"Unit": normalize_for_stub_compare("public class Unit {\n}\n")}
+
+            self.assertIsNotNone(check_stub_only_submission(build_dir, starter))
+
+
+class TestGradeStudentStubOnly(unittest.TestCase):
+    def test_unedited_submission_is_capped_to_zero(self):
+        junit_jar = find_junit_jar(Path(__file__).resolve().parent / "lib")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            starter_source = "public class Item {\n    public int getValue() { return 0; }\n}\n"
+            item_file = tmp_path / "Item.java"
+            item_file.write_text(starter_source, encoding="utf-8")
+            test_file = tmp_path / "ItemTest.java"
+            test_file.write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "import static org.junit.jupiter.api.Assertions.*;\n"
+                "class ItemTest {\n"
+                "    @Test void testGetValue() { assertEquals(0, new Item().getValue()); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            starter_files = {"Item": normalize_for_stub_compare(starter_source)}
+            build_root = tmp_path / "build"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000009", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar,
+                build_root, 30, False, None, None, failed_build_root,
+                stub_starter_files=starter_files,
+            )
+
+            self.assertEqual(row["compiled"], "yes")
+            self.assertEqual(row["tests_passed"], 1)
+            self.assertEqual(row["score"], 0)
+            self.assertEqual(row["uncapped_score"], 1)
+            self.assertEqual(row["score_cap"], "0%")
+            self.assertIn("STUB-ONLY SUBMISSION", row["notes"])
+            self.assertIn("SCORE CAPPED AT 0%", row["notes"])
+
+    def test_implemented_submission_is_untouched(self):
+        """The core guarantee, mirrored from TestGradeStudentManualReview: a
+        real implementation grades identically whether or not stub_starter_files
+        is even passed."""
+        junit_jar = find_junit_jar(Path(__file__).resolve().parent / "lib")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            item_file = tmp_path / "Item.java"
+            item_file.write_text(
+                "public class Item {\n    public int getValue() { return 42; }\n}\n",
+                encoding="utf-8",
+            )
+            test_file = tmp_path / "ItemTest.java"
+            test_file.write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "import static org.junit.jupiter.api.Assertions.*;\n"
+                "class ItemTest {\n"
+                "    @Test void testGetValue() { assertEquals(42, new Item().getValue()); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            starter_files = {
+                "Item": normalize_for_stub_compare("public class Item {\n    public int getValue() { return 0; }\n}\n")
+            }
+
+            def run(stub_starter_files):
+                build_root = tmp_path / f"build_{stub_starter_files is not None}"
+                build_root.mkdir()
+                failed_build_root = tmp_path / f"failed_{stub_starter_files is not None}"
+                failed_build_root.mkdir()
+                return grade_student(
+                    "10000009", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar,
+                    build_root, 30, False, None, None, failed_build_root,
+                    stub_starter_files=stub_starter_files,
+                )
+
+            flagged_row = run(starter_files)
+            plain_row = run(None)
+
+            self.assertNotIn("STUB-ONLY SUBMISSION", flagged_row["notes"])
+            for key in ("compiled", "tests_passed", "tests_total", "score", "max_score"):
+                self.assertEqual(flagged_row[key], plain_row[key], key)
+
+
 class TestGradeStudentPreservesFailedBuilds(unittest.TestCase):
     def _junit_jar(self) -> Path:
         return find_junit_jar(Path(__file__).resolve().parent / "lib")
@@ -970,7 +1160,7 @@ class TestFindJavaFiles(unittest.TestCase):
             root = Path(tmp)
             (root / "src").mkdir()
             (root / "src" / "Station.java").write_text("public class Station {}\n", encoding="utf-8")
-            for skip_dir in ("out", "target", "bin", "build", ".git", ".idea", ".vscode", ".settings"):
+            for skip_dir in ("out", "target", "bin", "build", ".git", ".idea", ".vscode", ".settings", "__MACOSX"):
                 d = root / skip_dir
                 d.mkdir()
                 (d / "Leftover.java").write_text("public class Leftover {}\n", encoding="utf-8")
@@ -978,6 +1168,35 @@ class TestFindJavaFiles(unittest.TestCase):
             found = find_java_files(root)
 
             self.assertEqual({f.name for f in found}, {"Station.java"})
+
+    def test_skips_macos_appledouble_file_inside_macosx_folder(self):
+        # Real incident: a macOS Finder "Compress" zip put the real Unit.java
+        # in src/ and its AppleDouble companion in a __MACOSX/src/ sibling
+        # folder - javac choked on the companion's binary content ("illegal
+        # character") and failed the whole submission even though the real
+        # Unit.java was fine.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "Unit.java").write_text("public class Unit {}\n", encoding="utf-8")
+            macosx = root / "__MACOSX" / "src"
+            macosx.mkdir(parents=True)
+            (macosx / "._Unit.java").write_bytes(b"\x00\x05\x16Mac OS X\x00\x02ATTR")
+
+            found = find_java_files(root)
+
+            self.assertEqual([f.name for f in found], ["Unit.java"])
+
+    def test_skips_macos_appledouble_file_even_without_macosx_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "Unit.java").write_text("public class Unit {}\n", encoding="utf-8")
+            (root / "src" / "._Unit.java").write_bytes(b"\x00\x05\x16Mac OS X\x00\x02ATTR")
+
+            found = find_java_files(root)
+
+            self.assertEqual([f.name for f in found], ["Unit.java"])
 
     def test_walks_normally_named_nested_folders(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1345,6 +1564,8 @@ class TestFindClassFiles(unittest.TestCase):
             root = Path(tmp)
             (root / ".git" / "objects").mkdir(parents=True)
             (root / ".git" / "objects" / "Item.class").write_bytes(b"")
+            (root / "__MACOSX" / "logic").mkdir(parents=True)
+            (root / "__MACOSX" / "logic" / "._Item.class").write_bytes(b"")
             (root / "logic").mkdir()
             (root / "logic" / "Item.class").write_bytes(b"")
 
