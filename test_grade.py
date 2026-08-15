@@ -10,12 +10,14 @@ from unittest import mock
 from grade import (
     RMTREE_RETRY_ATTEMPTS,
     CompileResult,
+    ProcResult,
     add_imports,
     bare_student_id,
     check_output_writable,
     check_structure_baseline,
     collect_required_class_names,
     collect_test_results,
+    compile_submission,
     compile_submission_with_fallback,
     compile_with_class_fallback,
     discover_submissions,
@@ -410,6 +412,48 @@ class TestCompileSubmissionWithFallback(unittest.TestCase):
             self.assertFalse(result.success)
             self.assertEqual(notes, [])
             mock_compile.assert_called_once()
+
+
+class TestCompileSubmissionNativeOom(unittest.TestCase):
+    def test_reports_a_clean_note_instead_of_the_raw_jvm_crash_dump(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Cell.java").write_text("public class Cell {}\n", encoding="utf-8")
+
+            crash_dump = (
+                "#\n"
+                "# There is insufficient memory for the Java Runtime Environment to continue.\n"
+                "# Native memory allocation (malloc) failed to allocate 8555480 bytes.\n"
+                "# An error report file with more information is saved as:\n"
+                "# C:\\grading\\hs_err_pid31300.log\n"
+            )
+            with mock.patch("grade.run_with_hard_timeout") as mock_run:
+                mock_run.return_value = ProcResult(False, 1, "", crash_dump)
+                result = compile_submission(build_dir, Path("junit.jar"), 30)
+
+            self.assertFalse(result.success)
+            self.assertEqual(
+                result.output,
+                "javac ran out of memory on this machine, not a code issue - "
+                "close other programs and rerun grade.py for this submission",
+            )
+            self.assertNotIn("hs_err_pid", result.output)
+            self.assertNotIn("malloc", result.output)
+
+    def test_a_real_compile_error_mentioning_memory_is_not_misclassified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Cell.java").write_text("public class Cell { broken!! }\n", encoding="utf-8")
+
+            with mock.patch("grade.run_with_hard_timeout") as mock_run:
+                mock_run.return_value = ProcResult(
+                    False, 1, "", "Cell.java:1: error: cannot find symbol memoryUsage\n"
+                )
+                result = compile_submission(build_dir, Path("junit.jar"), 30)
+
+            self.assertFalse(result.success)
+            self.assertIn("cannot find symbol", result.output)
+            self.assertNotIn("ran out of memory on this machine", result.output)
 
 
 class TestLoadStructureBaseline(unittest.TestCase):

@@ -78,6 +78,14 @@ OUTPUT_TRUNCATE_LINES = 40
 RMTREE_RETRY_ATTEMPTS = 5
 RMTREE_RETRY_DELAY_SECONDS = 2.0
 
+# The exact header line the JVM prints (to stderr, then repeats atop
+# hs_err_pid<pid>.log) when a javac subprocess dies from native-memory
+# exhaustion on the machine running grade.py itself - never something the
+# student's code caused. Matched verbatim so this can only ever fire on
+# that specific crash, not on a compile error that happens to mention
+# "memory" in a student's own message/identifier.
+JVM_NATIVE_OOM_SIGNATURE = "There is insufficient memory for the Java Runtime Environment to continue"
+
 PUBLIC_TYPE_RE = re.compile(
     r"public\s+(?:final\s+|abstract\s+)?(?:class|interface|enum|record)\s+(\w+)"
 )
@@ -860,6 +868,12 @@ def compile_submission(build_dir: Path, junit_jar: Path, timeout: int) -> Compil
 
     if result.returncode != 0:
         output = (result.stdout + result.stderr).replace(str(build_dir) + "\\", "").replace(str(build_dir) + "/", "")
+        if JVM_NATIVE_OOM_SIGNATURE in output:
+            return CompileResult(
+                False, classes_dir,
+                "javac ran out of memory on this machine, not a code issue - "
+                "close other programs and rerun grade.py for this submission",
+            )
         return CompileResult(False, classes_dir, truncate(output))
     return CompileResult(True, classes_dir)
 
