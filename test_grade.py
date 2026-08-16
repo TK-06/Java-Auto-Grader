@@ -19,6 +19,7 @@ from grade import (
     collect_required_class_names,
     collect_test_results,
     compile_submission,
+    console_line_suffix,
     compile_submission_with_fallback,
     compile_with_class_fallback,
     discover_submissions,
@@ -1053,6 +1054,49 @@ class TestGradeStudentStubOnly(unittest.TestCase):
             self.assertNotIn("STUB-ONLY SUBMISSION", flagged_row["notes"])
             for key in ("compiled", "tests_passed", "tests_total", "score", "max_score"):
                 self.assertEqual(flagged_row[key], plain_row[key], key)
+
+
+class TestConsoleLineSuffix(unittest.TestCase):
+    def _row(self, **overrides):
+        row = {
+            "score": 0, "score_cap": "", "notes": "", "failure_details": "",
+        }
+        row.update(overrides)
+        return row
+
+    def test_class_version_mismatch_gets_its_own_reason_regardless_of_cap(self):
+        row = self._row(
+            score=0, score_cap="50%",
+            notes="SCORE CAPPED AT 50%: used precompiled .class instead of .java source for required class(es): Unit",
+            failure_details=(
+                "UnitHierarchyTest.initializationError: Unit has been compiled by a "
+                "more recent version of the Java Runtime (class file version 70.0), "
+                "this version of the Java Runtime only recognizes class file versions up to 69.0"
+            ),
+        )
+
+        self.assertEqual(console_line_suffix(row), " - class can't load (compiled with a newer JDK)")
+
+    def test_zero_score_drops_the_percentage_framing(self):
+        row = self._row(
+            score=0, score_cap="0%",
+            notes='SCORE CAPPED AT 0%: submission matches the unedited starter template exactly for every required class (Boss, Mage, Unit, Warrior) - marking guide says "Stubs only = 0"',
+        )
+
+        self.assertEqual(console_line_suffix(row), " - stub-only submission")
+
+    def test_nonzero_score_keeps_the_full_percentage_framing(self):
+        row = self._row(
+            score=5.5, score_cap="50%",
+            notes="SCORE CAPPED AT 50%: used precompiled .class instead of .java source for required class(es): Unit",
+        )
+
+        self.assertEqual(console_line_suffix(row), " (capped at 50%: failed to include source file)")
+
+    def test_no_cap_at_all_is_empty(self):
+        row = self._row(score=11, score_cap="", notes="")
+
+        self.assertEqual(console_line_suffix(row), "")
 
 
 class TestGradeStudentPreservesFailedBuilds(unittest.TestCase):

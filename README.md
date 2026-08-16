@@ -349,9 +349,12 @@ that student's `notes`. What happens to the score depends on `auto_reject`:
   when in doubt leave it `false` instead.
 
 The console progress line also gets a short inline reason whenever any cap (50%/90%/0%)
-applies, e.g. `... (score 0/11) (capped at 0%: rejected by manual review)` — the full detail
-still only lives in `grades.csv`'s `notes` column; this is just a quick heads-up while a run
-is in progress.
+applies, e.g. `... (score 5.5/11) (capped at 50%: failed to include source file)` for a
+partial cap. Once the final score is exactly 0, the percentage is dropped from the line
+entirely — a cap that lands on zero doesn't need its number stated — so it reads
+`... (score 0/11) - rejected by manual review` instead. The full detail (percentage
+included) always still lives in `grades.csv`'s `notes` column regardless; this is just a
+quick heads-up while a run is in progress.
 
 **No `tests/manual_review.json`?** Nothing changes — no scan runs, exactly as before.
 Entirely opt-in, per week. **The file must be absent, not present with an empty `checks`
