@@ -86,6 +86,16 @@ RMTREE_RETRY_DELAY_SECONDS = 2.0
 # "memory" in a student's own message/identifier.
 JVM_NATIVE_OOM_SIGNATURE = "There is insufficient memory for the Java Runtime Environment to continue"
 
+# The exact phrase in a JUnit failure message (see collect_test_results) when
+# a required class's .class file was compiled with a newer Java version than
+# this grading machine's JDK supports - the class can't even be loaded, so
+# every test on it fails as one synthetic "initializationError" instead of
+# running for real. Used only to give the console progress line (see
+# console_line_suffix) a clearer reason than the generic cap label would
+# otherwise show; grades.csv's own notes/failure_details already contain the
+# JVM's full original message regardless of this constant.
+JVM_CLASS_VERSION_TOO_NEW_SIGNATURE = "more recent version of the Java Runtime"
+
 PUBLIC_TYPE_RE = re.compile(
     r"public\s+(?:final\s+|abstract\s+)?(?:class|interface|enum|record)\s+(\w+)"
 )
@@ -1774,6 +1784,30 @@ def short_cap_reason(notes: str) -> str:
     return segment
 
 
+def console_line_suffix(row: dict) -> str:
+    """The short, human-skimmable suffix appended to a student's console
+    progress line (see main()) - grades.csv's own score_cap/notes columns
+    always keep the full percentage and reason regardless of what this
+    returns. Once the final score is exactly 0, the cap percentage itself
+    stops carrying information - "capped at 50%" and "capped at 0%" both
+    just mean "this student got nothing," whether or not the cap was what
+    actually caused that (it wasn't, for a class-version failure below: the
+    submission scored 0 before any cap even applied). So when row["score"]
+    is 0, this drops the "capped at N%:" framing for a plain "- reason"
+    instead; a genuine partial cap (say, 5.5/11) keeps the full framing,
+    since the percentage is still meaningful there. A JVM class-version
+    mismatch (see JVM_CLASS_VERSION_TOO_NEW_SIGNATURE) gets its own reason
+    ahead of any cap label, since "failed to include source file" undersells
+    a submission that couldn't even be loaded, let alone tested."""
+    if JVM_CLASS_VERSION_TOO_NEW_SIGNATURE in row["failure_details"]:
+        return " - class can't load (compiled with a newer JDK)"
+    if not row["score_cap"]:
+        return ""
+    if row["score"] == 0:
+        return f" - {short_cap_reason(row['notes'])}"
+    return f" (capped at {row['score_cap']}: {short_cap_reason(row['notes'])})"
+
+
 def write_scores_csv(rows: list[dict], out_path: Path) -> None:
     """Simple 2-column CSV (student_id, score), no header row - MyCourseVille's
     gradebook import reads this directly and doesn't expect one. student_id
@@ -1929,13 +1963,10 @@ def main() -> None:
                 status = "NO SOURCE FILES"
             print(f"[{i}/{total}] {student_id}: {status} (score {row['score']})")
         else:
-            cap_suffix = ""
-            if row["score_cap"]:
-                cap_suffix = f" (capped at {row['score_cap']}: {short_cap_reason(row['notes'])})"
             print(
                 f"[{i}/{total}] {student_id}: compiled, "
                 f"{row['tests_passed']}/{row['tests_total']} tests passed "
-                f"(score {row['score']:g}/{row['max_score']:g}){cap_suffix}"
+                f"(score {row['score']:g}/{row['max_score']:g}){console_line_suffix(row)}"
             )
         if args.keep_build:
             print(f"         build dir: {build_root / build_key}")
