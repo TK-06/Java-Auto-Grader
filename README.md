@@ -41,9 +41,11 @@ What every submission can expect, regardless of week:
   below are — 1 day late caps the score at **90%** of what it would otherwise be, 2 days at
   **80%**, and so on down to **0%** at 10+ days late. Combines multiplicatively with any
   other cap in effect, same as the 50%/90% rules below (e.g. a `.class`-only submission 2
-  days late: 0.5 × 0.8 = **40%**). The script has no deadline awareness of its own — this is
-  a manual step: work out each submission's days-late and apply the cap by hand (or
-  pre-multiply the `score` column before writing `mcvScore.csv`) before uploading.
+  days late: 0.5 × 0.8 = **40%**). The script has no deadline awareness of its own —
+  `check_lateness.py` (see **Weekly workflow** below) computes each submission's real
+  days-late from the original MCV export, but applying that to the score is still a manual
+  step: apply the cap by hand (or pre-multiply the `score` column before writing
+  `mcvScore.csv`) before uploading.
 - **Submitted as bare `.java` source instead of a packaged archive** (a loose `.java` file,
   or an unpackaged folder of them, dropped straight into `submissions/` — commonly an LMS
   bulk-download artifact bundling two individually-uploaded files together) → **0**, rejected
@@ -428,6 +430,29 @@ itself is a short hash, not the student's ID — long/messy real-world filenames
 Windows' path length limit if used directly for a nested build path, so the actual
 student_id only ever appears in the CSV, never in a filesystem path.)
 
+### 4. (Optional) Check for late submissions
+
+The late-penalty policy above (10% off per day) needs a deadline to check against, which
+`grade.py` itself has no concept of. `check_lateness.py` computes it separately, as a standalone
+script:
+
+```
+python check_lateness.py <zip1> [<zip2> ...] --deadline 2026-08-19T23:59:00
+```
+
+It reads the original MyCourseVille bulk-export zip(s) directly — never `submissions/`, since
+renaming each student's file down to `<studentID>.<ext>` during extraction already discarded
+the original filename the real timestamp was embedded in. For each student it picks their
+latest submission to `--question` (default `2`; pass a different number for another
+question — nothing in the script itself is question-specific), decodes the real submission
+time from the filename, and prints `days_late` plus the resulting score multiplier. It only
+reads and prints — applying a result to `grades.csv`/`mcvScore.csv` is a separate, deliberate
+manual edit, same as any other score override.
+
+**Keep the original zip file(s) around until this has been run** — once a submission is
+renamed into `submissions/`, its real timestamp can no longer be recovered from anything in
+this repo.
+
 ## Reading the results
 
 `results/grades.csv` has one row per student, with these columns:
@@ -484,6 +509,7 @@ gradebook upload.
 ```
 grading/                  <- repo root
   grade.py
+  check_lateness.py        <- optional; computes real submission times / late penalties, see Weekly workflow §4
   README.md
   lib/
     junit-platform-console-standalone-*.jar   <- committed; see lib/README.md to update it
