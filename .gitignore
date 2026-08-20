@@ -3,8 +3,8 @@ submissions/*
 !submissions/.gitkeep
 
 # scratch copies of submissions for local testing - never commit these either
-submissions2/*
-!submissions2/.gitkeep
+scratchPad/*
+!scratchPad/.gitkeep
 
 # this week's official test cases / rubric - course material, never commit these either
 tests/*
@@ -16,6 +16,9 @@ build_tmp/
 hs_err_pid*.log
 replay_pid*.log
 results/*.csv
+# the published class report (see build_report.py) - real per-student grading
+# detail, same privacy category as everything else under results/
+results/*.html
 # extracted student code from failed-to-compile submissions (see grade_student
 # in grade.py) - same privacy category as submissions/, never commit it
 results/failed_builds/
