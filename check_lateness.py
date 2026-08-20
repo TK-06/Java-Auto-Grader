@@ -34,25 +34,46 @@ that names no question at all is never dropped on this basis). Among what
 survives, the LATEST decoded timestamp is that student's real, final
 submission.
 
-This tool only reads the export zips and prints/returns results -- it never
-writes to submissions/, results/grades.csv, or results/mcvScore.csv.
-Turning its output into an actual grade adjustment is a separate, deliberate
-step for a human to do after reviewing the numbers below.
+This tool never touches submissions/ or results/grades.csv -- grades.csv
+stays exactly as grade.py wrote it, so it always keeps the pre-late-penalty
+technical record intact for audit purposes (what actually compiled, what
+actually passed, what grade.py's own caps were).
+
+When --deadline is given, it DOES automatically rewrite results/mcvScore.csv
+(the file that actually gets uploaded) -- for each student found late, their
+mcvScore.csv score is capped at whichever is stricter: their existing
+score_cap from grades.csv (if any) or the late penalty. The two are never
+multiplied together, only compared -- a submission already capped at 50%
+for some other reason (e.g. compiled-class-only) that's also 1 day late
+(which alone would only cap at 90%) stays at 50%, not 45%, since the late
+penalty only binds when it's the stricter constraint. A submission with no
+other cap that's 1 day late gets the full 90% (10% off), same as always. A
+row with a "TA OVERRIDE:" note in grades.csv is never auto-adjusted, even if
+that student is also late -- a human already made a deliberate call there.
+mcvScore.csv is fully regenerated from grades.csv each run (not patched
+incrementally), so re-running with the same deadline is always safe and
+gives identical output -- there's no double-penalty risk to guard against.
+The previous copy is backed up to mcvScore.csv.bak first.
 
 Usage:
     python check_lateness.py ZIP [ZIP ...]
     python check_lateness.py ZIP [ZIP ...] --deadline 2026-08-19T23:59:00
     python check_lateness.py ZIP [ZIP ...] --question 1
+    python check_lateness.py ZIP [ZIP ...] --deadline ... --grades results/grades.csv --scores results/mcvScore.csv
 """
 import argparse
+import csv
 import math
 import re
+import shutil
 import sys
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import grade
 
 BANGKOK = ZoneInfo("Asia/Bangkok")
 
@@ -208,6 +229,67 @@ def late_multiplier(days: int) -> float:
     return (10 - capped_days) / 10
 
 
+def parse_cap_fraction(score_cap: str) -> float:
+    """Parse grades.csv's score_cap column ("", "50%", "0%", ...) into a
+    0.0-1.0 fraction. Blank means no cap is in effect (1.0)."""
+    text = score_cap.strip()
+    if not text:
+        return 1.0
+    return float(text.rstrip("%")) / 100.0
+
+
+def read_grades_csv(path: Path) -> "list[dict]":
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def apply_late_caps(grades_rows: "list[dict]", late_by_student: dict) -> "tuple[list[dict], list[str]]":
+    """Computes what results/mcvScore.csv should contain given the current
+    grades.csv rows and this run's late/multiplier results (student_id ->
+    row from the days_late table above, only for students with a valid
+    submission). Returns (mcv_rows, report) -- mcv_rows is grades_rows with
+    each late student's "score" replaced by the late-capped value (everyone
+    else's copied through unchanged); report is human-readable lines
+    describing every adjustment (or skip) made, for visibility.
+
+    grades.csv itself is never mutated or written by this function -- caller
+    only ever passes the result to write_scores_csv, never back to
+    write_csv. A late student's new cap is min(existing cap, late
+    multiplier), never existing * late -- see module docstring for why."""
+    mcv_rows = []
+    report = []
+    for row in grades_rows:
+        bare_id = grade.bare_student_id(row["student_id"])
+        new_row = dict(row)
+        late = late_by_student.get(bare_id)
+        if late is not None and late["days_late"] > 0:
+            if "TA OVERRIDE:" in row["notes"]:
+                report.append(
+                    f"  {row['student_id']}: {late['days_late']}d late, but grades.csv has a "
+                    f"TA OVERRIDE note -- left mcvScore.csv score as-is ({row['score']}), "
+                    f"not auto-adjusted"
+                )
+            else:
+                uncapped = float(row["uncapped_score"])
+                max_score = float(row["max_score"])
+                existing_cap = parse_cap_fraction(row["score_cap"])
+                new_cap = min(existing_cap, late["multiplier"])
+                # round() to sidestep float noise (e.g. 11.0 * 0.7 ==
+                # 7.699999999999999) -- this is the number written straight
+                # into mcvScore.csv, which gets uploaded as-is.
+                new_score = round(min(uncapped, new_cap * max_score), 2)
+                if new_score != float(row["score"]):
+                    new_row["score"] = new_score
+                    report.append(
+                        f"  {row['student_id']}: {late['days_late']}d late (late cap "
+                        f"{late['multiplier']:.0%}) -- existing cap {existing_cap:.0%}, "
+                        f"effective cap {new_cap:.0%}: mcvScore.csv score "
+                        f"{row['score']} -> {new_score:g}"
+                    )
+        mcv_rows.append(new_row)
+    return mcv_rows, report
+
+
 def parse_deadline(text: str) -> datetime:
     """Parse an ISO datetime string as Asia/Bangkok local time. If the
     string already carries its own UTC offset, that offset is honored and
@@ -252,7 +334,19 @@ def parse_args() -> argparse.Namespace:
         "--deadline", default=None,
         help="ISO datetime (e.g. 2026-08-19T23:59:00), interpreted as Asia/Bangkok local "
              "time unless it carries its own UTC offset. When given, adds days_late and "
-             "late_multiplier columns to the output.",
+             "late_multiplier columns to the output, AND automatically rewrites "
+             "--scores with each late student's score capped (never grades.csv -- see "
+             "module docstring).",
+    )
+    parser.add_argument(
+        "--grades", default=str(Path("results") / "grades.csv"),
+        help="grades.csv to read scores/caps from when --deadline is given; never modified "
+             "(default: results/grades.csv)",
+    )
+    parser.add_argument(
+        "--scores", default=str(Path("results") / "mcvScore.csv"),
+        help="mcvScore.csv to rewrite with late-adjusted scores when --deadline is given "
+             "(default: results/mcvScore.csv)",
     )
     return parser.parse_args()
 
@@ -349,6 +443,38 @@ def main() -> None:
         print("Notes:")
         for n in notes:
             print(f"  {n}")
+
+    if deadline is not None and rows:
+        late_by_student = {r["student_id"]: r for r in rows}
+        grades_path = Path(args.grades)
+        scores_path = Path(args.scores)
+        if not grades_path.is_file():
+            sys.exit(
+                f"ERROR: --grades file not found: {grades_path} "
+                f"(run grade.py first, or pass the correct path)"
+            )
+        write_err = grade.check_output_writable(scores_path)
+        if write_err:
+            sys.exit(f"ERROR: {write_err}")
+
+        grades_rows = read_grades_csv(grades_path)
+        mcv_rows, report = apply_late_caps(grades_rows, late_by_student)
+
+        if scores_path.is_file():
+            backup_path = scores_path.parent / (scores_path.name + ".bak")
+            shutil.copyfile(scores_path, backup_path)
+
+        grade.write_scores_csv(mcv_rows, scores_path)
+
+        print()
+        if report:
+            print(f"Applied late penalty to {scores_path} (previous copy backed up to "
+                  f"{scores_path.name}.bak):")
+            for line in report:
+                print(line)
+        else:
+            print(f"Rewrote {scores_path} from {grades_path} -- no late-student score "
+                  f"changes were needed.")
 
 
 if __name__ == "__main__":
