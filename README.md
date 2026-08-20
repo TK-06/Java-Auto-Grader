@@ -37,15 +37,20 @@ total instead — no other change needed.
 
 What every submission can expect, regardless of week:
 
-- **Late submissions are docked 10% per day late**, applied as a cap the same way the rules
-  below are — 1 day late caps the score at **90%** of what it would otherwise be, 2 days at
-  **80%**, and so on down to **0%** at 10+ days late. Combines multiplicatively with any
-  other cap in effect, same as the 50%/90% rules below (e.g. a `.class`-only submission 2
-  days late: 0.5 × 0.8 = **40%**). The script has no deadline awareness of its own —
-  `check_lateness.py` (see **Weekly workflow** below) computes each submission's real
-  days-late from the original MCV export, but applying that to the score is still a manual
-  step: apply the cap by hand (or pre-multiply the `score` column before writing
-  `mcvScore.csv`) before uploading.
+- **Late submissions are docked 10% per day late** — 1 day late caps the score at **90%**
+  of what it would otherwise be, 2 days at **80%**, and so on down to **0%** at 10+ days
+  late. `grade.py` itself has no deadline awareness — `check_lateness.py` (see **Weekly
+  workflow §4** below) computes each submission's real days-late from the original MCV
+  export and, given `--deadline`, automatically applies the late cap to `results/mcvScore.csv`
+  (the file that actually gets uploaded). Unlike the 50%/90%/manual-review caps above, which
+  combine with each other **multiplicatively** when more than one applies, the late penalty
+  combines with an existing cap by taking **whichever is stricter** (`min`, not multiply) —
+  a `.class`-only submission (50% cap) that's also 1 day late (which alone would only cap at
+  90%) still lands at **50%**, not 45%, since the late penalty only binds when it's the
+  tighter constraint. A submission with no other cap that's 1 day late still gets the full
+  90% (10% off). `results/grades.csv` is never touched by this — it always keeps the
+  pre-late-penalty technical record for audit purposes; only `mcvScore.csv` reflects the
+  late adjustment. See **Weekly workflow §4** for the exact mechanics.
 - **Submitted as bare `.java` source instead of a packaged archive** (a loose `.java` file,
   or an unpackaged folder of them, dropped straight into `submissions/` — commonly an LMS
   bulk-download artifact bundling two individually-uploaded files together) → **0**, rejected
@@ -434,7 +439,8 @@ student_id only ever appears in the CSV, never in a filesystem path.)
 
 The late-penalty policy above (10% off per day) needs a deadline to check against, which
 `grade.py` itself has no concept of. `check_lateness.py` computes it separately, as a standalone
-script:
+script — and, when `--deadline` is given, automatically applies the result to
+`results/mcvScore.csv` (never `results/grades.csv`):
 
 ```
 python check_lateness.py <zip1> [<zip2> ...] --deadline 2026-08-19T23:59:00
@@ -445,9 +451,35 @@ renaming each student's file down to `<studentID>.<ext>` during extraction alrea
 the original filename the real timestamp was embedded in. For each student it picks their
 latest submission to `--question` (default `2`; pass a different number for another
 question — nothing in the script itself is question-specific), decodes the real submission
-time from the filename, and prints `days_late` plus the resulting score multiplier. It only
-reads and prints — applying a result to `grades.csv`/`mcvScore.csv` is a separate, deliberate
-manual edit, same as any other score override.
+time from the filename, and prints `days_late` plus the resulting score multiplier.
+
+**With `--deadline`, it also rewrites `results/mcvScore.csv`** (override the path with
+`--scores`; `results/grades.csv` is read from `--grades`, default `results/grades.csv`, and is
+only ever read, never written):
+
+- For every student found late (`days_late > 0`), their `mcvScore.csv` score is capped at
+  **whichever is stricter** — their existing `score_cap` from `grades.csv` (if any) or the
+  late penalty — never multiplied together. See the worked example in the **Grading policy
+  (SLA)** section above.
+- A `grades.csv` row with a `TA OVERRIDE:` note (see §6 in **Reading the results**) is never
+  auto-adjusted, even if that student is also late — a human already made a deliberate call
+  there, and this automation won't second-guess it. It's reported on the console instead.
+- On-time students, and students not found in the zip(s) at all, are left completely alone.
+- The previous `mcvScore.csv` is backed up to `mcvScore.csv.bak` before it's overwritten.
+- `mcvScore.csv` is fully regenerated from the current `grades.csv` each run (not patched
+  incrementally), so running this twice with the same deadline is always safe and produces
+  identical output — there's no risk of the penalty being applied twice.
+
+Example output for a student 3 days late with no other cap (11/11 → 7.7/11):
+
+```
+Applied late penalty to results\mcvScore.csv (previous copy backed up to mcvScore.csv.bak):
+  333: 3d late (late cap 70%) -- existing cap 100%, effective cap 70%: mcvScore.csv score 11 -> 7.7
+```
+
+And a student 1 day late who *also* has an existing 50% cap (`.class`-only submission) —
+the late penalty doesn't bind, since 50% is already stricter than the 90% the late penalty
+alone would apply, so nothing changes and no line is printed for them.
 
 **Keep the original zip file(s) around until this has been run** — once a submission is
 renamed into `submissions/`, its real timestamp can no longer be recovered from anything in
