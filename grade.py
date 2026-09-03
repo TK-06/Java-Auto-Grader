@@ -7,7 +7,9 @@ JUnit Platform Console Launcher, and writes one row per student to a CSV:
 student_id, compiled, tests_passed, tests_total, score, max_score,
 uncapped_score, score_cap, passed_tests, failed_tests, failure_details, notes.
 Score is 1 point per passed test by default, or a weighted sum if
-tests/rubric.json is present. failure_details carries the JUnit assertion
+tests/rubric.json is present (a rubric entry with negative points is a
+penalty test: its |points| are subtracted when that test fails, and the
+score is floored at 0 - see load_rubric). failure_details carries the JUnit assertion
 message for each failed test (e.g. "expected: <0> but was: <-1>"), so a
 failure can be understood straight from the CSV instead of re-reading the
 test's source. A submission that fails to compile has its
@@ -31,11 +33,14 @@ still graded from that class's own precompiled .class if one is found
 elsewhere in the submission (a runnable-jar export that dropped source is
 the common case) - capped at 50% of max_score, since there's no source to
 verify. A found .class whose own compiled package doesn't match what the
-official tests naively expect (e.g. baked as `package main.java;` when the
-tests need the class unqualified) still gets a genuine attempt via an
-import-adjusted copy of just the official test - never the real
-tests/*.java - falling back to a clear "can't be used" note only if that
-attempt itself doesn't compile; see compile_with_class_fallback and
+official tests naively expect (e.g. baked as `package main.java;`, or as a
+real `package list;` when the tests name the class unqualified) still gets a
+genuine attempt against throwaway copies of just the official tests - never
+the real tests/*.java: first with an import added, then, when the tests need
+same-package access no import can grant (a package-private field like
+`l.header`), with those copies recompiled into that same package. It falls
+back to a clear "can't be used" note only if both attempts fail; see
+compile_with_class_fallback, derive_fallback_test_package and
 partition_fallback_matches. A submission that only yielded gradable content
 after digging past a plain unzip (a .zip wrapping a nested jar, say) is
 capped at 90%,
@@ -214,7 +219,7 @@ COMMON_JDK_TYPE_NAMES = {
     "Random", "StringBuilder", "StringBuffer", "Exception", "RuntimeException",
     "IllegalArgumentException", "IllegalStateException", "NullPointerException",
     "IndexOutOfBoundsException", "Thread", "Optional", "Comparator", "Iterator",
-    "Arrays", "Collections", "Math", "System",
+    "Arrays", "Collections", "Math", "System", "File",
 }
 
 
@@ -356,6 +361,28 @@ def add_imports(text: str, imports: list[str]) -> str:
         return text
     insert_at = matches[-1].end() if matches else 0
     return text[:insert_at] + "".join(to_add) + text[insert_at:]
+
+
+def add_package_declaration(text: str, package_name: str) -> str:
+    """Prepends `package <package_name>;` to text - the same throwaway,
+    in-memory copy of an official test file add_imports serves, never the
+    real tests/*.java on disk (see compile_with_class_fallback).
+
+    Where add_imports only makes a class in another package REACHABLE by
+    name, this makes the test a MEMBER of that package, which is the only
+    thing that also grants access to that class's package-private members. A
+    week whose official tests poke at fields directly (this week's
+    `l.header.previousNode`, `itr.currentNode.data`) can never be satisfied
+    by an import, no matter how correct the student's bytecode is - Java
+    grants package-private access on package membership alone.
+
+    A `package` declaration is legal as the very first line even when the
+    file opens with a comment, so prepending is always safe. Returns text
+    unchanged if it already declares a package, so this can never silently
+    move a test out of a package its own week requires."""
+    if PACKAGE_RE.search(text):
+        return text
+    return f"package {package_name};\n\n{text}"
 
 
 def truncate(text: str) -> str:
@@ -576,6 +603,51 @@ def partition_fallback_matches(
     return safe, needs_import
 
 
+def find_same_package_companions(
+    class_search_root: Path,
+    packages: set[str],
+    wanted: set[str],
+) -> dict[str, list[Path]]:
+    """Graded classes whose own `.class` sits in one of `packages` - the real
+    package(s) the submission's OTHER fallback classes were compiled into (see
+    partition_fallback_matches / derive_fallback_test_package).
+
+    This exists because prepare_build_dir flattens every student `.java` into
+    the UNNAMED package, so a student source file only ever supplies the
+    unnamed-package form of the class it declares. When the classes actually
+    being graded live in a real package `P`, a `P.Foo` reference cannot be
+    satisfied by an unnamed-package `Foo` - they are different types to javac.
+    The plain simple-name bookkeeping in grade_student can't see that: a
+    leftover `Foo.java` from an earlier week makes `Foo` look "present", so
+    `P/Foo.class` is never seeded and every `P` class that needed it fails to
+    compile.
+
+    Real case this fixes: a submission carrying this week's work as
+    `list/*.class` alongside an entire earlier week's source at the archive
+    root, including a same-named-but-unrelated `Iterator.java` (that week's
+    `int next()` interface, not this week's `char next()` one). Without this,
+    `list/Iterator.class` is skipped, `list.CDLinkedList` and
+    `list.DListIterator` can't resolve it, and a working submission scores 0.
+
+    Deliberately narrow: only the EXACT `<package>/<Name>.class` path is
+    accepted, never a same-named class found loose somewhere else in the tree,
+    and only for names the caller already considers graded. Returns
+    {class_name: [ClassName.class, ...]} (including any `ClassName$Inner`
+    sibling), empty when nothing matches - so a week where this never applies
+    behaves exactly as before."""
+    found: dict[str, list[Path]] = {}
+    for name in sorted(wanted):
+        for package in sorted(packages):
+            package_dir = class_search_root / Path(*package.split("."))
+            main_class = package_dir / f"{name}.class"
+            if not main_class.is_file():
+                continue
+            files = [main_class] + sorted(package_dir.glob(f"{name}$*.class"))
+            found[name] = files
+            break
+    return found
+
+
 def find_nested_archives(root: Path) -> list[Path]:
     """.zip/.jar files sitting inside an already-extracted submission - e.g.
     a student who zipped up their built .jar instead of submitting it
@@ -746,6 +818,94 @@ def find_extra_test_files(build_dir: Path, official_names: set[str]) -> list[Pat
     return extra
 
 
+TOP_LEVEL_TYPE_RE = re.compile(r"\b(?:class|interface|enum|record)\s+(\w+)")
+JAVA_WORD_RE = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def declared_type_names(text: str, stem: str) -> set[str]:
+    """Every type name a student .java file declares: its filename stem - which
+    prepare_build_dir has already resolved to the file's real public type, and
+    which is what the rest of grade.py keys "a class" on (present_java_classes,
+    check_structure_baseline, check_stub_only_submission) - plus every
+    class/interface/enum/record name declared anywhere in its text, including a
+    non-public secondary top-level type or a nested one that the stem alone
+    would miss. Deliberately over-collects (a name inside a comment or a string
+    counts): the only caller uses this to decide what NOT to touch, so a false
+    positive can only ever protect a file, never expose one."""
+    return {stem} | set(TOP_LEVEL_TYPE_RE.findall(text))
+
+
+def find_unreachable_student_files(
+    build_dir: Path, official_names: set[str], graded_class_names: set[str]
+) -> list[Path]:
+    """Student .java files in build_dir that CANNOT MATTER to this week's
+    grading - typically a previous week's assignment the student never deleted
+    from their project. Real case: a jar carrying this week's classes as .class
+    files at the archive root plus an entire earlier week's
+    LinkedList/ListNode/ListIterator/Iterator source, one file of which didn't
+    compile - zeroing a submission whose actual assignment code was fine (see
+    compile_submission_with_fallback).
+
+    "Cannot matter" is defined structurally, never by guessing at filenames:
+
+      ROOTS - the official test files' own source text (they are what actually
+      gets compiled and run, so any name they mention is relevant by
+      definition), plus every student file declaring a name in
+      graded_class_names, i.e. main()'s class_fallback_candidates:
+      structure.json's required_classes unioned with
+      collect_required_class_names' inference from the official tests.
+
+      REACHABLE - the transitive closure of the roots over "file A's source
+      text mentions a type name file B declares". Transitivity is essential and
+      not optional: a required class's own private helper, and that helper's
+      helper, are part of the student's actual assignment code even though this
+      week's tests never name them, and dropping one would break a submission
+      that compiles fine today.
+
+      UNREACHABLE - everything else. No official test, and no chain of the
+      student's own classes starting from one, names any type such a file
+      declares, so javac's verdict on every file that IS reachable is identical
+      whether it is present or absent. That is the whole claim, and it is why
+      excluding these can never hide a compile error in code that counts.
+
+    Both steps are deliberately over-broad in the SAFE direction: reachability
+    is a plain word match over raw source (a name in a comment or a string
+    literal still counts as a reference), and declared_type_names counts
+    non-public and nested types too. Every imprecision therefore KEEPS a file
+    rather than dropping one.
+
+    Never returns an official test file - those are the roots. The caller must
+    still treat this as a RETRY-ONLY candidate list; see
+    compile_submission_with_fallback."""
+    student_files = [
+        f for f in sorted(build_dir.glob("*.java")) if f.name not in official_names
+    ]
+    if not student_files:
+        return []
+    texts = {f: f.read_text(encoding="utf-8", errors="ignore") for f in student_files}
+    declares = {f: declared_type_names(texts[f], f.stem) for f in student_files}
+
+    reachable: set[Path] = set()
+    frontier: list[str] = [
+        (build_dir / name).read_text(encoding="utf-8", errors="ignore")
+        for name in sorted(official_names)
+        if (build_dir / name).is_file()
+    ]
+    for f in student_files:
+        if declares[f] & graded_class_names:
+            reachable.add(f)
+            frontier.append(texts[f])
+
+    while frontier:
+        words = set(JAVA_WORD_RE.findall(frontier.pop()))
+        for f in student_files:
+            if f not in reachable and declares[f] & words:
+                reachable.add(f)
+                frontier.append(texts[f])
+
+    return [f for f in student_files if f not in reachable]
+
+
 def prepare_build_dir(
     build_key: str, student_files: list[Path], test_files: list[Path], build_root: Path
 ) -> tuple[Path, list[str]]:
@@ -912,51 +1072,87 @@ def compile_submission(build_dir: Path, junit_jar: Path, timeout: int) -> Compil
 
 
 def compile_submission_with_fallback(
-    build_dir: Path, junit_jar: Path, timeout: int, official_names: set[str]
+    build_dir: Path,
+    junit_jar: Path,
+    timeout: int,
+    official_names: set[str],
+    graded_class_names: set[str] = frozenset(),
 ) -> tuple[CompileResult, list[str]]:
     """Try the normal full compile first. If it fails AND the submission
-    contains leftover, never-scored student test file(s) (see
-    find_extra_test_files - e.g. a prior week's TestCPTSMachine.java sitting
-    next to this week's official TestCPTSMachine2.java), retry once with
-    just those files excluded. Every student .java file is compiled together
-    in one javac invocation, so today a single broken leftover test class -
-    which was never going to count toward the score anyway - can zero out an
-    otherwise fully-working submission. Main.java is already excluded from
-    grading for the same class of reason (see prepare_build_dir); this
-    extends the same idea to leftover test files, but only as a recovery
-    path: if excluding them does NOT make the submission compile, the
-    ORIGINAL compile error is reported, not the retry's - excluding files is
-    for recovering a submission, never for hiding a real compile error in
-    the student's actual code or the official tests."""
+    contains student .java file(s) that cannot matter to this week's grading,
+    retry ONCE with all of them excluded together. Two independent sources feed
+    that candidate list:
+
+    - find_extra_test_files - a leftover, never-scored student test class from a
+      prior week (e.g. TestCPTSMachine.java sitting next to this week's official
+      TestCPTSMachine2.java), recognised by its JUnit import.
+    - find_unreachable_student_files - the general case: any student file that
+      nothing the official tests can reach, directly or through any chain of the
+      student's own classes, even mentions (e.g. a whole earlier week's
+      LinkedList/ListNode/ListIterator source still sitting in the project). A
+      leftover test file has no JUnit import to give it away when it is a plain
+      class, which is exactly the shape that used to slip through.
+
+    The JUnit-import rule stays in the union rather than being replaced, so that
+    long-standing recovery cannot regress even where the two disagree.
+
+    Every student .java file is compiled together in one javac invocation, so
+    without this a single broken irrelevant file - which was never going to
+    count toward the score anyway - zeroes an otherwise fully-working
+    submission. Main.java is already excluded from grading for the same class of
+    reason (see prepare_build_dir).
+
+    The whole candidate set is excluded in ONE retry, not one file at a time, so
+    N unrelated broken leftovers still cost exactly one extra compile and the
+    outcome never depends on which error javac happened to report first. There
+    is deliberately no second round and no re-computation: a file that survived
+    the exclusion is one the graded code genuinely reaches, so if the retry
+    still fails, that IS a real compile error in the student's own assignment
+    code. Iterating would mean peeling files away until something compiles,
+    which is precisely the failure mode this must not have.
+
+    Strictly a recovery path: if excluding them does NOT make the submission
+    compile, every excluded file is moved back and the ORIGINAL compile error is
+    reported, not the retry's - excluding files is for recovering a submission,
+    never for hiding a real compile error in the student's actual code or the
+    official tests."""
     notes: list[str] = []
     compile_result = compile_submission(build_dir, junit_jar, timeout)
     if compile_result.success:
         return compile_result, notes
 
-    extra_files = find_extra_test_files(build_dir, official_names)
-    if not extra_files:
+    excludable = sorted(
+        {
+            *find_extra_test_files(build_dir, official_names),
+            *find_unreachable_student_files(build_dir, official_names, graded_class_names),
+        },
+        key=lambda p: p.name,
+    )
+    if not excludable:
         return compile_result, notes
 
     original_error = compile_result.output
     excluded_dir = build_dir / "_excluded_extra"
     excluded_dir.mkdir(exist_ok=True)
-    for f in extra_files:
+    for f in excludable:
         shutil.move(str(f), str(excluded_dir / f.name))
 
     retry_result = compile_submission(build_dir, junit_jar, timeout)
     if retry_result.success:
-        names = ", ".join(f.name for f in extra_files)
+        names = ", ".join(f.name for f in excludable)
         notes.append(
-            f"excluded student's leftover test file(s) {names} (failed to compile on "
-            f"their own and aren't part of this week's rubric) so the official tests "
-            f"could still run; original compile error before exclusion: {original_error}"
+            f"excluded student file(s) {names} - not part of this week's graded "
+            f"classes, and nothing the official tests reach (directly or "
+            f"transitively) references them, so the official tests could still run "
+            f"despite them failing to compile; original compile error before "
+            f"exclusion: {original_error}"
         )
         return retry_result, notes
 
     # Excluding them didn't help - something else is actually broken, so put
     # the files back (for --keep-build inspection) and report the ORIGINAL
     # error rather than the retry's.
-    for f in extra_files:
+    for f in excludable:
         shutil.move(str(excluded_dir / f.name), str(f))
     return compile_result, notes
 
@@ -1056,7 +1252,15 @@ def load_rubric(tests_dir: Path) -> dict[str, dict[str, float]] | None:
     """Optional tests/rubric.json: {"ClassName": {"testMethod": points, ...}, ...}.
     When present, score becomes the weighted sum of passed tests found in the
     rubric instead of a flat 1-point-per-test count. Absent by default so weeks
-    without a rubric behave exactly as before."""
+    without a rubric behave exactly as before.
+
+    A rubric entry with NEGATIVE points is a PENALTY test rather than a scored
+    one: it contributes nothing to max_score, and its |points| are SUBTRACTED
+    from the score when that test FAILS (a marking guide "no loop / no
+    recursion" check that docks a flat 10 points for failing, say). A penalty
+    test that passes costs nothing; one with no pass/fail result at all is
+    flagged, never auto-deducted. The final score is floored at 0. See the
+    negative-points handling in grade_student and README.md section 2b."""
     rubric_path = tests_dir / "rubric.json"
     if not rubric_path.exists():
         return None
@@ -1298,6 +1502,91 @@ def run_manual_review_checks(
     return notes, reject_reasons
 
 
+def derive_fallback_test_package(
+    needs_import: dict[str, tuple[Path, str]],
+    test_files: list[Path],
+    build_dir: Path,
+    official_names: set[str],
+) -> str | None:
+    """The one package a throwaway copy of this week's official tests could be
+    compiled INTO so it reaches needs_import's .class files as a package
+    member rather than merely as an importer - see add_package_declaration
+    for why that's sometimes the only thing that can work. Returns None
+    whenever that would be wrong or ambiguous, and the caller then simply
+    doesn't attempt it.
+
+    The package is always DERIVED from where the student's own fallback
+    .class files actually sit: partition_fallback_matches already resolved
+    each candidate's real compiled package into its fully-qualified name, so
+    this only has to read it back off. Nothing here is week-specific or
+    configured. Three things disqualify the attempt:
+
+    - Any official test declares its OWN package. That week's tests already
+      state which package they belong to (see collect_referenced_packages),
+      and moving them out of it would break exactly the same-package access
+      this exists to provide.
+    - The needs_import candidates don't all share ONE package. A test file
+      lives in exactly one package, so no single choice could reach them all.
+    - Some class the official tests reference UNQUALIFIED is being supplied
+      from the unnamed package - as student .java flattened into build_dir by
+      prepare_build_dir, or as a fallback .class seeded at the classpath root
+      (see the seeding block in grade_student, which runs before this). Java
+      gives a named package no way to see an unnamed-package type - it can't
+      even be imported - so packaging the tests would just trade one
+      unreachable class for another. This is what keeps a mixed
+      source-plus-bytecode submission, and the already-working case of .class
+      files sitting at the archive root, on exactly the path they take
+      today."""
+    packages = {fqcn.rsplit(".", 1)[0] for _f, fqcn in needs_import.values()}
+    if len(packages) != 1:
+        return None
+    package = packages.pop()
+    if not package:
+        return None
+    for tf in test_files:
+        if PACKAGE_RE.search(tf.read_text(encoding="utf-8", errors="ignore")):
+            return None
+    unnamed_supplied = {
+        f.stem for f in build_dir.glob("*.java") if f.name not in official_names
+    }
+    classes_dir = build_dir / "classes"
+    if classes_dir.is_dir():
+        unnamed_supplied |= {f.stem.split("$", 1)[0] for f in classes_dir.glob("*.class")}
+    if infer_unnamed_package_classes(test_files) & unnamed_supplied:
+        return None
+    return package
+
+
+def attempt_compile_with_test_copies(
+    build_dir: Path,
+    junit_jar: Path,
+    timeout: int,
+    official_names: set[str],
+    adjusted: dict[Path, str],
+    graded_class_names: set[str] = frozenset(),
+) -> tuple[CompileResult, list[str]] | None:
+    """One compile attempt against adjusted throwaway copies of the official
+    test file(s) already sitting in build_dir (see prepare_build_dir):
+    `adjusted` maps each build_dir copy to the exact text to try. Returns
+    (compile_result, notes) on success. On failure every touched copy is
+    restored to its byte-for-byte original first and None is returned - so a
+    failed guess can never leave build_dir in a worse state than before, and
+    any later attempt always starts from pristine test text."""
+    originals = {
+        dest: dest.read_text(encoding="utf-8", errors="ignore") for dest in adjusted
+    }
+    for dest, text in adjusted.items():
+        dest.write_text(text, encoding="utf-8")
+    result, notes = compile_submission_with_fallback(
+        build_dir, junit_jar, timeout, official_names, graded_class_names
+    )
+    if result.success:
+        return result, notes
+    for dest, original_text in originals.items():
+        dest.write_text(original_text, encoding="utf-8")
+    return None
+
+
 def compile_with_class_fallback(
     build_dir: Path,
     junit_jar: Path,
@@ -1305,7 +1594,8 @@ def compile_with_class_fallback(
     official_names: set[str],
     test_files: list[Path],
     needs_import: dict[str, tuple[Path, str]],
-) -> tuple[CompileResult, list[str], list[str]]:
+    graded_class_names: set[str] = frozenset(),
+) -> tuple[CompileResult, list[str], list[str], str | None]:
     """Official test .java files are already sitting in build_dir as verbatim
     copies (see prepare_build_dir) when this runs. needs_import (see
     partition_fallback_matches) names classes whose only fallback .class is
@@ -1330,16 +1620,45 @@ def compile_with_class_fallback(
     plain compile is attempted with no adjustment at all, matching exactly
     what would have happened had needs_import been empty from the start.
 
-    Returns (compile_result, used_names, notes): used_names is which
-    needs_import class names the successful attempt actually resolved
-    (list(needs_import) on success, empty list if nothing was attempted or
-    the attempt failed and was reverted) - the caller uses an empty
-    used_names to know it must re-derive structure/compile-error reporting
-    without treating needs_import as covered."""
-    if not needs_import:
-        result, notes = compile_submission_with_fallback(build_dir, junit_jar, timeout, official_names)
-        return result, [], notes
+    An import only helps when the class's PUBLIC surface is all the test
+    touches. When the test also reads package-private members of it (this
+    week: `l.header`, `itr.currentNode.data`), no import can ever compile -
+    only being in the same package can. So a failed import attempt is
+    followed by a second one that recompiles those same throwaway copies as
+    members of the class's own package (see derive_fallback_test_package,
+    which returns None whenever that would be wrong or ambiguous, and
+    add_package_declaration). Import first, package second, deliberately:
+    the import attempt is the strictly less invasive of the two and is
+    exactly today's behavior, so anything that resolves today still resolves
+    the same way, unchanged, and never reaches the second attempt. Only if
+    both fail does one plain compile run with no adjustment at all, matching
+    exactly what would have happened had needs_import been empty from the
+    start.
 
+    Returns (compile_result, used_names, notes, test_package): used_names is
+    which needs_import class names the successful attempt actually resolved
+    (list(needs_import) on success, empty list if nothing was attempted or
+    every attempt failed and was reverted) - the caller uses an empty
+    used_names to know it must re-derive structure/compile-error reporting
+    without treating needs_import as covered. test_package is the package the
+    second attempt compiled the tests into, or None for every other outcome -
+    the caller needs it because the test classes' own fully-qualified names
+    moved with them, and the console launcher selects them by name (see the
+    run_tests call in grade_student)."""
+    if not needs_import:
+        result, notes = compile_submission_with_fallback(
+            build_dir, junit_jar, timeout, official_names, graded_class_names
+        )
+        return result, [], notes, None
+
+    used_names = sorted(needs_import)
+    # Derived BEFORE any compile runs, while build_dir/classes holds exactly the
+    # .class files grade_student seeded into it and nothing javac produced.
+    test_package = derive_fallback_test_package(
+        needs_import, test_files, build_dir, official_names
+    )
+
+    # Attempt 1 - add the missing import to the test(s) that name the class.
     imports_by_test_file: dict[Path, list[str]] = {}
     for class_name, (_file, fqcn) in needs_import.items():
         for tf in test_files:
@@ -1347,28 +1666,54 @@ def compile_with_class_fallback(
             if re.search(rf"\bnew\s+{re.escape(class_name)}\s*[(<]", text):
                 imports_by_test_file.setdefault(build_dir / tf.name, []).append(fqcn)
 
-    originals: dict[Path, str] = {}
-    for dest, fqcns in imports_by_test_file.items():
-        original_text = dest.read_text(encoding="utf-8", errors="ignore")
-        originals[dest] = original_text
-        dest.write_text(add_imports(original_text, fqcns), encoding="utf-8")
-
-    result, notes = compile_submission_with_fallback(build_dir, junit_jar, timeout, official_names)
-    if result.success:
-        used_names = sorted(needs_import)
-        notes = notes + [
+    attempt = attempt_compile_with_test_copies(
+        build_dir, junit_jar, timeout, official_names,
+        {
+            dest: add_imports(dest.read_text(encoding="utf-8", errors="ignore"), fqcns)
+            for dest, fqcns in imports_by_test_file.items()
+        },
+        graded_class_names,
+    )
+    if attempt is not None:
+        result, notes = attempt
+        return result, used_names, notes + [
             f"found precompiled {name}.class elsewhere in the submission, compiled "
             f"under a different package than the official tests expect - adjusted "
             f"the official test's import to reach it directly (no .java source to "
             f"verify, so still capped)"
             for name in used_names
-        ]
-        return result, used_names, notes
+        ], None
 
-    for dest, original_text in originals.items():
-        dest.write_text(original_text, encoding="utf-8")
-    result, notes = compile_submission_with_fallback(build_dir, junit_jar, timeout, official_names)
-    return result, [], notes
+    # Attempt 2 - compile the test copies into the class's own package, for the
+    # same-package access an import can't grant.
+    if test_package is not None:
+        attempt = attempt_compile_with_test_copies(
+            build_dir, junit_jar, timeout, official_names,
+            {
+                build_dir / tf.name: add_package_declaration(
+                    (build_dir / tf.name).read_text(encoding="utf-8", errors="ignore"),
+                    test_package,
+                )
+                for tf in test_files
+            },
+            graded_class_names,
+        )
+        if attempt is not None:
+            result, notes = attempt
+            return result, used_names, notes + [
+                f"found precompiled {name}.class elsewhere in the submission, compiled "
+                f"as part of package '{test_package}' - an import alone can't reach the "
+                f"package-private members the official tests use, so a throwaway copy of "
+                f"each official test was compiled into '{test_package}' as well (no .java "
+                f"source to verify, so still capped)"
+                for name in used_names
+            ], test_package
+
+    # Every adjusted copy has been restored by now, so this is the plain compile.
+    result, notes = compile_submission_with_fallback(
+        build_dir, junit_jar, timeout, official_names, graded_class_names
+    )
+    return result, [], notes, None
 
 
 def grade_student(
@@ -1468,6 +1813,26 @@ def grade_student(
                     raw_matches, class_search_root, test_files
                 )
 
+        # A graded class can be masked from missing_source above by an unrelated
+        # same-named .java the student left over from an earlier week - which
+        # lands in the unnamed package and therefore cannot satisfy a reference
+        # to <package>.<Name> from the packaged classes actually being graded.
+        # Seed those companions too; see find_same_package_companions.
+        if needs_import and class_search_root is not None:
+            fallback_packages = {
+                fqcn.rsplit(".", 1)[0] for _f, fqcn in needs_import.values()
+            }
+            wanted = (
+                (class_fallback_candidates or set())
+                - set(fallback_matches)
+                - set(needs_import)
+            )
+            companions = find_same_package_companions(
+                class_search_root, fallback_packages, wanted
+            )
+            for name, files in companions.items():
+                fallback_matches.setdefault(name, []).extend(files)
+
         # Both fallback_matches and needs_import count as "something was found"
         # for the checks below - whether a needs_import candidate truly resolves
         # is only known once compile_with_class_fallback actually tries it.
@@ -1531,8 +1896,11 @@ def grade_student(
                     "location, only the last one found was used: " + "; ".join(collisions)
                 ]
 
-        compile_result, used_needs_import, compile_notes = compile_with_class_fallback(
-            build_dir, junit_jar, timeout, official_names, test_files, needs_import
+        compile_result, used_needs_import, compile_notes, fallback_test_package = (
+            compile_with_class_fallback(
+                build_dir, junit_jar, timeout, official_names, test_files, needs_import,
+                class_fallback_candidates or frozenset(),
+            )
         )
         prep_notes = prep_notes + compile_notes
 
@@ -1544,9 +1912,10 @@ def grade_student(
                 # class truly has no usable form at all) using only fallback_matches
                 # as "covered", exactly as if needs_import had never been found.
                 prep_notes = prep_notes + [
-                    f"found precompiled {name}.class elsewhere in the submission, but "
-                    f"using it (via an adjusted test import) still didn't compile, so "
-                    f"it can't be used as a substitute"
+                    f"found precompiled {name}.class elsewhere in the submission, but no "
+                    f"adjusted copy of the official test (import added, then compiled into "
+                    f"the class's own package) could use it, so it can't be used as a "
+                    f"substitute"
                     for name in sorted(needs_import)
                 ]
                 if required_classes is not None:
@@ -1569,7 +1938,18 @@ def grade_student(
 
         reports_dir = build_dir / "reports"
         reports_dir.mkdir(exist_ok=True)
-        run_result = run_tests(compile_result.classes_dir, reports_dir, junit_jar, timeout, test_classes)
+        # A same-package fallback compile (see compile_with_class_fallback) put the
+        # official tests inside the student's own package, which moved their
+        # fully-qualified names with them - test_classes was derived in main() from
+        # the unnamed-package originals, so --select-class would find nothing here.
+        effective_test_classes = (
+            [f"{fallback_test_package}.{fqcn}" for fqcn in test_classes]
+            if fallback_test_package
+            else test_classes
+        )
+        run_result = run_tests(
+            compile_result.classes_dir, reports_dir, junit_jar, timeout, effective_test_classes
+        )
         if run_result.timed_out:
             row["compiled"] = "yes"
             row["notes"] = "; ".join(prep_notes + [f"test run timed out after {timeout}s"]).strip("; ")
@@ -1591,9 +1971,28 @@ def grade_student(
             ).strip("; ")
             return row
 
-        passed = [tc for tc in test_cases if tc.status == "passed"]
-        failed = [tc for tc in test_cases if tc.status == "failed"]
-        skipped = [tc for tc in test_cases if tc.status == "skipped"]
+        passed_all = [tc for tc in test_cases if tc.status == "passed"]
+        failed_all = [tc for tc in test_cases if tc.status == "failed"]
+
+        # A rubric entry with NEGATIVE points is a PENALTY test, not a scored one
+        # (see load_rubric / README 2b) - e.g. a marking-guide "no loop / no
+        # recursion" check that docks a fixed number of points for FAILING,
+        # rather than awarding points for passing. It's kept out of the
+        # tests_passed/tests_total tally and the passed_tests/failed_tests/
+        # skipped columns below (it isn't "points possible"); the rubric block
+        # handles the deduction itself.
+        penalty_keys = {
+            (c, m)
+            for c, methods in (rubric or {}).items()
+            for m, pts in methods.items()
+            if pts < 0
+        }
+        passed = [tc for tc in passed_all if (tc.classname, tc.method) not in penalty_keys]
+        failed = [tc for tc in failed_all if (tc.classname, tc.method) not in penalty_keys]
+        skipped = [
+            tc for tc in test_cases
+            if tc.status == "skipped" and (tc.classname, tc.method) not in penalty_keys
+        ]
 
         row["tests_passed"] = len(passed)
         row["tests_total"] = len(passed) + len(failed)
@@ -1614,19 +2013,51 @@ def grade_student(
             row["max_score"] = row["tests_total"]
         else:
             found = {(tc.classname, tc.method) for tc in test_cases}
-            passed_set = {(tc.classname, tc.method) for tc in passed}
+            passed_set = {(tc.classname, tc.method) for tc in passed_all}
+            failed_set = {(tc.classname, tc.method) for tc in failed_all}
             score = 0.0
             max_score = 0.0
             missing = []
+            penalties_applied = []     # negative-points test(s) that fired (test failed)
+            penalties_no_result = []   # negative-points test(s) with no pass/fail result
             for classname, methods in rubric.items():
                 for method, points in methods.items():
+                    key = (classname, method)
+                    if points < 0:
+                        # Penalty: costs |points| when the test does NOT pass
+                        # (a fail or an error - both are "failed" here). NOT part
+                        # of max_score. A genuinely missing result is left alone
+                        # and only flagged, never auto-deducted - that usually
+                        # means the check's own test file broke, not the
+                        # student's code.
+                        if key in passed_set:
+                            continue
+                        if key in failed_set:
+                            score += points
+                            detail = next(
+                                (tc.detail for tc in failed_all
+                                 if (tc.classname, tc.method) == key and tc.detail),
+                                "",
+                            )
+                            label = f"{classname}.{method} ({points:g})"
+                            penalties_applied.append(f"{label}: {detail}" if detail else label)
+                        else:
+                            penalties_no_result.append(f"{classname}.{method}")
+                        continue
                     max_score += points
-                    if (classname, method) in passed_set:
+                    if key in passed_set:
                         score += points
-                    elif (classname, method) not in found:
+                    elif key not in found:
                         missing.append(f"{classname}.{method}")
-            row["score"] = score
+            row["score"] = max(0.0, score)
             row["max_score"] = max_score
+            if penalties_applied:
+                extra.append("PENALTY applied (rubric): " + "; ".join(penalties_applied))
+            if penalties_no_result:
+                extra.append(
+                    "rubric penalty test(s) had no pass/fail result - NOT applied: "
+                    + ", ".join(penalties_no_result)
+                )
             if missing:
                 extra.append(f"rubric test(s) not found in results: {', '.join(missing)}")
             rubric_keys = {(c, m) for c, ms in rubric.items() for m in ms}
@@ -1900,8 +2331,19 @@ def main() -> None:
     print(f"  tests:       {tests_dir}  ({len(test_files)} test file(s))")
     print(f"  junit jar:   {junit_jar}")
     if rubric is not None:
-        rubric_total = sum(points for methods in rubric.values() for points in methods.values())
-        print(f"  rubric:      {tests_dir / 'rubric.json'}  (weighted, {rubric_total:g} points total)")
+        rubric_total = sum(
+            p for methods in rubric.values() for p in methods.values() if p > 0
+        )
+        penalties = [
+            (f"{c}.{m}", p)
+            for c, methods in rubric.items()
+            for m, p in methods.items()
+            if p < 0
+        ]
+        rubric_line = f"  rubric:      {tests_dir / 'rubric.json'}  (weighted, {rubric_total:g} points total"
+        if penalties:
+            rubric_line += "; penalty test(s): " + ", ".join(f"{n} {p:g}" for n, p in penalties)
+        print(rubric_line + ")")
     else:
         print("  rubric:      none (tests/rubric.json not found - scoring 1 point per test)")
     if required_classes is not None:

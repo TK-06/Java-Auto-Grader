@@ -79,6 +79,8 @@ def category_of(row):
     notes = row["notes"]
     if "TA OVERRIDE" in notes:
         return "override"
+    if "timed out" in notes and row["tests_total"] in ("", "0"):
+        return "timeout"
     if row["compiled"] == "no" and "STRUCTURE ERROR" in notes:
         return "structure"
     if row["compiled"] == "no" and "COMPILE ERROR" in notes:
@@ -87,8 +89,19 @@ def category_of(row):
         return "nosource"
     if row["score_cap"]:
         return "capped"
+    if "PENALTY applied (rubric)" in notes:
+        return "penalty"
     if row["tests_passed"] == row["tests_total"] and row["tests_total"] != "0":
         return "pass"
+    # Earning every available point IS a full pass, even when some test the
+    # student "failed" carries no marks - a rubric entry weighted 0 is an
+    # informational check (see grade.py's rubric handling), so counting it in
+    # tests_passed/tests_total must not label a full-marks row "Partial".
+    try:
+        if float(row["score"]) == float(row["max_score"]) and float(row["max_score"]) > 0:
+            return "pass"
+    except ValueError:
+        pass
     return "partial"
 
 
@@ -96,6 +109,7 @@ CATEGORY_LABEL = {
     "pass": "Full pass", "partial": "Partial", "capped": "Capped",
     "compile": "Compile error", "structure": "Structure error",
     "nosource": "No source", "override": "TA review", "missing": "No submission",
+    "timeout": "Timed out", "penalty": "Penalty",
 }
 
 
@@ -117,6 +131,11 @@ def render_reason(row, cat):
         </div>"""
     if cat in ("structure", "nosource"):
         return f'<div class="reason reason-bad"><pre>{esc(notes)}</pre></div>'
+    if cat == "timeout":
+        return f"""<div class="reason reason-bad">
+          <p>The test run for this submission <strong>did not finish within the time limit</strong> and was stopped, so it scored 0. This almost always means a loop that never ends &mdash; e.g. walking the list with an iterator without ever advancing it, or a remove/insert that loses the rest of the chain.</p>
+          <p class="hint">Run the JUnit grader locally before submitting: a test that hangs instead of passing or failing is the signal to look for.</p>
+        </div>"""
     if cat == "capped":
         m = re.search(r"SCORE CAPPED AT (\d+)%:\s*(.*)$", notes)
         pct = m.group(1) if m else row["score_cap"].strip("%")
@@ -130,6 +149,12 @@ def render_reason(row, cat):
         </div>"""
     if cat == "override":
         return f'<div class="reason reason-override"><pre>{esc(notes)}</pre></div>'
+    if cat == "penalty":
+        return f"""<div class="reason reason-warn">
+          <p><strong>A rubric penalty was applied</strong> &mdash; a marking-guide rule that deducts a fixed number of points regardless of how the other tests went. The exact reason:</p>
+          <pre>{esc(notes)}</pre>
+          <p class="hint">The scored tests listed below are unaffected by this; the deduction is separate.</p>
+        </div>"""
     return ""
 
 
@@ -168,10 +193,14 @@ def render_graded_row(row):
     summary_extra = ""
     if cat in ("compile", "structure", "nosource"):
         summary_extra = '<span class="note-flag">did not compile</span>'
+    elif cat == "timeout":
+        summary_extra = '<span class="note-flag">test run timed out</span>'
     elif cat == "capped":
         summary_extra = f'<span class="note-flag">capped {row["score_cap"]}</span>'
     elif cat == "override":
         summary_extra = '<span class="note-flag">TA reviewed</span>'
+    elif cat == "penalty":
+        summary_extra = '<span class="note-flag">rubric penalty</span>'
     return f"""
     <details class="row" data-id="{esc(sid)}" data-cat="{cat}">
       <summary>
@@ -275,8 +304,8 @@ h1 { font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp
 .chip { font-size: .72rem; font-weight: 600; padding: .2em .55em; border-radius: 5px; letter-spacing: .01em; white-space: nowrap; }
 .chip-pass { background: var(--pass-bg); color: var(--pass); }
 .chip-partial { background: var(--warn-bg); color: var(--warn); }
-.chip-capped { background: var(--warn-bg); color: var(--warn); }
-.chip-compile, .chip-structure, .chip-nosource { background: var(--fail-bg); color: var(--fail); }
+.chip-capped, .chip-penalty { background: var(--warn-bg); color: var(--warn); }
+.chip-compile, .chip-structure, .chip-nosource, .chip-timeout { background: var(--fail-bg); color: var(--fail); }
 .chip-override { background: var(--override-bg); color: var(--ink); border: 1px solid var(--override-line); }
 .chip-missing { background: var(--missing-bg); color: var(--ink-soft); }
 .note-flag { font-size: .78rem; color: var(--ink-soft); }
@@ -373,6 +402,7 @@ def main():
 
     catbar_defs = [
         ("pass", "Full pass"), ("partial", "Partial"), ("capped", "Capped"),
+        ("penalty", "Penalty"), ("timeout", "Timed out"),
         ("compile", "Compile error"), ("structure", "Structure error"),
         ("nosource", "No source"), ("override", "TA review"), ("missing", "No submission"),
     ]
