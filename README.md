@@ -154,6 +154,20 @@ this exclusion, that one irrelevant leftover file would fail the whole submissio
 compile, even though the actual assignment code is fine. Any student file that resolves to
 `Main.java` is skipped and noted in `notes`, exactly like a colliding test file.
 
+**A leftover file that this week's grading cannot possibly reach is excluded too — but only
+as a retry after a failed compile.** Students often leave a previous week's assignment in
+the same project (e.g. a whole `LinkedList`/`ListNode`/`ListIterator` set next to this
+week's classes). Because every student `.java` is compiled in one `javac` invocation, one
+such file failing to compile used to zero the whole submission. If the first compile fails,
+the grader retries once with every student file excluded that **nothing the official tests
+reach even mentions** — computed as the transitive closure over "file A's source text names
+a type file B declares", rooted at the official test files themselves plus every class in
+`structure.json`'s `required_classes` and the names inferred from the tests. A required
+class's own private helper (and that helper's helper) is therefore never dropped. If the
+retry still fails, every file is put back and the **original** compile error is reported —
+excluding files can recover a submission, never hide a real error in the graded code. Every
+excluded file is named in `notes`, along with the original pre-exclusion error.
+
 **A student's package declaration is stripped before compiling, but only if none of this
 week's official test files actually need it** (and if it's stripped, any now-dangling
 `import` of that package elsewhere in the submission is stripped too). Some weeks' official
@@ -209,8 +223,9 @@ different marks (e.g. a "how to mark" doc saying `testCalculatePrice() 2 marks`)
 Use the class name only (no package) and the method name only (no `()`). With this in
 place:
 - `score` = sum of points for every rubric test the student passed
-- `max_score` = sum of every point value in the rubric (14 in the example above) — this is
+- `max_score` = sum of every positive point value in the rubric (14 in the example above) —
   the same for every student regardless of what their submission did, so it's your "out of"
+  (negative "penalty" entries don't count toward it — see below)
 - `grades.csv` gets a `passed_tests` / `failed_tests` column listing exactly which named
   tests passed or failed, e.g. `TestTicket2.testCalculatePrice`
 - If a rubric test never shows up in a student's results at all (not just failed —
@@ -219,6 +234,31 @@ place:
 - Extra `@Test` methods found that *aren't* in the rubric (e.g. a sanity-check test file the
   student bundled alongside your official one, under a different filename) are listed in
   `notes` too, but don't affect the score either way
+
+**Penalty tests — a negative point value.** Some marking guides *deduct* a fixed number of
+points for a test *failing* rather than *awarding* points for it passing (e.g. "−10 if
+`testNoLoop` does not pass"). Give that rubric entry a **negative** number:
+
+```json
+{
+    "ShiftableListTest": { "testShift1": 2, "testShift2": 2 },
+    "TestNoLoop": { "testNoLoop": -10 }
+}
+```
+
+A negative entry is treated as a penalty, not a scored test:
+- It contributes **nothing to `max_score`** — the "out of" is still just the positive points.
+- Its `|points|` are **subtracted from `score` when that test fails** (a JUnit failure *or*
+  an error both count as "did not pass"). A penalty test that **passes** costs nothing.
+- The final `score` is **floored at 0** — a penalty can't push a student negative.
+- It's kept **out of the `tests_passed` / `tests_total` / `passed_tests` / `failed_tests`
+  columns** (it isn't "points possible"). When it fires, `notes` gets a
+  `PENALTY applied (rubric): TestNoLoop.testNoLoop (-10): ...` line.
+- A penalty test with **no pass/fail result at all** (e.g. its own test file failed to
+  load) is **never auto-deducted** — `notes` flags it (`rubric penalty test(s) had no
+  pass/fail result - NOT applied: ...`) so a TA can check by hand, since a missing result
+  usually means the check itself broke, not the student's code.
+- The 50%/90%/0% caps still apply on top of the already-penalized `score`, unchanged.
 
 **No `tests/rubric.json`?** Nothing changes — `score` stays the flat "1 point per passed
 test" count exactly as before. This is entirely opt-in, per week.
@@ -299,9 +339,31 @@ directory once grading moves on) and compilation is attempted against that. If i
 the class evidently works fine once the test can actually see it, so it's graded for real
 against the student's real, unmodified bytecode and capped at 50% exactly as above — this
 is what recovers credit that's rightfully earned instead of scoring a correct submission 0
-over an import path. If it doesn't compile, everything reverts and the submission falls
+over an import path. If it doesn't compile, everything reverts and a **second** attempt is
+made: the same throwaway copies of *every* official test file get `package <that package>;`
+prepended, so the tests become members of the student's own package. This is the only thing
+that can work when the tests reach into package-private members of the student's classes
+(e.g. `l.header`, `itr.currentNode.data`) — an `import` makes a class *reachable*, never
+*package-accessible*, so no import can ever compile such a test. The package is always
+derived from where the student's own `.class` files actually sit, never configured, and the
+attempt is skipped entirely when any official test declares its own package, when the
+missing classes don't all share one package, or when some class the tests name unqualified
+is being supplied from the unnamed package (which a named-package test could no longer
+see). The import attempt always runs first, so anything that resolves today still resolves
+exactly the same way. If both attempts fail, everything reverts and the submission falls
 back to exactly the STRUCTURE ERROR / compile error it would have gotten otherwise, with a
-note explaining the attempt was made and didn't pan out.
+note explaining the attempts were made and didn't pan out.
+
+Once a submission is being graded from `.class` files in a real package like that, any
+*other* required class whose `.class` sits in that **same package** is pulled in alongside
+them — even if a `.java` of the same name exists elsewhere in the submission. A student
+source file is always flattened into the unnamed package by the grader, so it can only ever
+supply the unnamed-package form of its class; it cannot satisfy a `thatpackage.Foo`
+reference. Without this, one leftover `Foo.java` from an earlier week (a same-named but
+completely unrelated class) makes `Foo` *look* present, its real `thatpackage/Foo.class` is
+never used, and every class in that package that depended on it fails to compile — scoring
+a working submission 0. Only the exact `<package>/<Name>.class` path is accepted, and only
+for classes that are already required this week.
 
 ### 2e. (Optional) Manual-review flags for things JUnit can't catch
 
