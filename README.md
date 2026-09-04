@@ -113,6 +113,42 @@ thing you change week to week.
 
 ### 2. Put student submissions in `submissions/`
 
+**If you have an LMS bulk export, use `extract_submissions.py` — don't do this by hand.**
+MyCourseVille's export gives you one folder per student holding *everything* they attached
+to that assignment slot, which is not the same as one valid answer per student. The script
+does the whole step:
+
+```
+python extract_submissions.py <zip1> [<zip2> ...] --question 1
+python extract_submissions.py <zip1> [<zip2> ...] --question 1 --dry-run
+```
+
+It keeps exactly one file per student — the **latest** one, decided by the timestamp
+encoded in the original filename (the same decoding `check_lateness.py` uses, so the two
+can never disagree about which file is a student's real final submission) — drops files
+belonging to another question or that aren't archives at all, writes each as
+`submissions/<studentID>.<ext>`, and empties `submissions/` first (keeping `.gitkeep`) so
+last week's files can't be graded by accident. Run it with `--dry-run` first to see exactly
+what it would do.
+
+`--question` is **required**, deliberately: guessing it wrong silently extracts the other
+question's files for the whole class. Getting it wrong is loud rather than subtle — the
+summary reports `0` written and every student as "nothing usable".
+
+It never decides anything quietly. It prints a "needs a look" list covering resubmissions
+(and which one it kept), a filename carrying a different student's ID or no question marker
+at all — the **folder name is authoritative** for whose work a file is, so such a file is
+kept and flagged, never reassigned — plus any archive small enough to be suspicious. It
+also prints the `not_submitted` list, ready to paste into `tests/report_config.json`, taken
+from the export's own `log.txt`: those students have no folder at all, so they're otherwise
+invisible once you're looking at extracted files.
+
+Extracting deliberately discards the timestamp the original filename carried. That's not a
+mistake to fix — `check_lateness.py` (**§4**) recovers real submission times from the
+original zip(s), never from `submissions/`. **Keep the export zip(s) until that has run.**
+
+If you're placing files yourself instead:
+
 `submissions/` is **gitignored** on purpose — real student code should never end up
 committed to this shared repo. **Every submission must be a packaged archive** — a `.zip`
 or a `.jar` — dropped straight into `submissions/` exactly as received, don't unzip or
@@ -603,6 +639,7 @@ gradebook upload.
 ```
 grading/                  <- repo root
   grade.py
+  extract_submissions.py   <- MCV bulk export -> one <studentID>.<ext> per student, see Weekly workflow §2
   check_lateness.py        <- optional; computes real submission times / late penalties, see Weekly workflow §4
   README.md
   lib/
