@@ -19,6 +19,34 @@ Each new week: write a fresh tests/report_config.json (see the JSON shape
 loaded below), then run this file, then publish OUT_PATH with the Artifact
 tool (title = a short name for that week's assignment topic, e.g. "Cell
 Simulation Grading"; favicon = one emoji tied to the subject).
+
+WRITE EVERY STUDENT-FACING STRING FOR THE STUDENT, NOT THE GRADER. This
+page is the only explanation most of them get. Three rules this file has
+already been bitten by, all fixed in W5Q2:
+  1. A hint must be chosen from the ACTUAL reason, never hard-coded per
+     branch. The capped block used to print the no-source advice to every
+     capped student, including one capped at 0% for a stub-only submission,
+     who was told to tick "include source" - advice unrelated to their 0.
+  2. Never render a number a student cannot act on. max_score is the STRING
+     "0" for a submission rejected before the rubric ran, which is truthy,
+     so `row["max_score"] or AUTOMATED_POINTS` silently produced "0/0".
+  3. Interpret machine output rather than dumping it - a javac wall needs a
+     sentence naming the likely cause above it.
+A compile failure against a FIXED official test is diagnosable, not just
+reportable: javac naming a method the TEST calls as `cannot find symbol`
+means the submitted class is not this question's. analyze_compile_error()
+extracts those, category_of() routes them to "wrongwork" (Wrong submission)
+rather than "compile", and the reason block leads with the missing method,
+with the raw javac collapsed behind a toggle. Signature-mismatch evidence
+alongside it separates "you exported a different project" from "you never
+wrote the method". Lab-agnostic - it reads javac, not the assignment - and
+covers instance, static and interface call sites. Missing CLASSES are a
+different case, already caught upstream by grade.py's structure.json check.
+
+Category labels are grader vocabulary, so the page carries a legend defining
+each one it shows. And a score shown here must reconcile with the score the
+student actually received: grades.csv is the PRE-late-penalty record, which
+is what late_penalties in report_config.json exists to explain.
 """
 import csv, html, json, re, statistics
 from pathlib import Path
@@ -36,6 +64,12 @@ MANUAL_COMPONENT_DESC = _config.get("manual_component_desc")
 NOT_SUBMITTED = _config.get("not_submitted", [])
 NO_VALID_Q2 = _config.get("no_valid_q2", [])
 NOTE_REDACTIONS = _config.get("note_redactions", {})
+# Optional {student_id: {"days": <int>, "uploaded_score": <str|num>}}. grades.csv is
+# deliberately the PRE-late-penalty technical record (check_lateness.py only ever
+# rewrites mcvScore.csv), so without this the report would show a late student the
+# score they earned and the gradebook would show them a smaller one, with nothing
+# explaining the gap. Generic and reusable: no IDs or week-specific text live here.
+LATE_PENALTIES = _config.get("late_penalties", {})
 # JSON gives [class_name, points, [[method, desc], ...]] - equivalent to the
 # (str, int, [(str, str), ...]) shape the rest of this file expects; plain
 # list unpacking works the same as tuple unpacking, so nothing else changes.
@@ -84,7 +118,11 @@ def category_of(row):
     if row["compiled"] == "no" and "STRUCTURE ERROR" in notes:
         return "structure"
     if row["compiled"] == "no" and "COMPILE ERROR" in notes:
-        return "compile"
+        # Distinguish "your own code has a bug" from "this isn't the assignment" -
+        # they need completely different explanations, and lumping the second under
+        # "Compile error" buries the only fact that matters under a wall of javac.
+        missing, _ = analyze_compile_error(extract_compile_error(notes))
+        return "wrongwork" if missing else "compile"
     if row["compiled"] == "no":
         return "nosource"
     if row["score_cap"]:
@@ -105,9 +143,42 @@ def category_of(row):
     return "partial"
 
 
+MISSING_METHOD_RE = re.compile(
+    r"symbol:\s*method\s+(\w+)\([^)]*\)\s*\n\s*location:\s*"\
+    r"(?:variable\s+\w+\s+of type|class|interface)\s+([\w.]+)")
+# javac saying the student's type is a DIFFERENT SHAPE from the one the official
+# test compiles against - not merely missing a method.
+VARIANT_EVIDENCE = (
+    "is not compatible with",
+    "does not override or implement a method from a supertype",
+    "lossy conversion",
+    "cannot implement",
+)
+
+
+def analyze_compile_error(err):
+    """A compile failure against a FIXED official test says something specific:
+    the test is known-good, so an error reporting that a method the test calls
+    does not exist means the submitted class is not the class this question
+    asked for. Returns (missing, is_variant): `missing` is the de-duplicated
+    ["CDLinkedList.swapRange", ...] the test called and could not find, in the
+    order javac first reported them; `is_variant` is True when javac ALSO
+    complained that existing members have different types (e.g. a class storing
+    char where this question's test passes int), which distinguishes "you
+    exported a different assignment" from "you left the method unwritten"."""
+    missing, seen = [], set()
+    for method, owner in MISSING_METHOD_RE.findall(err or ""):
+        key = f"{owner}.{method}"
+        if key not in seen:
+            seen.add(key)
+            missing.append(key)
+    return missing, any(sig in (err or "") for sig in VARIANT_EVIDENCE)
+
+
 CATEGORY_LABEL = {
     "pass": "Full pass", "partial": "Partial", "capped": "Capped",
     "compile": "Compile error", "structure": "Structure error",
+    "wrongwork": "Wrong submission",
     "nosource": "No source", "override": "TA review", "missing": "No submission",
     "timeout": "Timed out", "penalty": "Penalty",
 }
@@ -120,14 +191,71 @@ def extract_compile_error(notes):
     return m.group(1).replace(" | ", "\n") if m else ""
 
 
+def render_late_notice(row):
+    """Rendered ABOVE the category reason, for any student listed in
+    late_penalties - including one who also compiled fine and passed
+    everything, whose category reason is empty. Additive, never a
+    replacement: a late submission that was also capped shows both."""
+    info = LATE_PENALTIES.get(row["student_id"])
+    if not info:
+        return ""
+    days = str(info.get("days", ""))
+    uploaded = info.get("uploaded_score")
+    day_word = "day" if days == "1" else "days"
+    uploaded_html = ""
+    if uploaded is not None:
+        uploaded_html = (f' The score actually uploaded to MyCourseVille is '
+                         f'<strong>{esc(str(uploaded))}/{AUTOMATED_POINTS}</strong>.')
+    return f"""<div class="reason reason-warn">
+      <p><strong>Submitted {esc(days)} {day_word} late.</strong> The score shown above is the technical
+      test result, before the late penalty.{uploaded_html}</p>
+      <p class="hint">Course policy: 10% off per day late, any partial day counting as a full day. This
+      deduction is for submission time only - it says nothing about the code, and the test results below
+      are unaffected by it.</p>
+    </div>"""
+
+
 def render_reason(row, cat):
     notes = NOTE_REDACTIONS.get(row["student_id"], row["notes"])
-    if cat == "compile":
+    return render_late_notice(row) + _render_category_reason(row, cat, notes)
+
+
+def _render_category_reason(row, cat, notes):
+    if cat in ("compile", "wrongwork"):
         err = extract_compile_error(notes)
+        missing, is_variant = analyze_compile_error(err)
+        raw = f"""<details class="rawerr"><summary>Show the full compiler output</summary>
+          <pre>{esc(err)}</pre></details>"""
+        if cat == "wrongwork":
+            names = ", ".join(f"<code>{esc(m)}(...)</code>" for m in missing[:3])
+            if is_variant:
+                what = (f"<p class='diag'>The official test for this question calls {names}, and the class in "
+                        f"this submission has no such method. Its other methods also have different parameter "
+                        f"and return types from the ones this question uses — so this is a <strong>different "
+                        f"version of the class</strong>, not an incomplete one.</p>"
+                        f"<p class='diag'><strong>What almost certainly happened:</strong> the exported JAR was "
+                        f"another lab question's project, not this one's. Nothing here could be compiled, so no "
+                        f"test could run and the score is 0.</p>"
+                        f"<p class='hint'>What to check: open your submitted JAR and confirm the "
+                        f"<code>.java</code> files inside are the ones you wrote for <em>this</em> question. If you "
+                        f"believe the right project was submitted, take this to your TA.</p>")
+            else:
+                what = (f"<p class='diag'>The official test calls {names}, but no such method exists in the class "
+                        f"submitted. The method this question asked you to write is <strong>not "
+                        f"there</strong>, so nothing could be compiled and no test could run.</p>"
+                        f"<p class='hint'>What to check: that the method name and its parameter list match the "
+                        f"assignment exactly, and that the file you exported is the edited one rather than the "
+                        f"untouched starter.</p>")
+            return f'<div class="reason reason-bad">{what}{raw}</div>'
+        first = (err or "").strip().splitlines()
+        first_line = first[0] if first else ""
         return f"""<div class="reason reason-bad">
-          <p>This is the exact error <code>javac</code> reported compiling this submission against the official tests:</p>
-          <pre>{esc(err)}</pre>
-          <p class="hint">Reading tip: <code>file.java:LINE: error: ...</code> names the file and line to look at first. Fix the first error and recompile - later ones are often just consequences of it.</p>
+          <p class="diag">This submission did not compile against the official test, so no test could run. The first
+          error <code>javac</code> reported was:</p>
+          <pre>{esc(first_line)}</pre>
+          <p class="hint">Fix the first error and recompile - the later ones are usually just consequences of it.
+          <code>file.java:LINE:</code> names the file and line to open.</p>
+          {raw}
         </div>"""
     if cat in ("structure", "nosource"):
         return f'<div class="reason reason-bad"><pre>{esc(notes)}</pre></div>'
@@ -143,9 +271,22 @@ def render_reason(row, cat):
         extra = ""
         if "more recent version of the Java Runtime" in row["failure_details"]:
             extra = '<p><strong>On top of that:</strong> the compiled classes were built with a newer Java version than the grading machine supports, so those classes could not even be loaded for testing.</p>'
+        # The hint has to match the reason for THIS cap, not assume the no-source one.
+        if pct == "0":
+            hint = ('This cap is a marking-guide rule that sets the score to 0 outright, so it '
+                    'replaces whatever the tests below did - any PASS listed there does not earn points here.')
+        elif "precompiled .class" in reason or "no .java source" in reason:
+            hint = ('Assignment policy: a JAR submitted without its <code>.java</code> source earns at most '
+                    'half credit, even when the compiled code is correct. Tick "include source" when you '
+                    'export the JAR, then open it with 7-Zip/WinRAR and confirm the .java files are in there.')
+        elif "deeper archive" in reason or "nested" in reason:
+            hint = ('Submit the project archive itself, not an archive wrapping another archive - the '
+                    'grader had to dig through an extra layer to find anything gradable.')
+        else:
+            hint = 'The cap above is applied on top of the test results listed below.'
         return f"""<div class="reason reason-warn">
           <p><strong>Capped at {pct}%.</strong> {esc(reason)}</p>{extra}
-          <p class="hint">Assignment policy: a JAR submitted without its <code>.java</code> source earns at most half credit, even if the compiled code is correct. Check "include source" when exporting your submission JAR.</p>
+          <p class="hint">{hint}</p>
         </div>"""
     if cat == "override":
         return f'<div class="reason reason-override"><pre>{esc(notes)}</pre></div>'
@@ -189,7 +330,12 @@ def render_graded_row(row):
     cat = category_of(row)
     sid = row["student_id"]
     score = row["score"]
-    max_score = row["max_score"] or str(AUTOMATED_POINTS)
+    # A submission rejected before the rubric ran (compile/structure error) carries
+    # max_score "0", which is a truthy STRING - so `or` never fired and the row read
+    # "0/0", which tells a student nothing about what the work was out of.
+    max_score = row["max_score"]
+    if max_score in ("", "0", "0.0"):
+        max_score = str(AUTOMATED_POINTS)
     summary_extra = ""
     if cat in ("compile", "structure", "nosource"):
         summary_extra = '<span class="note-flag">did not compile</span>'
@@ -201,6 +347,8 @@ def render_graded_row(row):
         summary_extra = '<span class="note-flag">TA reviewed</span>'
     elif cat == "penalty":
         summary_extra = '<span class="note-flag">rubric penalty</span>'
+    if row["student_id"] in LATE_PENALTIES:
+        summary_extra += '<span class="note-flag">late</span>'
     return f"""
     <details class="row" data-id="{esc(sid)}" data-cat="{cat}">
       <summary>
@@ -278,7 +426,9 @@ h1 { font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp
 .stat .n { font-family: "Fraunces", serif; font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; }
 .stat .l { font-size: .74rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .05em; margin-top: .15rem; }
 
-.catbar { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0 0 1.75rem; }
+.catbar { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0 0 .75rem; }
+.legend { margin: 0 0 1.75rem; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); gap: .3rem 1.4rem; font-size: .82rem; color: var(--ink-soft); line-height: 1.5; }
+.legend b { color: var(--ink); font-weight: 600; }
 .catbar .chip { cursor: pointer; user-select: none; }
 .catbar .chip.active { outline: 2px solid var(--stain); outline-offset: 1px; }
 
@@ -305,7 +455,15 @@ h1 { font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp
 .chip-pass { background: var(--pass-bg); color: var(--pass); }
 .chip-partial { background: var(--warn-bg); color: var(--warn); }
 .chip-capped, .chip-penalty { background: var(--warn-bg); color: var(--warn); }
-.chip-compile, .chip-structure, .chip-nosource, .chip-timeout { background: var(--fail-bg); color: var(--fail); }
+.chip-compile, .chip-structure, .chip-nosource, .chip-timeout, .chip-wrongwork { background: var(--fail-bg); color: var(--fail); }
+.rawerr { margin-top: .9rem; border-top: 1px solid var(--line); padding-top: .6rem; }
+.rawerr > summary { cursor: pointer; font-size: .82rem; color: var(--ink-soft); list-style: none; }
+.rawerr > summary::-webkit-details-marker { display: none; }
+.rawerr > summary::before { content: "b8 "; display: inline-block; transition: transform .15s; }
+.rawerr[open] > summary::before { transform: rotate(90deg); }
+.rawerr > summary:hover { color: var(--ink); }
+.diag { margin: 0 0 .5rem; }
+.diag code { font-size: .9em; }
 .chip-override { background: var(--override-bg); color: var(--ink); border: 1px solid var(--override-line); }
 .chip-missing { background: var(--missing-bg); color: var(--ink-soft); }
 .note-flag { font-size: .78rem; color: var(--ink-soft); }
@@ -403,13 +561,32 @@ def main():
     catbar_defs = [
         ("pass", "Full pass"), ("partial", "Partial"), ("capped", "Capped"),
         ("penalty", "Penalty"), ("timeout", "Timed out"),
-        ("compile", "Compile error"), ("structure", "Structure error"),
+        ("wrongwork", "Wrong submission"), ("compile", "Compile error"), ("structure", "Structure error"),
         ("nosource", "No source"), ("override", "TA review"), ("missing", "No submission"),
     ]
     catbar_html = '<div class="catbar">' + "".join(
         f'<span class="chip chip-{c} filterchip" data-cat="{c}">{label} ({cats.get(c, 0) if c != "missing" else len(NOT_SUBMITTED) + len(NO_VALID_Q2)})</span>'
         for c, label in catbar_defs if cats.get(c, 0) > 0 or c == "missing"
     ) + "</div>"
+
+    CATEGORY_MEANING = {
+        "pass": "Every scored test passed.",
+        "partial": "Some tests passed, some failed - the failing ones are listed with the exact mismatch.",
+        "capped": "A marking-guide rule limited the score, separately from how the tests went.",
+        "penalty": "A fixed deduction from a marking-guide rule was applied.",
+        "timeout": "The tests did not finish in the time limit and were stopped.",
+        "wrongwork": "The class submitted is missing the method this question asked for - usually the wrong project was exported.",
+        "compile": "The code did not compile against the official test, so no test could run.",
+        "structure": "A class the assignment required was missing, so nothing could be compiled.",
+        "nosource": "No usable .java source was found in the submission.",
+        "override": "A TA reviewed this one by hand; the note explains what was decided.",
+        "missing": "No gradable file was received for this assignment.",
+    }
+    shown = [c for c, _ in catbar_defs
+             if cats.get(c, 0) > 0 or (c == "missing" and (NOT_SUBMITTED or NO_VALID_Q2))]
+    legend_html = ('<ul class="legend">' + "".join(
+        f'<li><b>{label}</b> &mdash; {CATEGORY_MEANING[c]}</li>'
+        for c, label in catbar_defs if c in shown) + "</ul>")
 
     body_rows = [render_graded_row(r) for r in rows]
     for sid in NOT_SUBMITTED:
@@ -451,6 +628,7 @@ def main():
 
   {stats_html}
   {catbar_html}
+    {legend_html}
 
   <div class="searchbar">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>

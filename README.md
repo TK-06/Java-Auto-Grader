@@ -544,6 +544,13 @@ script — and, when `--deadline` is given, automatically applies the result to
 python check_lateness.py <zip1> [<zip2> ...] --deadline 2026-08-19T23:59:00
 ```
 
+`--deadline` takes a plain ISO 8601 datetime — the date, a literal `T`, then the time:
+`YYYY-MM-DDTHH:MM:SS`. Nothing goes between the date and the `T`. Slipping a colon in
+there (`2026-08-19:T23:59:00`) is the easy typo and fails immediately with
+`ERROR: could not parse --deadline ... Invalid isoformat string`, before any zip is read
+or any file written — so a mistyped deadline can never half-apply a penalty. A value with
+no UTC offset is interpreted as **Asia/Bangkok**; append an explicit offset to override.
+
 It reads the original MyCourseVille bulk-export zip(s) directly — never `submissions/`, since
 renaming each student's file down to `<studentID>.<ext>` during extraction already discarded
 the original filename the real timestamp was embedded in. For each student it picks their
@@ -584,6 +591,19 @@ renamed into `submissions/`, its real timestamp can no longer be recovered from 
 this repo.
 
 ## Reading the results
+
+> **`notes` is student-facing.** If you publish the class report artifact (`build_report.py`), the
+> text in a row's `notes` can be shown to that student verbatim. Write each note as an explanation
+> the student can act on, not as private shorthand. Prefix an annotation that leaves the score
+> alone with `TA NOTE:`; reserve `TA OVERRIDE:` for a genuine score override, because that exact
+> string is also what `check_lateness.py` matches to skip a row — using it as a generic prefix
+> silently exempts that student from their late penalty.
+>
+> That report also **diagnoses** a compile failure rather than pasting `javac` at the student: an
+> error naming a method the official test calls as `cannot find symbol` means the submitted class
+> isn't this question's, so those rows get their own **Wrong submission** category and a
+> plain-language explanation, with the raw compiler output collapsed. Missing *classes* are
+> separate and are caught earlier by `structure.json` as `STRUCTURE ERROR` (see §2c).
 
 `results/grades.csv` has one row per student, with these columns:
 
