@@ -68,6 +68,22 @@ MANUAL_COMPONENT_DESC = _config.get("manual_component_desc")
 NOT_SUBMITTED = _config.get("not_submitted", [])
 NO_VALID_Q2 = _config.get("no_valid_q2", [])
 NOTE_REDACTIONS = _config.get("note_redactions", {})
+# Optional {student_id: "TA NOTE: ..." or "TA OVERRIDE: ..."}, appended to that
+# student's notes before anything reads them (see main).
+#
+# grade.py REGENERATES results/grades.csv from scratch on every run, so a note
+# typed into a notes cell by hand survives only until the next re-grade - and
+# re-grading mid-week is routine: a corrected setup, a late resubmission, a tool
+# upgrade. In W5Q2 two real TA notes were lost exactly that way, and the loss is
+# silent: the row still looks complete, just without the human explanation that
+# was the whole point of it. Keeping the text HERE instead makes it durable
+# across re-grades, and re-running build_report.py puts it straight back.
+#
+# Merged before category_of() runs, so a "TA OVERRIDE:" written here routes the
+# row to the TA review category exactly as if it had been typed into the CSV.
+# A note_redactions entry for the same student still wins, since that replaces
+# the whole notes string on purpose.
+TA_NOTES = _config.get("ta_notes", {})
 # Optional {student_id: {"days": <int>, "uploaded_score": <str|num>}}. grades.csv is
 # deliberately the PRE-late-penalty technical record (check_lateness.py only ever
 # rewrites mcvScore.csv), so without this the report would show a late student the
@@ -219,9 +235,35 @@ def render_late_notice(row):
     </div>"""
 
 
+def render_ta_note(notes, cat):
+    """A `TA NOTE:` is written FOR the student, so it has to reach them whatever
+    the row's category is.
+
+    Only some categories render a reason block at all - `pass` and `partial`
+    render none - so a note left on one of those was silently dropped, which is
+    worse than not writing it: the TA believes the student was told. The failing
+    case was real (W6Q1: a submission that threw on an `instanceof` guard, where
+    the six identical `java.lang.Exception` lines explain nothing on their own).
+
+    Skipped for `override`, where the branch already leads with everything from
+    the TA marker onward, so rendering here would print it twice.
+    """
+    if cat == "override" or "TA NOTE:" not in notes:
+        return ""
+    said = notes[notes.find("TA NOTE:"):].split(":", 1)[-1].strip()
+    return f"""<div class="reason reason-override">
+      <p class="diag"><strong>A note from your TA on this submission:</strong></p>
+      <p class="diag">{esc(said)}</p>
+    </div>"""
+
+
 def render_reason(row, cat):
     notes = NOTE_REDACTIONS.get(row["student_id"], row["notes"])
-    return render_late_notice(row) + _render_category_reason(row, cat, notes)
+    return (
+        render_late_notice(row)
+        + _render_category_reason(row, cat, notes)
+        + render_ta_note(notes, cat)
+    )
 
 
 def _render_category_reason(row, cat, notes):
@@ -284,7 +326,46 @@ def _render_category_reason(row, cat, notes):
           {raw}
         </div>"""
     if cat in ("structure", "nosource"):
-        return f'<div class="reason reason-bad"><pre>{esc(notes)}</pre></div>'
+        # Rule 3 again: this used to dump the raw notes string, which makes a
+        # student read the grader's own trail ("stripped package declaration
+        # 'x' from Y.java ...") to find the one clause addressed to them - and
+        # the two structure failures need OPPOSITE advice (rule 1). A missing
+        # class means "you exported the wrong project"; bare source means "the
+        # code was fine, the packaging wasn't". One message for both is wrong
+        # for one of them.
+        segments = [s.strip() for s in notes.split("; ") if s.strip()]
+        violations = [s.split("STRUCTURE ERROR:", 1)[1].strip()
+                      for s in segments if s.startswith("STRUCTURE ERROR:")]
+        rest = [s for s in segments if not s.startswith("STRUCTURE ERROR:")]
+        missing = re.findall(r"missing required class (\w+)", notes)
+        if missing:
+            names = ", ".join(f"<code>{esc(m)}</code>" for m in missing)
+            plural = "classes" if len(missing) > 1 else "class"
+            what = (f"<p class='diag'>This question requires a {plural} the submitted file does not "
+                    f"contain: {names}. Without it there was nothing to compile against the official "
+                    f"test, so no test could run and the score is 0.</p>")
+            hint = ("<p class='hint'>What to check: that the JAR you exported is <em>this</em> question's "
+                    "project, and that the class name matches the assignment exactly &mdash; a class left "
+                    "in another project, or saved under a different name, counts as missing here.</p>")
+        elif any("bare .java source" in v for v in violations):
+            what = ("<p class='diag'>This submission arrived as loose <code>.java</code> file(s) rather than "
+                    "a packaged archive. Submitting a single <code>.zip</code> or <code>.jar</code> is part "
+                    "of the assignment's required format, so this was not graded &mdash; independently of "
+                    "whether the code itself would have compiled.</p>")
+            hint = ("<p class='hint'>What to do: export the project as a <code>.jar</code> with source "
+                    "included, or zip the project folder, and submit that one file.</p>")
+        elif cat == "nosource":
+            what = ("<p class='diag'>No usable <code>.java</code> source file was found inside this "
+                    "submission, so there was nothing to compile and no test could run.</p>")
+            hint = ("<p class='hint'>What to check: when exporting a JAR, tick the option that includes the "
+                    "source files &mdash; then open the exported file with 7-Zip/WinRAR and confirm the "
+                    "<code>.java</code> files are actually inside before submitting.</p>")
+        else:
+            what = f"<p class='diag'>{esc('; '.join(violations) or notes)}</p>"
+            hint = ""
+        extra = (f"""<details class="rawerr"><summary>Show the grader's full notes</summary>
+          <pre>{esc('; '.join(rest))}</pre></details>""") if rest else ""
+        return f'<div class="reason reason-bad">{what}{hint}{extra}</div>'
     if cat == "timeout":
         return f"""<div class="reason reason-bad">
           <p>The test run for this submission <strong>did not finish within the time limit</strong> and was stopped, so it scored 0. This almost always means a loop that never ends &mdash; e.g. walking the list with an iterator without ever advancing it, or a remove/insert that loses the rest of the chain.</p>
@@ -315,7 +396,32 @@ def _render_category_reason(row, cat, notes):
           <p class="hint">{hint}</p>
         </div>"""
     if cat == "override":
-        return f'<div class="reason reason-override"><pre>{esc(notes)}</pre></div>'
+        # An override row's notes carry the WHOLE grading trail, and the TA's
+        # decision is only the last clause of it. Dumping all of it makes the
+        # student read package-strip chatter and MANUAL REVIEW text written for
+        # a TA - e.g. a forbidden-method flag whose wording deliberately warns
+        # the TA that the scan over-reaches - before reaching the one sentence
+        # actually addressed to them. Lead with the decision; collapse the rest,
+        # the same way the javac wall is handled above.
+        # Split on the marker's POSITION, not on "; ": a TA writing prose is
+        # free to use a semicolon, and splitting on one truncated the decision
+        # mid-sentence, hiding the rest of what they wrote inside the collapsed
+        # block. Everything from the marker onward is theirs, verbatim.
+        idx = notes.find("TA OVERRIDE")
+        if idx == -1:
+            return f'<div class="reason reason-override"><pre>{esc(notes)}</pre></div>'
+        trail = notes[:idx].strip().rstrip(";").strip()
+        said = notes[idx:].split(":", 1)[-1].strip()
+        extra = (f"""<details class="rawerr"><summary>Show the grader's full notes</summary>
+          <pre>{esc(trail)}</pre></details>""") if trail else ""
+        return f"""<div class="reason reason-override">
+          <p class="diag"><strong>A TA reviewed this submission by hand and set the score themselves</strong>,
+          rather than leaving it to the automated result. Their reason:</p>
+          <p class="diag">{esc(said)}</p>
+          <p class="hint">This is the score that counts for this question. If anything here looks wrong,
+          raise it with your TA and point them at this note.</p>
+          {extra}
+        </div>"""
     if cat == "penalty":
         return f"""<div class="reason reason-warn">
           <p><strong>A rubric penalty was applied</strong> &mdash; a marking-guide rule that deducts a fixed number of points regardless of how the other tests went. The exact reason:</p>
@@ -564,6 +670,13 @@ apply();
 
 def main():
     rows = list(csv.DictReader(CSV_PATH.open(encoding="utf-8")))
+    # Before ANY read of notes - category_of() below included - so a TA_NOTES
+    # entry behaves identically to one typed into grades.csv. Idempotent: a note
+    # already present (because it WAS typed in) is not appended twice.
+    for r in rows:
+        extra = TA_NOTES.get(r["student_id"], "").strip()
+        if extra and extra not in r["notes"]:
+            r["notes"] = (r["notes"].rstrip("; ").rstrip() + "; " + extra).lstrip("; ")
     scores = [float(r["score"]) for r in rows]
     compiled_yes = sum(1 for r in rows if r["compiled"] == "yes")
     full_pass = sum(1 for r in rows if category_of(r) == "pass")
