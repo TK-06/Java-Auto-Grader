@@ -51,6 +51,10 @@ is what late_penalties in report_config.json exists to explain.
 import csv, html, json, re, statistics
 from pathlib import Path
 
+# Imported, not re-spelled: grade.py owns this marker and writes it into
+# grades.csv, so a copy here would be free to drift out of sync silently.
+from grade import WRONG_SUBMISSION_PREFIX
+
 CSV_PATH = Path(__file__).parent / "results" / "grades.csv"
 OUT_PATH = Path(__file__).parent / "results" / "report.html"
 CONFIG_PATH = Path(__file__).parent / "tests" / "report_config.json"
@@ -228,6 +232,11 @@ def _render_category_reason(row, cat, notes):
           <pre>{esc(err)}</pre></details>"""
         if cat == "wrongwork":
             names = ", ".join(f"<code>{esc(m)}(...)</code>" for m in missing[:3])
+            # Diagnosis and hint are built separately so the bytecode evidence
+            # below can slot BETWEEN them: a hint that follows "here is what is
+            # actually in your archive" has to be a different hint from the one
+            # that follows "we cannot tell what is in your archive" (rule 1 in
+            # this file's header - the hint comes from the actual reason).
             if is_variant:
                 what = (f"<p class='diag'>The official test for this question calls {names}, and the class in "
                         f"this submission has no such method. Its other methods also have different parameter "
@@ -235,18 +244,35 @@ def _render_category_reason(row, cat, notes):
                         f"version of the class</strong>, not an incomplete one.</p>"
                         f"<p class='diag'><strong>What almost certainly happened:</strong> the exported JAR was "
                         f"another lab question's project, not this one's. Nothing here could be compiled, so no "
-                        f"test could run and the score is 0.</p>"
-                        f"<p class='hint'>What to check: open your submitted JAR and confirm the "
+                        f"test could run and the score is 0.</p>")
+                hint = (f"<p class='hint'>What to check: open your submitted JAR and confirm the "
                         f"<code>.java</code> files inside are the ones you wrote for <em>this</em> question. If you "
                         f"believe the right project was submitted, take this to your TA.</p>")
             else:
                 what = (f"<p class='diag'>The official test calls {names}, but no such method exists in the class "
                         f"submitted. The method this question asked you to write is <strong>not "
-                        f"there</strong>, so nothing could be compiled and no test could run.</p>"
-                        f"<p class='hint'>What to check: that the method name and its parameter list match the "
+                        f"there</strong>, so nothing could be compiled and no test could run.</p>")
+                hint = (f"<p class='hint'>What to check: that the method name and its parameter list match the "
                         f"assignment exactly, and that the file you exported is the edited one rather than the "
                         f"untouched starter.</p>")
-            return f'<div class="reason reason-bad">{what}{raw}</div>'
+            # grade.py PROVED this one from the archive's own bytecode (see
+            # detect_wrong_submission), so it is stated, not hedged - and it
+            # answers the question the generic hints above can only ask, which
+            # is why it replaces rather than follows them. The difference it
+            # carries is "your work exists, the export was wrong" versus "there
+            # is nothing here to recover", and no amount of javac output shows
+            # a student which of those they are looking at.
+            if WRONG_SUBMISSION_PREFIX in notes:
+                what += ("<p class='diag'><strong>Your submitted file does contain a compiled build of "
+                         "this question's work.</strong> Alongside the <code>.java</code> files, the "
+                         "archive carries a compiled <code>.class</code> that <em>does</em> define the "
+                         "method named above. So the work itself appears to have been done \u2014 what went "
+                         "wrong is the export: the source folder packaged with it belongs to a different "
+                         "question.</p>")
+                hint = ("<p class='hint'>Take this to your TA and point them at this paragraph. The score "
+                        "follows the <code>.java</code> you actually submitted, so it does not change on "
+                        "its own \u2014 but what is in the archive is worth showing them.</p>")
+            return f'<div class="reason reason-bad">{what}{hint}{raw}</div>'
         first = (err or "").strip().splitlines()
         first_line = first[0] if first else ""
         return f"""<div class="reason reason-bad">
