@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from grade import (
+    CONSOLE_REASON_MAX_CHARS,
     RMTREE_RETRY_ATTEMPTS,
     WRONG_SUBMISSION_PREFIX,
     CompileResult,
@@ -18,9 +19,11 @@ from grade import (
     check_structure_baseline,
     check_stub_only_submission,
     class_file_methods,
+    clip_console_reason,
     collect_required_class_names,
     collect_test_results,
     compile_submission,
+    console_failure_reason,
     console_line_suffix,
     detect_wrong_submission,
     compile_submission_with_fallback,
@@ -2555,6 +2558,118 @@ class TestGradeStudentWrongSubmission(unittest.TestCase):
 
             self.assertEqual(row["compiled"], "no")
             self.assertNotIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+
+
+
+
+class TestClipConsoleReason(unittest.TestCase):
+    def test_collapses_whitespace(self):
+        self.assertEqual(clip_console_reason("  a   b \n c "), "a b c")
+
+    def test_short_text_is_untouched(self):
+        self.assertEqual(clip_console_reason("';' expected"), "';' expected")
+
+    def test_long_text_is_clipped_to_the_limit(self):
+        clipped = clip_console_reason("x" * 300)
+
+        self.assertEqual(len(clipped), CONSOLE_REASON_MAX_CHARS)
+        self.assertTrue(clipped.endswith("..."))
+
+    def test_clipping_marker_stays_ascii(self):
+        # This prints to a Windows console routinely not on a UTF-8 code page,
+        # where a non-ASCII byte renders as a replacement glyph mid-reason.
+        clipped = clip_console_reason("y" * 300)
+
+        clipped.encode("ascii")  # raises if a non-ASCII ellipsis crept in
+
+    def test_empty_input_is_empty_output(self):
+        self.assertEqual(clip_console_reason(""), "")
+
+
+class TestConsoleFailureReason(unittest.TestCase):
+    def _row(self, notes: str) -> dict:
+        return {"notes": notes, "score": 0}
+
+    def test_names_the_missing_class_for_a_structure_error(self):
+        row = self._row("STRUCTURE ERROR: missing required class Ticket (expected Ticket.java)")
+
+        self.assertEqual(
+            console_failure_reason(row),
+            "missing required class Ticket (expected Ticket.java)",
+        )
+
+    def test_counts_the_remaining_structure_violations(self):
+        row = self._row(
+            "STRUCTURE ERROR: missing required class Gadget (expected Gadget.java); "
+            "STRUCTURE ERROR: missing required class Sprocket (expected Sprocket.java)"
+        )
+
+        reason = console_failure_reason(row)
+
+        self.assertIn("Gadget", reason)
+        self.assertTrue(reason.endswith("(+1 more)"))
+
+    def test_reports_javacs_first_message_for_a_plain_compile_error(self):
+        row = self._row(
+            "COMPILE ERROR: Widget.java:1: error: ';' expected | "
+            "public class Widget { | ^ | 1 error"
+        )
+
+        self.assertEqual(console_failure_reason(row), "';' expected")
+
+    def test_wrong_submission_outranks_whatever_javac_reported_first(self):
+        # The javac line is only how it was noticed; "the work is in the
+        # archive" is the fact that decides what the TA does next.
+        row = self._row(
+            f"{WRONG_SUBMISSION_PREFIX} the official test calls CDLinkedList.swapRange, "
+            f"which the submitted .java does not declare, but this submission also ships "
+            f"a precompiled CDLinkedList.class that DOES declare it; "
+            f"COMPILE ERROR: CDLinkedListTest.java:46: error: incompatible types | ^"
+        )
+
+        self.assertEqual(
+            console_failure_reason(row),
+            "CDLinkedList.swapRange missing from .java, present in bundled .class",
+        )
+
+    def test_falls_back_to_the_last_note_when_nothing_compiled_at_all(self):
+        row = self._row("archive extracted OK; no .java source files found")
+
+        self.assertEqual(console_failure_reason(row), "no .java source files found")
+
+    def test_returns_empty_rather_than_a_dangling_separator(self):
+        self.assertEqual(console_failure_reason(self._row("")), "")
+
+
+class TestConsoleReasonMatchesTheNoteItParses(unittest.TestCase):
+    """console_failure_reason reads WRONG_SUBMISSION_CALL_RE against prose that
+    detect_wrong_submission writes. Both live in grade.py, so nothing stops a
+    reword of one from silently degrading the other - this pins them together
+    by generating the note for real and parsing that, never a handwritten copy."""
+
+    def test_a_real_generated_note_still_yields_the_class_and_method(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src = tmp_path / "Widget.java"
+            src.write_text("public class Widget {\n  public void beta() {}\n}\n", encoding="utf-8")
+            out = tmp_path / "archive" / "bin"
+            out.mkdir(parents=True)
+            subprocess.run(["javac", "-d", str(out), str(src)], check=True, capture_output=True)
+            compile_error = (
+                "WidgetTest.java:3: error: cannot find symbol | "
+                "  symbol:   method beta() | "
+                "  location: class Widget"
+            )
+
+            notes = detect_wrong_submission(compile_error, tmp_path / "archive", {"Widget"})
+            self.assertEqual(len(notes), 1)
+
+            row = {"notes": notes[0] + f"; COMPILE ERROR: {compile_error}", "score": 0}
+
+            self.assertEqual(
+                console_failure_reason(row),
+                "Widget.beta missing from .java, present in bundled .class",
+            )
 
 
 

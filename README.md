@@ -526,6 +526,26 @@ Progress prints as it goes; when it's done, check `results/grades.csv` (detailed
 a `notes` column explaining any 0 score) and `results/mcvScore.csv` (just bare IDs and
 scores, ready for MyCourseVille).
 
+Every 0 prints its own reason on the progress line, so a run can be read live without
+opening the CSV — the four failures mean very different things:
+
+```
+[1/6] 11110001_...: STRUCTURE ERROR (score 0) - missing required class Sprocket (expected Sprocket.java)
+[2/6] 11110002_...: STRUCTURE ERROR (score 0) - missing required class Gadget (expected Gadget.java) (+1 more)
+[3/6] 11110003_...: COMPILE ERROR (score 0) - ';' expected
+[4/6] 11110004_...: WRONG SUBMISSION (score 0) - CDLinkedList.swapRange missing from .java, present in bundled .class
+[5/6] 11110005_...: NO SOURCE FILES (score 0) - no .java source files found
+[6/6] 11110006_...: compiled, 1/1 tests passed (score 1/1)
+```
+
+`STRUCTURE ERROR` is a packaging problem and names the class that's missing (with a
+`(+N more)` count when several are). `COMPILE ERROR` is a bug in the student's own code
+and shows `javac`'s first message. `WRONG SUBMISSION` replaces `COMPILE ERROR` on a row
+where the archive's own bytecode proves the work exists — see the wrong-submission bullet
+under **Grading policy** above — and the run's closing summary repeats how many of them
+there were, since on a full class the individual lines have long since scrolled away.
+The reason is a clipped one-liner; `grades.csv`'s `notes` always keeps it in full.
+
 ### Useful flags
 
 ```
