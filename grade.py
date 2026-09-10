@@ -329,6 +329,94 @@ def collect_referenced_packages(test_files: list[Path]) -> set[str]:
     return referenced
 
 
+def package_of(text: str) -> str | None:
+    """The package a student file declares, or None for the unnamed package."""
+    match = PACKAGE_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _resolves_to_kept(declared: str, keep_packages: set[str]) -> bool:
+    """Mirrors strip_package_declaration's matching: a declared package counts
+    as kept when it IS a required package, or sits under an extra prefix above
+    one (the `Q1_toStudent.application` case), since that gets rewritten down
+    to the required name rather than stripped."""
+    return declared in keep_packages or any(
+        declared.endswith("." + kp) for kp in keep_packages
+    )
+
+
+def expand_keep_packages(
+    student_texts: list[str],
+    referenced_packages: set[str],
+    unnamed_only_classes: set[str] = frozenset(),
+) -> set[str]:
+    """Grow the keep-set (see strip_package_declaration) along the SUBMISSION's
+    own package graph instead of only what the official tests name.
+
+    collect_referenced_packages sees the tests and nothing else, so a package
+    the tests never mention is flattened even when a package they DO require
+    depends on it. That is not a niche case. W6Q1's official test imports
+    `stack` and `myInterface`; `stack.StackLinkedList` imports
+    `lnkedList.CDLinkedList`; nothing names `lnkedList`. So `lnkedList` was
+    stripped to the unnamed package while `stack` stayed named, and Java cannot
+    reference the unnamed package from a named one - every submission in the
+    class failed to compile, the professor's own solution included.
+
+    A package is kept once some file whose OWN package is kept imports from it,
+    repeated to a fixpoint so a chain (kept -> a -> b) is covered. Only packages
+    this submission actually declares can be added: an import of something
+    genuinely absent is a real compile error, not a packaging artifact.
+
+    Never adds a package declaring a class the tests can only see unqualified in
+    the unnamed package (infer_unnamed_package_classes) - keeping that one named
+    would break the very test it exists to serve.
+
+    When the official tests declare and import no package at all - every week
+    whose tests assume the unnamed package - nothing seeds the walk and this
+    returns referenced_packages unchanged, so those weeks strip exactly as
+    before. Only a week with PACKAGED tests can see any difference, and only
+    from "did not compile" to "compiled".
+    """
+    declared: dict[str, list[str]] = {}
+    for text in student_texts:
+        pkg = package_of(text)
+        if pkg:
+            declared.setdefault(pkg, []).append(text)
+    if not declared:
+        return set(referenced_packages)
+
+    blocked = set()
+    for pkg, texts in declared.items():
+        for text in texts:
+            match = PUBLIC_TYPE_RE.search(text)
+            if match and match.group(1) in unnamed_only_classes:
+                blocked.add(pkg)
+
+    keep = set(referenced_packages)
+    changed = True
+    while changed:
+        changed = False
+        for pkg, texts in declared.items():
+            if not _resolves_to_kept(pkg, keep):
+                continue
+            for text in texts:
+                for m in IMPORT_RE.finditer(text):
+                    dep = m.group(1)
+                    # A package that already resolves to a required one (the
+                    # `Q1_toStudent.logic` -> `logic` prefix case) must be left
+                    # for strip_package_declaration to REWRITE. Pinning it here
+                    # would keep the prefixed name and strand the official
+                    # test's own `import logic.Station;`.
+                    if (
+                        dep in declared
+                        and not _resolves_to_kept(dep, keep)
+                        and dep not in blocked
+                    ):
+                        keep.add(dep)
+                        changed = True
+    return keep
+
+
 def strip_imports_of_packages(text: str, package_names: set[str]) -> str:
     """Once strip_package_declaration has flattened a submission's classes
     into the unnamed package, any `import <pkg>.Foo;` elsewhere in that same
@@ -1078,7 +1166,12 @@ def prepare_build_dir(
     build_dir.mkdir(parents=True)
 
     test_names = {f.name for f in test_files}
-    referenced_packages = collect_referenced_packages(test_files)
+    student_texts = [f.read_text(encoding="utf-8", errors="ignore") for f in student_files]
+    referenced_packages = expand_keep_packages(
+        student_texts,
+        collect_referenced_packages(test_files),
+        infer_unnamed_package_classes(test_files),
+    )
     seen_names: set[str] = set()
     kept: list[tuple[str, str]] = []  # (dest_name, text)
     stripped_package_names: set[str] = set()

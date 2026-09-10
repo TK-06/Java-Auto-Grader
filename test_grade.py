@@ -242,6 +242,51 @@ class TestPrepareBuildDirStripsPackage(unittest.TestCase):
             self.assertNotIn("import main.java.Bot;", copied_text)
 
 
+class TestKeepsPackageADependencyNeeds(unittest.TestCase):
+    """A package the official tests never name, but that a package they DO
+    require imports from, must keep its `package` declaration.
+
+    Flattening it puts it in the unnamed package while its dependent stays
+    named, and Java cannot reference the unnamed package from a named one - so
+    EVERY submission fails to compile. This is W6Q1: the official test imports
+    `stack` and `myInterface` but never `lnkedList`, which
+    `stack.StackLinkedList` depends on. See expand_keep_packages.
+    """
+
+    def test_dependency_package_survives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+
+            test_file = root / "tests" / "StackTest.java"
+            test_file.write_text(
+                "package test;\n\nimport stack.StackArray;\n"
+                "public class StackTest { StackArray s = new StackArray(); }\n",
+                encoding="utf-8",
+            )
+            dependent = root / "src" / "StackArray.java"
+            dependent.write_text(
+                "package stack;\n\nimport lnkedList.CDLinkedList;\n"
+                "public class StackArray { private CDLinkedList l; }\n",
+                encoding="utf-8",
+            )
+            dependency = root / "src" / "CDLinkedList.java"
+            dependency.write_text(
+                "package lnkedList;\n\npublic class CDLinkedList {}\n", encoding="utf-8"
+            )
+
+            build_dir, notes = prepare_build_dir(
+                "k", [dependent, dependency], [test_file], root / "build"
+            )
+
+            dep_text = (build_dir / "CDLinkedList.java").read_text(encoding="utf-8")
+            user_text = (build_dir / "StackArray.java").read_text(encoding="utf-8")
+            self.assertIn("package lnkedList;", dep_text, notes)
+            self.assertIn("import lnkedList.CDLinkedList;", user_text, notes)
+            self.assertFalse([n for n in notes if "stripped package" in n], notes)
+
+
 class TestStripPackageDeclaration(unittest.TestCase):
     def test_strips_leading_package_declaration(self):
         text = "package main.java;\n\npublic class Bot {\n}\n"
@@ -379,8 +424,12 @@ class TestCompileSubmissionWithFallback(unittest.TestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(mock_compile.call_count, 2)
+            # Wording follows find_unreachable_student_files, which generalised
+            # this note from "leftover test file(s)" to any student file the
+            # official tests cannot reach. With official_names empty, nothing is
+            # reachable, so CPTSMachine.java is named alongside the test file.
             self.assertTrue(
-                any("excluded student's leftover test file(s) TestCPTSMachine.java" in n for n in notes), notes
+                any("excluded student file(s)" in n and "TestCPTSMachine.java" in n for n in notes), notes
             )
             self.assertTrue(any("illegal start" in n for n in notes), notes)
             self.assertFalse((build_dir / "TestCPTSMachine.java").exists())
@@ -408,15 +457,26 @@ class TestCompileSubmissionWithFallback(unittest.TestCase):
             self.assertEqual(notes, [])
             self.assertTrue((build_dir / "TestCPTSMachine.java").exists())
 
-    def test_no_retry_when_nothing_looks_like_a_leftover_test_file(self):
+    def test_no_retry_when_nothing_is_excludable(self):
         with tempfile.TemporaryDirectory() as tmp:
             build_dir = Path(tmp)
             (build_dir / "CPTSMachine.java").write_text("public class CPTSMachine { broken!! }\n", encoding="utf-8")
+            # An official test that REACHES CPTSMachine is what makes it
+            # unexcludable. Without one, find_unreachable_student_files roots its
+            # closure in nothing, every student file is unreachable, and the
+            # retry correctly fires - so an empty official_names cannot express
+            # "nothing to exclude" any more, which is what this test is about.
+            (build_dir / "TestCPTSMachine2.java").write_text(
+                "import org.junit.jupiter.api.Test;\n"
+                "public class TestCPTSMachine2 { @Test void t() { new CPTSMachine(); } }\n",
+                encoding="utf-8",
+            )
 
             with mock.patch("grade.compile_submission") as mock_compile:
                 mock_compile.return_value = CompileResult(False, build_dir / "classes", "some error")
                 result, notes = compile_submission_with_fallback(
-                    build_dir, Path("junit.jar"), 30, official_names=set()
+                    build_dir, Path("junit.jar"), 30,
+                    official_names={"TestCPTSMachine2.java"},
                 )
 
             self.assertFalse(result.success)
@@ -2286,7 +2346,10 @@ class TestGradeStudentScoreCap(unittest.TestCase):
 
             self.assertEqual(row["compiled"], "no")
             self.assertIn("STRUCTURE ERROR: missing required class Item", row["notes"])
-            self.assertIn("still didn't compile", row["notes"])
+            # Wording follows compile_with_class_fallback's note, which now says
+            # which attempts were made (import added, then compiled into the
+            # class's own package) before concluding it is unusable.
+            self.assertIn("can't be used as a substitute", row["notes"])
 
 
 class TestGradeStudentNotAnArchive(unittest.TestCase):
