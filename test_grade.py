@@ -9,6 +9,7 @@ from unittest import mock
 
 from grade import (
     RMTREE_RETRY_ATTEMPTS,
+    WRONG_SUBMISSION_PREFIX,
     CompileResult,
     ProcResult,
     add_imports,
@@ -16,10 +17,12 @@ from grade import (
     check_output_writable,
     check_structure_baseline,
     check_stub_only_submission,
+    class_file_methods,
     collect_required_class_names,
     collect_test_results,
     compile_submission,
     console_line_suffix,
+    detect_wrong_submission,
     compile_submission_with_fallback,
     compile_with_class_fallback,
     discover_submissions,
@@ -2322,6 +2325,237 @@ class TestGradeStudentNotAnArchive(unittest.TestCase):
             self.assertEqual(row["score"], 0)
             self.assertIn("STRUCTURE ERROR", row["notes"])
             self.assertIn("bare .java source", row["notes"])
+
+
+
+class TestClassFileMethods(unittest.TestCase):
+    """The parser exists because javap REFUSES a class file newer than the JDK
+    running it, which is precisely the case it has to survive - so these check
+    it against real javac output rather than a hand-built fixture."""
+
+    def _compile(self, tmp_path: Path, source: str, name: str) -> Path:
+        src = tmp_path / f"{name}.java"
+        src.write_text(source, encoding="utf-8")
+        out = tmp_path / "out"
+        out.mkdir(exist_ok=True)
+        subprocess.run(["javac", "-d", str(out), str(src)], check=True, capture_output=True)
+        return out / f"{name}.class"
+
+    def test_reads_names_and_descriptors_of_a_real_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            class_file = self._compile(
+                Path(tmp),
+                "public class Widget {\n"
+                "  public void alpha() {}\n"
+                "  public int beta(String s, long n) { return 0; }\n"
+                "}\n",
+                "Widget",
+            )
+
+            major, methods = class_file_methods(class_file)
+
+            self.assertGreaterEqual(major, 49)
+            self.assertEqual(methods["alpha"], ["()V"])
+            self.assertEqual(methods["beta"], ["(Ljava/lang/String;J)I"])
+
+    def test_walks_past_long_and_double_constants(self):
+        # Long/Double each take TWO constant-pool slots (JVMS 4.4.5); getting
+        # that wrong desynchronises the walk and garbles every name after them.
+        with tempfile.TemporaryDirectory() as tmp:
+            class_file = self._compile(
+                Path(tmp),
+                "public class Consts {\n"
+                "  static final long L = 1234567890123L;\n"
+                "  static final double D = 2.718281828459045;\n"
+                "  public void afterTheConstants() {}\n"
+                "}\n",
+                "Consts",
+            )
+
+            _major, methods = class_file_methods(class_file)
+
+            self.assertIn("afterTheConstants", methods)
+
+    def test_unreadable_input_is_reported_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            junk = tmp_path / "Junk.class"
+            junk.write_bytes(b"not a class file")
+            empty = tmp_path / "Empty.class"
+            empty.write_bytes(b"")
+
+            self.assertEqual(class_file_methods(junk), (None, {}))
+            self.assertEqual(class_file_methods(empty), (None, {}))
+            self.assertEqual(class_file_methods(tmp_path / "Absent.class"), (None, {}))
+
+
+class TestDetectWrongSubmission(unittest.TestCase):
+    # javac output as grade.py stores it: truncate() has already flattened the
+    # real line breaks to " | ".
+    COMPILE_ERROR = (
+        "WidgetTest.java:3: error: cannot find symbol | "
+        "    new Widget().beta(); | "
+        "                ^ | "
+        "  symbol:   method beta() | "
+        "  location: class Widget"
+    )
+
+    def _archive_with(self, tmp_path: Path, source: str) -> Path:
+        src = tmp_path / "Widget.java"
+        src.write_text(source, encoding="utf-8")
+        out = tmp_path / "archive" / "bin"
+        out.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["javac", "-d", str(out), str(src)], check=True, capture_output=True)
+        return tmp_path / "archive"
+
+    def test_flags_a_class_whose_bytecode_has_the_method_the_source_lacks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._archive_with(
+                Path(tmp), "public class Widget {\n  public void beta() {}\n}\n"
+            )
+
+            notes = detect_wrong_submission(self.COMPILE_ERROR, root, {"Widget"})
+
+            self.assertEqual(len(notes), 1)
+            self.assertTrue(notes[0].startswith(WRONG_SUBMISSION_PREFIX))
+            self.assertIn("Widget.beta", notes[0])
+            self.assertIn("beta()V", notes[0])
+
+    def test_note_carries_no_bare_separator_that_would_split_it_in_two(self):
+        # notes are joined with "; ", so a note containing that sequence reads
+        # back as two unrelated notes. JVM descriptors legitimately contain ";".
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._archive_with(
+                Path(tmp), "public class Widget {\n  public void beta(String s) {}\n}\n"
+            )
+
+            notes = detect_wrong_submission(
+                self.COMPILE_ERROR.replace("beta()", "beta(String)"), root, {"Widget"}
+            )
+
+            self.assertEqual(len(notes), 1)
+            self.assertNotIn("; ", notes[0])
+
+    def test_silent_when_the_bytecode_lacks_the_method_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._archive_with(
+                Path(tmp), "public class Widget {\n  public void alpha() {}\n}\n"
+            )
+
+            self.assertEqual(detect_wrong_submission(self.COMPILE_ERROR, root, {"Widget"}), [])
+
+    def test_silent_when_no_class_file_exists_at_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "archive"
+            root.mkdir()
+
+            self.assertEqual(detect_wrong_submission(self.COMPILE_ERROR, root, {"Widget"}), [])
+
+    def test_silent_for_a_class_this_week_does_not_require(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._archive_with(
+                Path(tmp), "public class Widget {\n  public void beta() {}\n}\n"
+            )
+
+            self.assertEqual(detect_wrong_submission(self.COMPILE_ERROR, root, {"Gadget"}), [])
+
+    def test_silent_without_a_search_root(self):
+        self.assertEqual(detect_wrong_submission(self.COMPILE_ERROR, None, {"Widget"}), [])
+
+    def test_silent_on_a_compile_error_naming_no_missing_method(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._archive_with(
+                Path(tmp), "public class Widget {\n  public void beta() {}\n}\n"
+            )
+            err = "Widget.java:1: error: reached end of file while parsing | ^"
+
+            self.assertEqual(detect_wrong_submission(err, root, {"Widget"}), [])
+
+
+class TestGradeStudentWrongSubmission(unittest.TestCase):
+    def _junit_jar(self) -> Path:
+        return find_junit_jar(Path(__file__).resolve().parent / "lib")
+
+    def _official_test(self, tmp_path: Path) -> Path:
+        test_file = tmp_path / "WidgetTest.java"
+        test_file.write_text(
+            "public class WidgetTest {\n  void t() { new Widget().beta(); }\n}\n",
+            encoding="utf-8",
+        )
+        return test_file
+
+    def test_note_lands_ahead_of_the_compile_error_in_the_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            # What the student actually exported: source WITHOUT beta()...
+            src_dir = tmp_path / "archive" / "src"
+            src_dir.mkdir(parents=True)
+            student = src_dir / "Widget.java"
+            student.write_text(
+                "public class Widget {\n  public void alpha() {}\n}\n", encoding="utf-8"
+            )
+            # ...beside a build of a DIFFERENT project, where beta() does exist.
+            good_src = tmp_path / "good" / "Widget.java"
+            good_src.parent.mkdir()
+            good_src.write_text(
+                "public class Widget {\n  public void alpha() {}\n  public void beta() {}\n}\n",
+                encoding="utf-8",
+            )
+            bin_dir = tmp_path / "archive" / "bin"
+            bin_dir.mkdir(parents=True)
+            subprocess.run(
+                ["javac", "-d", str(bin_dir), str(good_src)], check=True, capture_output=True
+            )
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "55556666", "1", [student], [], [self._official_test(tmp_path)], [],
+                self._junit_jar(), build_root, 30, False, None, None, failed_build_root,
+                class_search_root=tmp_path / "archive",
+                class_fallback_candidates={"Widget"},
+            )
+
+            self.assertEqual(row["compiled"], "no")
+            self.assertEqual(row["score"], 0)  # detection only - never moves the score
+            self.assertIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+            self.assertLess(
+                row["notes"].index(WRONG_SUBMISSION_PREFIX),
+                row["notes"].index("COMPILE ERROR:"),
+            )
+
+    def test_no_note_when_the_method_is_genuinely_unwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_dir = tmp_path / "archive" / "src"
+            src_dir.mkdir(parents=True)
+            student = src_dir / "Widget.java"
+            student.write_text(
+                "public class Widget {\n  public void alpha() {}\n}\n", encoding="utf-8"
+            )
+            # The student's OWN build, matching their own source - no beta() here.
+            bin_dir = tmp_path / "archive" / "bin"
+            bin_dir.mkdir(parents=True)
+            subprocess.run(
+                ["javac", "-d", str(bin_dir), str(student)], check=True, capture_output=True
+            )
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "77778888", "1", [student], [], [self._official_test(tmp_path)], [],
+                self._junit_jar(), build_root, 30, False, None, None, failed_build_root,
+                class_search_root=tmp_path / "archive",
+                class_fallback_candidates={"Widget"},
+            )
+
+            self.assertEqual(row["compiled"], "no")
+            self.assertNotIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+
 
 
 class TestCheckOutputWritable(unittest.TestCase):

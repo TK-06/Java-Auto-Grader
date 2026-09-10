@@ -77,6 +77,20 @@ What every submission can expect, regardless of week:
 - **Doesn't compile** (with the official tests dropped in, replacing any copy the student
   bundled) → **0**, with the exact `javac` error saved in `notes` so the reason is always
   visible, not just the score.
+- **Doesn't compile, but the archive contains a build that would have** → still **0**, with
+  a `WRONG SUBMISSION LIKELY:` note added to `notes` ahead of the `javac` output. The
+  official tests are fixed and known-good, so `javac` reporting `cannot find symbol: method
+  swapRange` on a required class means the `.java` submitted is not this question's. When
+  the *same archive* also ships a precompiled `CDLinkedList.class` that **does** declare
+  that method, the student didn't skip the work — they exported the wrong `src/` folder
+  beside a correct build (an Eclipse export whose source tree and output tree came from
+  different projects). The note names the method, its bytecode descriptor and the Java
+  version it was compiled to, so the claim is checkable without unzipping anything.
+  Detection and reporting only: **the score is unchanged**, still following the `.java`, per
+  the `.class`-fallback rule above — a `.class` is graded in place of source only when there
+  is no source at all. `build_report.py` routes these rows to its **Wrong submission**
+  category and tells the student their compiled work is in the archive and to bring it to a
+  TA. Nothing to configure; it fires whenever the evidence is there.
 - **Target Java 17 language level, even if compiled with a newer JDK.** Grading runs on
   **JDK 25** — a student's `.class` file compiled to a *newer* bytecode version than JDK 25
   supports can't be loaded at all (`UnsupportedClassVersionError` on every test, or a `bad

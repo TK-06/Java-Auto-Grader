@@ -67,6 +67,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -108,6 +109,30 @@ METHOD_NAME_RE = re.compile(r"^\w+")
 PACKAGE_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
 STUDENT_ID_RE = re.compile(r"^\d+")
 JUNIT_IMPORT_RE = re.compile(r"^\s*import\s+org\.junit\b", re.MULTILINE)
+
+# javac naming a method that a FIXED official test calls and the submitted class
+# does not have. Same shape as build_report.py's own copy, deliberately: that one
+# reads the flattened note back out of grades.csv, this one reads javac's output
+# on the way in, and the two must agree on what counts as a missing method.
+MISSING_METHOD_RE = re.compile(
+    r"symbol:\s*method\s+(\w+)\([^)]*\)\s*\n\s*location:\s*"
+    r"(?:variable\s+\w+\s+of type|class|interface)\s+([\w.]+)"
+)
+
+# Opens the note detect_wrong_submission emits. build_report.py matches on this
+# verbatim rather than re-deriving the bytecode evidence itself, so the two
+# spellings must stay in sync.
+WRONG_SUBMISSION_PREFIX = "WRONG SUBMISSION LIKELY:"
+
+# Constant-pool tag -> bytes of fixed-size payload following it (JVMS 4.4).
+# Utf8 (1) is variable-length and handled separately; Long (5) and Double (6)
+# additionally consume TWO pool slots each, which is the classic off-by-one
+# that silently desynchronises a hand-rolled pool walk.
+CONSTANT_POOL_PAYLOAD_SIZES = {
+    3: 4, 4: 4, 5: 8, 6: 8, 7: 2, 8: 2, 9: 4, 10: 4,
+    11: 4, 12: 4, 15: 3, 16: 2, 17: 4, 18: 4, 19: 2, 20: 2,
+}
+CONSTANT_POOL_DOUBLE_WIDTH_TAGS = frozenset({5, 6})
 
 
 def rmtree_with_retry(path: Path) -> None:
@@ -509,6 +534,143 @@ def find_class_fallback_files(class_search_root: Path, class_names: set[str]) ->
         if simple in class_names:
             result.setdefault(simple, []).append(class_file)
     return result
+
+
+def class_file_methods(path: Path) -> tuple[int | None, dict[str, list[str]]]:
+    """Read a .class file's own method table: returns (major_version,
+    {method_name: [descriptor, ...]}).
+
+    A hand-rolled walk of just the constant pool and the method table (JVMS
+    4.1) rather than a javap subprocess, for one specific reason: javap
+    REFUSES a class file newer than the JDK running it ("Unsupported class
+    file version"), and a student compiling on a newer JDK than the grading
+    machine is exactly the case this has to keep working for. Only names and
+    descriptors are wanted, so nothing past the method table is decoded.
+
+    Anything that isn't a readable class file returns (None, {}) - this is
+    diagnostic reporting, and a malformed or truncated .class somewhere in a
+    submission must never take down the run.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None, {}
+    if len(data) < 10 or data[:4] != b"\xca\xfe\xba\xbe":
+        return None, {}
+    try:
+        major = struct.unpack_from(">H", data, 6)[0]
+        pool_count = struct.unpack_from(">H", data, 8)[0]
+        offset = 10
+        utf8: dict[int, str] = {}
+        index = 1
+        while index < pool_count:
+            tag = data[offset]
+            offset += 1
+            if tag == 1:
+                length = struct.unpack_from(">H", data, offset)[0]
+                offset += 2
+                utf8[index] = data[offset:offset + length].decode("utf-8", "replace")
+                offset += length
+            else:
+                offset += CONSTANT_POOL_PAYLOAD_SIZES[tag]
+                if tag in CONSTANT_POOL_DOUBLE_WIDTH_TAGS:
+                    index += 1
+            index += 1
+
+        offset += 6  # access_flags, this_class, super_class
+        offset += 2 + 2 * struct.unpack_from(">H", data, offset)[0]  # interfaces
+
+        def skip_attributes(pos: int) -> int:
+            count = struct.unpack_from(">H", data, pos)[0]
+            pos += 2
+            for _ in range(count):
+                pos += 6 + struct.unpack_from(">I", data, pos + 2)[0]
+            return pos
+
+        field_count = struct.unpack_from(">H", data, offset)[0]
+        offset += 2
+        for _ in range(field_count):
+            offset = skip_attributes(offset + 6)
+
+        method_count = struct.unpack_from(">H", data, offset)[0]
+        offset += 2
+        methods: dict[str, list[str]] = {}
+        for _ in range(method_count):
+            name_index, descriptor_index = struct.unpack_from(">HH", data, offset + 2)
+            offset = skip_attributes(offset + 6)
+            name = utf8.get(name_index, "")
+            if name:
+                methods.setdefault(name, []).append(utf8.get(descriptor_index, ""))
+        return major, methods
+    except (struct.error, KeyError, IndexError):
+        return None, {}
+
+
+def detect_wrong_submission(
+    compile_error: str,
+    class_search_root: Path | None,
+    class_names: set[str],
+) -> list[str]:
+    """A compile failure against a FIXED official test is diagnosable, not
+    just reportable: the test is known-good, so javac reporting `cannot find
+    symbol: method swapRange` on a required class means the .java submitted
+    is not the class this question asked for.
+
+    When the SAME archive ALSO ships a precompiled ClassName.class that DOES
+    declare that method, the student didn't skip the work - they exported the
+    wrong src/ folder next to a correct build, and the 0 they got means
+    something completely different from "never wrote it". That distinction is
+    invisible in the wall of javac output and changes what a TA does next, so
+    it gets its own note ahead of the compile error.
+
+    Detection and reporting ONLY. The score still follows the .java, per the
+    README's grading policy - a .class is graded in place of source only when
+    there is no source at all (see find_class_fallback_files), and nothing
+    here changes that. Returns at most one note per class, in name order.
+    """
+    if class_search_root is None or not class_names:
+        return []
+
+    # compile_result.output has already been flattened by truncate(); restore
+    # the line breaks MISSING_METHOD_RE is written against.
+    err = (compile_error or "").replace(" | ", "\n")
+    wanted: dict[str, list[str]] = {}
+    for method, owner in MISSING_METHOD_RE.findall(err):
+        simple_owner = owner.rsplit(".", 1)[-1]
+        if simple_owner not in class_names:
+            continue
+        seen = wanted.setdefault(simple_owner, [])
+        if method not in seen:
+            seen.append(method)
+    if not wanted:
+        return []
+
+    matches = find_class_fallback_files(class_search_root, set(wanted))
+    notes: list[str] = []
+    for class_name in sorted(wanted):
+        for class_file in matches.get(class_name, []):
+            # find_class_fallback_files also returns ClassName$Inner.class
+            # siblings; the outer class is the one that declares the method.
+            if class_file.stem != class_name:
+                continue
+            major, declared = class_file_methods(class_file)
+            found = [m for m in wanted[class_name] if m in declared]
+            if not found:
+                continue
+            signatures = ", ".join(f"{m}{declared[m][0]}" for m in found)
+            version = f", Java {major - 44} bytecode" if major else ""
+            notes.append(
+                f"{WRONG_SUBMISSION_PREFIX} the official test calls "
+                f"{class_name}.{'/'.join(found)}, which the submitted .java does not "
+                f"declare, but this submission also ships a precompiled "
+                f"{class_name}.class that DOES declare it ({signatures}{version}) - "
+                f"the .java exported are a different assignment from the .class "
+                f"exported beside them, so this looks like a wrong-project export "
+                f"rather than unwritten work. The score still follows the .java, "
+                f"per policy"
+            )
+            break
+    return notes
 
 
 def resolve_class_fallback_dest(rel_path: Path, referenced_packages: set[str]) -> Path:
@@ -1928,6 +2090,14 @@ def grade_student(
                             prep_notes + [f"STRUCTURE ERROR: {v}" for v in violations]
                         ).strip("; ")
                         return row
+            # Ahead of the javac wall, not after it: a TA scanning notes needs to
+            # see "they shipped the wrong src/" before a screenful of errors that
+            # all look like the student never did the work. Also keeps the note
+            # clear of truncate()'s cut, which lands inside the compile output.
+            prep_notes = prep_notes + detect_wrong_submission(
+                compile_result.output, class_search_root,
+                class_fallback_candidates or frozenset(),
+            )
             row["notes"] = "; ".join(prep_notes + [f"COMPILE ERROR: {compile_result.output}"]).strip("; ")
             return row
 
