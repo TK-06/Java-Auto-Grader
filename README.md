@@ -232,6 +232,17 @@ otherwise causes `cannot find symbol` against an unnamed-package test even thoug
 is fine. Both the stripped package and any import cleaned up alongside it are noted in
 `notes`.
 
+**A package the tests never name is still kept when a required package depends on it.**
+The keep-set starts from what `tests/*.java` declares and imports, then grows along the
+submission's own package graph: if a file whose package is kept `import`s from another
+package the submission declares, that one is kept too, repeated until nothing new is added.
+Without this, a week whose official tests are packaged breaks for the whole class — W6Q1's
+test imports `stack` and `myInterface` but never `lnkedList`, so `lnkedList` was flattened
+while `stack` stayed named, and Java cannot reference the unnamed package from a named one.
+Every submission failed to compile, the reference solution included. When the official tests
+declare and import no package at all — every week whose tests assume the unnamed package —
+nothing seeds that walk and stripping behaves exactly as it always has.
+
 If a package is required (like `application` above) but a student's declaration is that
 name *plus an extra prefix* — e.g. `Q1_toStudent.application`, because their IDE inferred
 the package from a source-root folder literally named after the assignment — the grader
