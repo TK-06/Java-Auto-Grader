@@ -2362,6 +2362,25 @@ def bare_student_id(student_id: str) -> str:
 # text that's always present in that case, checked in this order so the first hit
 # wins if a submission somehow triggered more than one. Used only for the console
 # progress line; grades.csv's own "notes" column keeps the full detail regardless.
+# Longest reason clause console_failure_reason will print before clipping.
+# Sized so the whole progress line still fits a normal terminal alongside the
+# student id and score; grades.csv always keeps the untruncated notes.
+CONSOLE_REASON_MAX_CHARS = 72
+
+# Pulls "CDLinkedList.swapRange" back out of the note detect_wrong_submission
+# wrote, for the console's short clause. Coupled to that note's own wording on
+# purpose - both live in this file, and a test pins them together so a reword
+# fails loudly here instead of silently degrading the progress line.
+WRONG_SUBMISSION_CALL_RE = re.compile(
+    re.escape(WRONG_SUBMISSION_PREFIX) + r"\s*the official test calls ([\w.]+)"
+)
+
+# The message half of javac's first reported error. Notes store javac output
+# flattened to " | "-joined text (see truncate), so a clause ends at the next
+# separator, not at a newline.
+JAVAC_FIRST_ERROR_RE = re.compile(r"error:\s*([^|]+)")
+
+
 CAP_REASON_LABELS = [
     ("manual review check(s) require rejection", "rejected by manual review"),
     ("matches the unedited starter template", "stub-only submission"),
@@ -2383,6 +2402,63 @@ def short_cap_reason(notes: str) -> str:
         if marker in segment:
             return label
     return segment
+
+
+def clip_console_reason(text: str) -> str:
+    """Collapse whitespace and cut to CONSOLE_REASON_MAX_CHARS. ASCII "..." on
+    purpose, not an ellipsis character - this prints to a Windows console that
+    is routinely not on a UTF-8 code page, where a non-ASCII byte comes out as
+    a replacement glyph in the middle of the reason a TA is trying to read."""
+    text = " ".join((text or "").split())
+    if len(text) > CONSOLE_REASON_MAX_CHARS:
+        text = text[:CONSOLE_REASON_MAX_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def console_failure_reason(row: dict) -> str:
+    """One short clause naming WHY a submission scored 0, appended to its
+    console progress line in main(). grades.csv keeps the full notes either way.
+
+    A grading run is watched live, and a screenful of bare "COMPILE ERROR"
+    lines tells a TA nothing about which rows are worth opening - yet the
+    failures behind them mean entirely different things. A structure error is a
+    packaging problem the student can be told to fix; a plain compile error is
+    a bug in their own code; a wrong-submission flag means the work may exist
+    and be recoverable from the archive. Each gets its own clause, chosen from
+    the actual notes rather than the branch that printed it.
+
+    Returns "" when there is nothing useful to add, so the caller can omit the
+    separator entirely rather than print a dangling dash.
+    """
+    notes = row["notes"]
+
+    # Checked first because the structure path returns BEFORE compiling, so
+    # such a row can never also carry a compile error to report instead.
+    if "STRUCTURE ERROR" in notes:
+        violations = [
+            segment.split("STRUCTURE ERROR: ", 1)[1]
+            for segment in notes.split("; ")
+            if segment.startswith("STRUCTURE ERROR: ")
+        ]
+        if not violations:
+            return ""
+        extra = f" (+{len(violations) - 1} more)" if len(violations) > 1 else ""
+        return clip_console_reason(violations[0]) + extra
+
+    if "COMPILE ERROR" in notes:
+        # A proven wrong submission outranks whatever javac happened to report
+        # first: "the work is in the archive" is the fact that decides what the
+        # TA does next, and the javac line is only how it was noticed.
+        call = WRONG_SUBMISSION_CALL_RE.search(notes)
+        if call:
+            return f"{call.group(1)} missing from .java, present in bundled .class"
+        segment = notes.split("COMPILE ERROR: ", 1)[1]
+        first = JAVAC_FIRST_ERROR_RE.search(segment)
+        return clip_console_reason(first.group(1) if first else segment)
+
+    # Everything else prep_notes recorded on the way to a 0 - no .java found,
+    # a javac timeout, a native OOM. The last note is the one that ended it.
+    return clip_console_reason(notes.split("; ")[-1])
 
 
 def console_line_suffix(row: dict) -> str:
@@ -2569,11 +2645,21 @@ def main() -> None:
         if row["compiled"] == "no":
             if "STRUCTURE ERROR" in row["notes"]:
                 status = "STRUCTURE ERROR"
+            elif WRONG_SUBMISSION_PREFIX in row["notes"]:
+                # Deliberately REPLACES "COMPILE ERROR" rather than qualifying
+                # it, matching how build_report.py routes the same row to its
+                # own "Wrong submission" category instead of "Compile error".
+                # That it failed to compile is true but not the useful half.
+                status = "WRONG SUBMISSION"
             elif "COMPILE ERROR" in row["notes"]:
                 status = "COMPILE ERROR"
             else:
                 status = "NO SOURCE FILES"
-            print(f"[{i}/{total}] {student_id}: {status} (score {row['score']})")
+            reason = console_failure_reason(row)
+            print(
+                f"[{i}/{total}] {student_id}: {status} (score {row['score']})"
+                + (f" - {reason}" if reason else "")
+            )
         else:
             print(
                 f"[{i}/{total}] {student_id}: compiled, "
@@ -2602,6 +2688,16 @@ def main() -> None:
     failed_count = len(rows) - compiled_count
     if failed_count:
         print(f"  {failed_count} submission(s) failed to compile - build dir(s) saved under {failed_build_root}")
+    wrong_submissions = sum(1 for r in rows if WRONG_SUBMISSION_PREFIX in r["notes"])
+    if wrong_submissions:
+        # Called out separately from the compile-failure count it is a subset
+        # of: these are the 0s most likely to be worth a second look, and a run
+        # over a full class is long enough that the per-student lines above have
+        # scrolled away by the time it finishes.
+        print(
+            f"  {wrong_submissions} of those look like a WRONG SUBMISSION - the .java "
+            f"exported are a different assignment from the .class beside them (see notes)"
+        )
 
 
 if __name__ == "__main__":
