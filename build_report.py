@@ -53,7 +53,7 @@ from pathlib import Path
 
 # Imported, not re-spelled: grade.py owns this marker and writes it into
 # grades.csv, so a copy here would be free to drift out of sync silently.
-from grade import WRONG_SUBMISSION_PREFIX
+from grade import WRONG_SUBMISSION_PREFIX, RUBRIC_GATE_PREFIX, RUBRIC_PENALTY_PREFIX
 
 CSV_PATH = Path(__file__).parent / "results" / "grades.csv"
 OUT_PATH = Path(__file__).parent / "results" / "report.html"
@@ -147,7 +147,11 @@ def category_of(row):
         return "nosource"
     if row["score_cap"]:
         return "capped"
-    if "PENALTY applied (rubric)" in notes:
+    # Gate before penalty: a class can carry both, and a fired gate is the bigger
+    # fact (it forfeits that whole class), so it's the one to lead with.
+    if RUBRIC_GATE_PREFIX in notes:
+        return "gate"
+    if RUBRIC_PENALTY_PREFIX in notes:
         return "penalty"
     if row["tests_passed"] == row["tests_total"] and row["tests_total"] != "0":
         return "pass"
@@ -200,7 +204,7 @@ CATEGORY_LABEL = {
     "compile": "Compile error", "structure": "Structure error",
     "wrongwork": "Wrong submission",
     "nosource": "No source", "override": "TA review", "missing": "No submission",
-    "timeout": "Timed out", "penalty": "Penalty",
+    "timeout": "Timed out", "penalty": "Penalty", "gate": "Rule not met",
 }
 
 
@@ -311,9 +315,13 @@ def _render_category_reason(row, cat, notes):
                          "method named above. So the work itself appears to have been done \u2014 what went "
                          "wrong is the export: the source folder packaged with it belongs to a different "
                          "question.</p>")
-                hint = ("<p class='hint'>Take this to your TA and point them at this paragraph. The score "
-                        "follows the <code>.java</code> you actually submitted, so it does not change on "
-                        "its own \u2014 but what is in the archive is worth showing them.</p>")
+                hint = ("<p class='hint'>The assignment requires the JAR to be exported with <em>this</em> "
+                        "question's source, so this scores 0 even though the compiled code beside it looks "
+                        "right \u2014 there is no source for this question to mark. Check your export next "
+                        "time by opening the JAR with 7-Zip or WinRAR and confirming the <code>.java</code> "
+                        "files inside are the ones you wrote for this question. If you believe the correct "
+                        "project <em>was</em> submitted, take this to your TA and point them at this "
+                        "paragraph.</p>")
             return f'<div class="reason reason-bad">{what}{hint}{raw}</div>'
         first = (err or "").strip().splitlines()
         first_line = first[0] if first else ""
@@ -422,6 +430,26 @@ def _render_category_reason(row, cat, notes):
           raise it with your TA and point them at this note.</p>
           {extra}
         </div>"""
+    if cat == "gate":
+        # The gate note carries the grader's whole trail; the student needs the
+        # decision, not the trail. Lead with what the rule was and what it cost,
+        # put the exact check behind a toggle - same shape as the javac wall.
+        idx = notes.find(RUBRIC_GATE_PREFIX)
+        said = notes[idx + len(RUBRIC_GATE_PREFIX):].strip() if idx != -1 else notes
+        trail = notes[:idx].strip().rstrip(";").strip() if idx != -1 else ""
+        extra = (f"""<details class="rawerr"><summary>Show the grader's full notes</summary>
+          <pre>{esc(trail)}</pre></details>""") if trail else ""
+        return f"""<div class="reason reason-gate">
+          <p class="diag"><strong>A rule in the marking guide was not met for one part of this
+          question</strong>, so the marks for that part were forfeited. The tests you passed in
+          the other parts are unaffected and still count.</p>
+          <p class="diag">{esc(said)}</p>
+          <p class="hint">This is not about a test failing - it is a rule the assignment stated
+          separately, so passing the tests for that part does not earn the marks back. Re-read the
+          instruction printed in bold for this question, and raise it with your TA if you think
+          the check is wrong.</p>
+          {extra}
+        </div>"""
     if cat == "penalty":
         return f"""<div class="reason reason-warn">
           <p><strong>A rubric penalty was applied</strong> &mdash; a marking-guide rule that deducts a fixed number of points regardless of how the other tests went. The exact reason:</p>
@@ -479,6 +507,8 @@ def render_graded_row(row):
         summary_extra = '<span class="note-flag">TA reviewed</span>'
     elif cat == "penalty":
         summary_extra = '<span class="note-flag">rubric penalty</span>'
+    elif cat == "gate":
+        summary_extra = '<span class="note-flag">rule not met</span>'
     if row["student_id"] in LATE_PENALTIES:
         summary_extra += '<span class="note-flag">late</span>'
     return f"""
@@ -586,7 +616,7 @@ h1 { font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp
 .chip { font-size: .72rem; font-weight: 600; padding: .2em .55em; border-radius: 5px; letter-spacing: .01em; white-space: nowrap; }
 .chip-pass { background: var(--pass-bg); color: var(--pass); }
 .chip-partial { background: var(--warn-bg); color: var(--warn); }
-.chip-capped, .chip-penalty { background: var(--warn-bg); color: var(--warn); }
+.chip-capped, .chip-penalty, .chip-gate { background: var(--warn-bg); color: var(--warn); }
 .chip-compile, .chip-structure, .chip-nosource, .chip-timeout, .chip-wrongwork { background: var(--fail-bg); color: var(--fail); }
 .rawerr { margin-top: .9rem; border-top: 1px solid var(--line); padding-top: .6rem; }
 .rawerr > summary { cursor: pointer; font-size: .82rem; color: var(--ink-soft); list-style: none; }
@@ -699,7 +729,7 @@ def main():
 
     catbar_defs = [
         ("pass", "Full pass"), ("partial", "Partial"), ("capped", "Capped"),
-        ("penalty", "Penalty"), ("timeout", "Timed out"),
+        ("gate", "Rule not met"), ("penalty", "Penalty"), ("timeout", "Timed out"),
         ("wrongwork", "Wrong submission"), ("compile", "Compile error"), ("structure", "Structure error"),
         ("nosource", "No source"), ("override", "TA review"), ("missing", "No submission"),
     ]
@@ -712,6 +742,7 @@ def main():
         "pass": "Every scored test passed.",
         "partial": "Some tests passed, some failed - the failing ones are listed with the exact mismatch.",
         "capped": "A marking-guide rule limited the score, separately from how the tests went.",
+        "gate": "A rule in the marking guide was not met, so the marks for that part were forfeited - the other parts are unaffected.",
         "penalty": "A fixed deduction from a marking-guide rule was applied.",
         "timeout": "The tests did not finish in the time limit and were stopped.",
         "wrongwork": "The class submitted is missing the method this question asked for - usually the wrong project was exported.",

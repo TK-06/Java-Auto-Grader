@@ -51,6 +51,16 @@ What every submission can expect, regardless of week:
   90% (10% off). `results/grades.csv` is never touched by this — it always keeps the
   pre-late-penalty technical record for audit purposes; only `mcvScore.csv` reflects the
   late adjustment. See **Weekly workflow §4** for the exact mechanics.
+- **Source belonging to a different question** → **0**, even when the compiled `.class`
+  files bundled beside it are correct and complete. Two questions in the same week usually
+  share most of their class *names*, so a wrong-project export still looks structurally
+  right: what gives it away is that the `.java` doesn't declare the method this question's
+  official test calls, while a `.class` in the same archive does. `grade.py` labels that
+  `WRONG SUBMISSION LIKELY:` in `notes` and applies an explicit **0% cap**, so the rule
+  holds on its own rather than depending on the compile happening to fail. The assignment
+  requires the JAR to be exported with *this* question's source; without it there is
+  nothing to mark. The bytecode evidence is reported, not scored — a TA who wants to check
+  what the student actually built can, and can override by hand.
 - **Submitted as bare `.java` source instead of a packaged archive** (a loose `.java` file,
   or an unpackaged folder of them, dropped straight into `submissions/` — commonly an LMS
   bulk-download artifact bundling two individually-uploaded files together) → **0**, rejected
@@ -321,6 +331,57 @@ A negative entry is treated as a penalty, not a scored test:
   usually means the check itself broke, not the student's code.
 - The 50%/90%/0% caps still apply on top of the already-penalized `score`, unchanged.
 
+**Gate tests — `"__gate__"`.** Some marking guides make one check a *condition* on a whole
+test class: *"`testNoForbiddenMethod` — if this fails, make every test in this file score
+0."* That's a conditional zero of a **group**, which neither flat points nor a penalty can
+express. Name it with the reserved `__gate__` key inside that class's block:
+
+```json
+{
+    "StackUtilityTest2": { "testRemoveRange1": 1, "testRemoveRange2": 1 },
+    "StackArrayTest2": {
+        "testRemoveRange1": 1,
+        "testRemoveRange2": 1,
+        "__gate__": "testNoForbiddenMethod"
+    }
+}
+```
+
+When a gate test does **not** pass, every scored test **in that class** contributes 0, and
+**other classes are untouched**. Specifically:
+
+- `max_score` is **unchanged** — those marks were available and the student forfeited them,
+  so the "out of" still means the same thing for everyone.
+- The gate test is kept **out of** `tests_passed` / `tests_total` / `passed_tests` /
+  `failed_tests`, exactly like a penalty test. It's a condition, not points possible, and
+  it is *not* reported as an "extra test not in rubric" either.
+- `notes` gets `GATE failed (rubric): StackArrayTest2.testNoForbiddenMethod (forfeits 7
+  point(s) from StackArrayTest2): ...`, and `build_report.py` routes the row to its own
+  **Rule not met** category.
+- A gate with **no pass/fail result at all** never fires — it's flagged in `notes` instead,
+  same as a penalty with no result, since a missing result usually means the check itself
+  broke.
+- Giving the same method both `__gate__` and a points entry is a config error and exits at
+  startup.
+
+**Gates and source-reading checks.** A gate is very often a test that reads the student's
+own `.java` off disk (*"`removeRange` must not call `push`/`pop`"* can't be written as an
+assertion). `grade.py` materialises a real `src/<package>/` tree next to the build and runs
+JUnit from there, so such a test works — but a **`.class`-only submission has no source to
+read**, so the check fails for that reason alone, *on top of* the 50% no-source cap. That's
+one problem penalised twice. It isn't auto-suppressed, because a gate can equally be an
+ordinary assertion that judges bytecode perfectly well; instead the note gets a
+`[CHECK BY HAND: ...]` marker so a TA can tell the two cases apart. If you're writing a
+source-reading check yourself, give it a bytecode fallback (JDK 24+'s `java.lang.classfile`
+can walk the method's real call graph, which also catches a helper declared *above* the
+entry method — something the usual text scan structurally cannot see).
+
+**Why not just use a big negative penalty?** Because a penalty is a *fixed* deduction, so it
+only matches the rule for a student who passed everything else. A student who passes 3 of 7
+*and* trips the check should score 0 for that class; `-7` gives `3 - 7`, and the floor
+applies to the **whole** score, so it eats marks earned in *other* classes. That is a real
+case, not a hypothetical — it happened in W6Q2 and had to be corrected by hand.
+
 **No `tests/rubric.json`?** Nothing changes — `score` stays the flat "1 point per passed
 test" count exactly as before. This is entirely opt-in, per week.
 
@@ -451,6 +512,14 @@ submission yourself, create `tests/manual_review.json`:
 - `pattern` — a regex, searched against each student `.java` file's raw source.
 - `reason` — free text, copied straight into the note so you don't have to re-open this
   file to remember why something got flagged.
+- `include_classes` (optional) — when non-empty, **only** these classes are scanned for
+  this check. Reach for this whenever the rule is about one specific class. Expressing
+  "only `StackUtility`" as a list of everything *else* to exclude is fragile and fails
+  **open**: in W6Q2 exactly that mistake matched the starter's own test files (which
+  legitimately call `getTheArray()`) and flagged **123 of 132** students before anyone
+  noticed, and it would have silently broken again the moment the assignment gained a
+  class. Listing the same class in both `include_classes` and `exclude_classes` is a config
+  error and exits at startup.
 - `exclude_classes` (optional) — class names exempt from *this* check, e.g. a class whose
   own game rules legitimately require `instanceof` (the `Boss` example above).
 - `auto_reject` (optional, defaults to `false`) — see below.
@@ -578,6 +647,12 @@ itself is a short hash, not the student's ID — long/messy real-world filenames
 Windows' path length limit if used directly for a nested build path, so the actual
 student_id only ever appears in the CSV, never in a filesystem path.)
 
+`build_tmp/<hash>/src/` inside that build dir is a mirror of the same flattened sources
+laid out by package, written for tests that read their own source via a relative path (see
+[Verifying a change before it ships](#verifying-a-change-before-it-ships)). It's never
+compiled — every compile and scan uses a non-recursive `*.java` glob over the build dir
+itself — so it can't cause a class to be built twice.
+
 ### 4. (Optional) Check for late submissions
 
 The late-penalty policy above (10% off per day) needs a deadline to check against, which
@@ -699,6 +774,59 @@ gradebook upload.
 - Results are parsed from JUnit's XML reports (not the printed text summary), so per-test
   pass/fail is exact even if a student's code prints to stdout/stderr during a test.
 
+## Verifying a change before it ships
+
+`grade.py` runs on the TA's machine, but this week's official test files also have to run on
+**the student's** machine — they're handed out, dropped into `src/test/`, and run from the
+IDE. Those are two different environments, and a test can pass in one while being broken in
+the other. The case that motivated this: a test reading its own source with
+`new File("src/stack/StackArray.java")` works in a student's project and fails for every
+submission under the grader, because the grader flattens sources and runs from elsewhere.
+Verify **both** sides before shipping a change to `grade.py` or to a week's `tests/`.
+
+**1. The unit suites.**
+
+```bash
+python -m pytest test_grade.py test_check_lateness.py -q
+```
+
+**2. The TA side — synthetic submissions, against scratch paths so `results/` is untouched.**
+Build a JAR of the reference solution and one of the untouched starter, then:
+
+```bash
+python grade.py --submissions <scratch>/validate \
+                --out <scratch>/grades.csv --scores-out <scratch>/mcv.csv
+```
+
+Full marks on the solution and a clean 0 on the starter is the bar. Add a deliberately
+rule-violating copy whenever the week has a `__gate__` or a penalty test, and check it
+forfeits exactly the points it should.
+
+**3. The student side — real submissions, in their own project layout.**
+
+```bash
+python verify_student_run.py --grading . --work <scratch>/studentrun ALL
+```
+
+This rebuilds each student's project from their jar exactly as the jar lays it out (some
+exports are rooted at `src/`, some at the archive root), copies `tests/*.java` in beside
+their own test package, compiles, and runs each test class **with the working directory set
+to the project root** — what an IDE Run does. A student who scored *n* under `grade.py`
+should score *n* here; a difference means the test behaves differently in the two places,
+which is a bug in the test, not in the student's work. It also answers "could this student
+have run the given tests themselves at all", which is useful evidence when a submission is
+missing source or is the wrong project.
+
+**4. Re-grade the real cohort and diff the scores.** A tool change that is meant to be
+behaviour-preserving must produce byte-identical scores; one that is meant to change
+behaviour must change *only* the rows you predicted. Write to scratch paths and compare
+against the previous `results/grades.csv` rather than overwriting it.
+
+A change to `grade.py` that can produce a **new kind of 0, cap, or flag** is not finished
+when `grades.csv` records it — that row reaches a student through `build_report.py`, and a
+note it doesn't recognise falls through to a raw dump of the grader's internal trail. See
+`build_report.py`'s module docstring for the four touch points a new category needs.
+
 ## Project layout
 
 ```
@@ -706,6 +834,11 @@ grading/                  <- repo root
   grade.py
   extract_submissions.py   <- MCV bulk export -> one <studentID>.<ext> per student, see Weekly workflow §2
   check_lateness.py        <- optional; computes real submission times / late penalties, see Weekly workflow §4
+  verify_student_run.py    <- rebuilds each student's own project from their jar and runs this
+                              week's tests there, the way THEY would; see "Verifying a change" below
+  audit_forbidden.py       <- optional; re-checks a "these methods are forbidden" rule over the
+                              real call graph and reports where the official text scan disagrees
+  dupe_check.py            <- optional; groups students whose student-written code is identical
   README.md
   lib/
     junit-platform-console-standalone-*.jar   <- committed; see lib/README.md to update it
