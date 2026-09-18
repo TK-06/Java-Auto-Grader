@@ -37,8 +37,11 @@ from grade import (
     grade_student,
     infer_unnamed_package_classes,
     load_manual_review_checks,
+    load_rubric,
+    load_rubric_gates,
     load_stub_starter_files,
     load_structure_baseline,
+    materialise_source_tree,
     normalize_for_stub_compare,
     partition_fallback_matches,
     prepare_build_dir,
@@ -2800,6 +2803,162 @@ class TestWriteCsvNewColumns(unittest.TestCase):
             self.assertEqual(lines[1].split(","), [
                 "1", "yes", "2", "2", "2", "2", "2", "", "", "", "", "",
             ])
+
+
+class TestRubricGates(unittest.TestCase):
+    """A gate is a CONDITION on a class - not a scored test, and not a penalty.
+    See load_rubric_gates for why a big negative penalty is not equivalent."""
+
+    def _write(self, tests_dir, rubric):
+        (tests_dir / "rubric.json").write_text(json.dumps(rubric), encoding="utf-8")
+
+    def test_gate_is_stripped_out_of_the_points_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            self._write(tests_dir, {"ArrTest": {"t1": 1, "t2": 1, "__gate__": "tNoForbidden"}})
+
+            self.assertEqual(load_rubric(tests_dir), {"ArrTest": {"t1": 1, "t2": 1}})
+            self.assertEqual(load_rubric_gates(tests_dir), {"ArrTest": "tNoForbidden"})
+
+    def test_no_gates_returns_empty_and_rubric_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            self._write(tests_dir, {"ArrTest": {"t1": 1, "t2": 2}})
+
+            self.assertEqual(load_rubric(tests_dir), {"ArrTest": {"t1": 1, "t2": 2}})
+            self.assertEqual(load_rubric_gates(tests_dir), {})
+
+    def test_missing_rubric_file_has_no_gates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(load_rubric_gates(Path(tmp)), {})
+
+    def test_gate_naming_a_scored_test_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            self._write(tests_dir, {"ArrTest": {"tNoForbidden": 1, "__gate__": "tNoForbidden"}})
+
+            with self.assertRaises(SystemExit):
+                load_rubric_gates(tests_dir)
+
+    def test_non_string_gate_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            self._write(tests_dir, {"ArrTest": {"t1": 1, "__gate__": True}})
+
+            with self.assertRaises(SystemExit):
+                load_rubric_gates(tests_dir)
+
+
+class TestMaterialiseSourceTree(unittest.TestCase):
+    """Official tests that read their own source via a relative path need a real
+    src/<package>/ tree beside the flattened build - see materialise_source_tree."""
+
+    def test_packaged_and_unpackaged_files_land_where_a_project_would_put_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "StackArray.java").write_text(
+                "package stack;\n\npublic class StackArray {}\n", encoding="utf-8")
+            (build_dir / "Bot.java").write_text("public class Bot {}\n", encoding="utf-8")
+
+            src_root = materialise_source_tree(build_dir)
+
+            self.assertTrue((src_root / "stack" / "StackArray.java").is_file())
+            self.assertTrue((src_root / "Bot.java").is_file())
+
+    def test_mirror_carries_the_package_that_actually_compiled(self):
+        # prepare_build_dir may rewrite or strip a package before compiling; the
+        # mirror has to show what javac saw, not what the archive originally held.
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "Foo.java").write_text(
+                "package application;\n\npublic class Foo {}\n", encoding="utf-8")
+
+            src_root = materialise_source_tree(build_dir)
+
+            mirrored = src_root / "application" / "Foo.java"
+            self.assertTrue(mirrored.is_file())
+            self.assertIn("package application;", mirrored.read_text(encoding="utf-8"))
+
+    def test_mirror_is_invisible_to_the_flat_glob_everything_else_uses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = Path(tmp)
+            (build_dir / "StackArray.java").write_text(
+                "package stack;\n\npublic class StackArray {}\n", encoding="utf-8")
+
+            materialise_source_tree(build_dir)
+
+            # compile / structure-check / manual-review all use this same glob; if
+            # the mirror showed up here every class would be compiled twice.
+            self.assertEqual([f.name for f in build_dir.glob("*.java")], ["StackArray.java"])
+
+
+class TestManualReviewIncludeClasses(unittest.TestCase):
+    """include_classes narrows a check to the class the rule is actually about.
+    Expressing that with exclude_classes instead fails OPEN - see README 2e."""
+
+    def _build(self, tmp):
+        build_dir = Path(tmp)
+        (build_dir / "StackUtility.java").write_text(
+            "public class StackUtility {\n    void f() { s.getTheArray(); }\n}\n",
+            encoding="utf-8")
+        (build_dir / "StackArrayTest.java").write_text(
+            "public class StackArrayTest {\n    void t() { a.getTheArray(); }\n}\n",
+            encoding="utf-8")
+        return build_dir
+
+    def test_include_limits_the_scan_to_named_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = self._build(tmp)
+            checks = [{"pattern": r"\.getTheArray\(", "reason": "internals",
+                       "include_classes": ["StackUtility"]}]
+
+            notes, _ = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertEqual(len(notes), 1)
+            self.assertIn("StackUtility.java", notes[0])
+            self.assertNotIn("StackArrayTest.java", notes[0])
+
+    def test_absent_include_still_scans_every_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = self._build(tmp)
+            checks = [{"pattern": r"\.getTheArray\(", "reason": "internals"}]
+
+            notes, _ = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertIn("StackUtility.java", notes[0])
+            self.assertIn("StackArrayTest.java", notes[0])
+
+    def test_include_of_a_class_that_does_not_match_yields_no_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = self._build(tmp)
+            checks = [{"pattern": r"\.nothingHere\(", "reason": "internals",
+                       "include_classes": ["StackUtility"]}]
+
+            notes, reject = run_manual_review_checks(build_dir, official_names=set(), checks=checks)
+
+            self.assertEqual(notes, [])
+            self.assertEqual(reject, [])
+
+    def test_class_in_both_lists_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(json.dumps({"checks": [
+                {"pattern": "x", "reason": "y",
+                 "include_classes": ["A"], "exclude_classes": ["A"]}
+            ]}), encoding="utf-8")
+
+            with self.assertRaises(SystemExit):
+                load_manual_review_checks(tests_dir)
+
+    def test_non_list_include_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp)
+            (tests_dir / "manual_review.json").write_text(json.dumps({"checks": [
+                {"pattern": "x", "reason": "y", "include_classes": "A"}
+            ]}), encoding="utf-8")
+
+            with self.assertRaises(SystemExit):
+                load_manual_review_checks(tests_dir)
 
 
 if __name__ == "__main__":

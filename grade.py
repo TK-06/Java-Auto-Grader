@@ -50,7 +50,8 @@ records the pre-cap result; score_cap shows the cap percentage applied
 ("" when none); notes explains why ("SCORE CAPPED AT n%: ...").
 
 If tests/manual_review.json is present ({"checks": [{"pattern": <regex>,
-"reason": <str>, "exclude_classes": [...], "auto_reject": <bool>}, ...]}),
+"reason": <str>, "include_classes": [...], "exclude_classes": [...],
+"auto_reject": <bool>}, ...]}),
 every student .java file is scanned against each pattern and a match appends
 a "MANUAL REVIEW: ..." note - a flag for a TA to read, and, only for a check
 with "auto_reject": true, also a hard 0% score cap (same mechanism as the
@@ -59,7 +60,9 @@ with "auto_reject": true, also a hard 0% score cap (same mechanism as the
 checks behaves exactly as before: notes only. For behavior JUnit's tests
 structurally can't tell apart from the real thing, e.g. a submission that
 fakes polymorphic dispatch with an instanceof chain instead of overriding;
-see load_manual_review_checks / run_manual_review_checks.
+see load_manual_review_checks / run_manual_review_checks. A check aimed at
+one class should say so with "include_classes" rather than excluding every
+other class by name.
 """
 import argparse
 import csv
@@ -123,6 +126,19 @@ MISSING_METHOD_RE = re.compile(
 # verbatim rather than re-deriving the bytecode evidence itself, so the two
 # spellings must stay in sync.
 WRONG_SUBMISSION_PREFIX = "WRONG SUBMISSION LIKELY:"
+
+# Reserved key inside a tests/rubric.json class block, naming that class's gate
+# test rather than a scored one - see load_rubric_gates. Chosen with dunder
+# affixes so it can never collide with a real JUnit method name.
+RUBRIC_GATE_KEY = "__gate__"
+
+# Open the two rubric notes a student can end up seeing. build_report.py imports
+# both rather than re-spelling them, for the same reason as
+# WRONG_SUBMISSION_PREFIX above: a literal copy drifts silently the next time the
+# wording changes, and the row then falls through to a raw dump of the grader's
+# internal trail instead of an explanation.
+RUBRIC_GATE_PREFIX = "GATE failed (rubric):"
+RUBRIC_PENALTY_PREFIX = "PENALTY applied (rubric):"
 
 # Constant-pool tag -> bytes of fixed-size payload following it (JVMS 4.4).
 # Utf8 (1) is variable-length and handled separately; Long (5) and Double (6)
@@ -1258,7 +1274,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def run_with_hard_timeout(cmd: list[str], timeout: int) -> ProcResult:
+def run_with_hard_timeout(cmd: list[str], timeout: int, cwd: Path | None = None) -> ProcResult:
     """Run cmd, capturing output via temp files (not pipes) so a hung,
     silent child can't deadlock a reader thread. Waits on the process
     handle only (no data to read), which enforces the timeout reliably,
@@ -1271,7 +1287,10 @@ def run_with_hard_timeout(cmd: list[str], timeout: int) -> ProcResult:
             popen_kwargs["start_new_session"] = True
         with open(stdout_path, "w", encoding="utf-8") as out_f, \
              open(stderr_path, "w", encoding="utf-8") as err_f:
-            proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, text=True, **popen_kwargs)
+            proc = subprocess.Popen(
+                cmd, stdout=out_f, stderr=err_f, text=True,
+                cwd=str(cwd) if cwd is not None else None, **popen_kwargs,
+            )
             try:
                 returncode = proc.wait(timeout=timeout)
                 timed_out = False
@@ -1290,6 +1309,40 @@ class CompileResult:
     success: bool
     classes_dir: Path
     output: str = ""
+
+
+def materialise_source_tree(build_dir: Path) -> Path:
+    """Mirror build_dir's flattened .java files into build_dir/src/<package>/,
+    the layout they'd have in a real project, and return that src directory.
+
+    Some official tests read the student's own source off disk to check a rule
+    no assertion can express - e.g. W6Q2's testNoForbiddenMethod does
+    `new File("src/stack/StackArray.java")` to prove removeRange doesn't call
+    push/pop. That path is relative to the working directory, so it resolves in
+    the professor's IDE project and nowhere else. prepare_build_dir flattens
+    every submission into one directory with no package folders at all, so
+    without this mirror such a test raises FileNotFoundException for EVERY
+    student - and when the marking guide makes it a gate, that silently zeroes
+    a whole class's worth of marks for the entire cohort. (W6Q2 needed the
+    official test patched by hand to dodge exactly that.)
+
+    The mirror is written from the files ALREADY in build_dir, so it carries the
+    same post-strip/post-rewrite package declarations that actually compiled -
+    a test reading it sees the same code javac saw, not the original archive.
+    It lives under build_dir/src/, which every existing `build_dir.glob("*.java")`
+    ignores by construction (that glob is non-recursive), so nothing compiles,
+    structure-checks or manual-review-scans these copies twice.
+
+    Cheap insurance: a few file copies per submission, and the alternative is
+    discovering the problem when a whole cohort scores 0."""
+    src_root = build_dir / "src"
+    for java_file in sorted(build_dir.glob("*.java")):
+        text = java_file.read_text(encoding="utf-8", errors="ignore")
+        match = PACKAGE_RE.search(text)
+        dest_dir = src_root / match.group(1).replace(".", "/") if match else src_root
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / java_file.name).write_text(text, encoding="utf-8")
+    return src_root
 
 
 def compile_submission(build_dir: Path, junit_jar: Path, timeout: int) -> CompileResult:
@@ -1416,7 +1469,8 @@ TestRunResult = ProcResult
 
 
 def run_tests(
-    classes_dir: Path, reports_dir: Path, junit_jar: Path, timeout: int, test_classes: list[str]
+    classes_dir: Path, reports_dir: Path, junit_jar: Path, timeout: int,
+    test_classes: list[str], cwd: Path | None = None,
 ) -> TestRunResult:
     """Run each official test class as its own JVM invocation (--select-class)
     rather than one --scan-classpath call across everything compiled. This
@@ -1448,7 +1502,11 @@ def run_tests(
             "--disable-ansi-colors",
             "--details=summary",
         ]
-        result = run_with_hard_timeout(cmd, timeout)
+        # cwd is the build directory, so a test that reads its own project's
+        # source via a relative path (e.g. "src/stack/StackArray.java") finds the
+        # tree materialise_source_tree mirrored there - the same thing it would
+        # find running from the project root in an IDE.
+        result = run_with_hard_timeout(cmd, timeout, cwd=cwd)
         stdout_parts.append(f"--- {fqcn} ---\n{result.stdout}")
         stderr_parts.append(result.stderr)
         if result.timed_out:
@@ -1515,12 +1573,66 @@ def load_rubric(tests_dir: Path) -> dict[str, dict[str, float]] | None:
     recursion" check that docks a flat 10 points for failing, say). A penalty
     test that passes costs nothing; one with no pass/fail result at all is
     flagged, never auto-deducted. The final score is floored at 0. See the
-    negative-points handling in grade_student and README.md section 2b."""
+    negative-points handling in grade_student and README.md section 2b.
+
+    A class may also carry the reserved key "__gate__": "<testMethod>" in place
+    of a points entry. That names a GATE test: when it does not pass, every
+    scored test in THAT class contributes 0, while other classes are unaffected.
+    It is stripped out here so the returned mapping stays points-only;
+    load_rubric_gates reads the same file for the gates themselves."""
     rubric_path = tests_dir / "rubric.json"
     if not rubric_path.exists():
         return None
     with open(rubric_path, encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    return {
+        classname: {m: p for m, p in methods.items() if m != RUBRIC_GATE_KEY}
+        for classname, methods in data.items()
+    }
+
+
+def load_rubric_gates(tests_dir: Path) -> dict[str, str]:
+    """Optional per-class "__gate__": "<testMethod>" entries in tests/rubric.json.
+
+    A marking guide sometimes says "if <check> fails, make every test in this
+    file score 0" - a conditional zero of a GROUP, which neither flat points nor
+    a negative penalty can express. A penalty is a FIXED deduction, so it only
+    coincides with that rule for a student who passed everything else: one who
+    passed 3 of 7 and also tripped the check should end on 0 for that file, but
+    a -7 penalty gives 3 - 7, and the floor is applied to the WHOLE score, so it
+    eats marks earned in other classes. W6Q2 hit exactly this and it had to be
+    corrected by hand.
+
+    The gate test is kept out of tests_passed/tests_total/passed_tests/
+    failed_tests, exactly like a penalty test - it is a condition, not points.
+    max_score is NOT reduced when a gate fires: those marks were available and
+    the student forfeited them, and max_score has to mean the same "out of" for
+    every student (README 2b). A gate with no pass/fail result at all is flagged
+    and never fires, same as a penalty with no result - a missing result almost
+    always means the check itself broke, not the student's code."""
+    rubric_path = tests_dir / "rubric.json"
+    if not rubric_path.exists():
+        return {}
+    with open(rubric_path, encoding="utf-8") as f:
+        data = json.load(f)
+    gates: dict[str, str] = {}
+    for classname, methods in data.items():
+        if not isinstance(methods, dict) or RUBRIC_GATE_KEY not in methods:
+            continue
+        gate = methods[RUBRIC_GATE_KEY]
+        if not isinstance(gate, str) or not gate:
+            sys.exit(
+                f'ERROR: "{RUBRIC_GATE_KEY}" for {classname} in {rubric_path} must be a '
+                f'test method name, e.g. "{RUBRIC_GATE_KEY}": "testNoForbiddenMethod".'
+            )
+        if gate in methods:
+            sys.exit(
+                f'ERROR: {rubric_path} names {classname}.{gate} as "{RUBRIC_GATE_KEY}" but '
+                f"also gives it points. A gate is a condition, not a scored test - remove "
+                f"the points entry."
+            )
+        gates[classname] = gate
+    return gates
 
 
 def load_structure_baseline(tests_dir: Path) -> list[str] | None:
@@ -1549,7 +1661,8 @@ def load_structure_baseline(tests_dir: Path) -> list[str] | None:
 
 def load_manual_review_checks(tests_dir: Path) -> list[dict] | None:
     """Optional tests/manual_review.json: {"checks": [{"pattern": <regex>,
-    "reason": <str>, "exclude_classes": [<class name>, ...],
+    "reason": <str>, "include_classes": [<class name>, ...],
+    "exclude_classes": [<class name>, ...],
     "auto_reject": <bool>}, ...]}. When present, run_manual_review_checks
     scans every student .java file for each pattern and appends a
     "MANUAL REVIEW: ..." note to notes when one matches - by default that's
@@ -1568,7 +1681,12 @@ def load_manual_review_checks(tests_dir: Path) -> list[dict] | None:
     note, it also forces a hard 0% score cap in grade_student (see the
     score-cap section there), for a check whose marking guide says a match
     should be rejected outright rather than just flagged for a human to
-    look at."""
+    look at." "include_classes" is optional too (defaults to every class):
+    when non-empty, only those classes are scanned for that check, which is
+    what a marking-guide rule aimed at ONE class needs. Prefer it over
+    listing every other class in "exclude_classes" - an exclusion list has
+    to be revised every time the assignment gains a class, and it fails
+    OPEN, flagging students rather than missing them."""
     checks_path = tests_dir / "manual_review.json"
     if not checks_path.exists():
         return None
@@ -1596,6 +1714,18 @@ def load_manual_review_checks(tests_dir: Path) -> list[dict] | None:
             sys.exit(
                 f'ERROR: "exclude_classes" in {checks_path} must be a list of class '
                 f"name strings."
+            )
+        include = check.get("include_classes", [])
+        if not isinstance(include, list) or not all(isinstance(c, str) for c in include):
+            sys.exit(
+                f'ERROR: "include_classes" in {checks_path} must be a list of class '
+                f"name strings."
+            )
+        if include and set(include) & set(exclude):
+            sys.exit(
+                f'ERROR: {checks_path} lists the same class in both "include_classes" '
+                f'and "exclude_classes": {", ".join(sorted(set(include) & set(exclude)))}. '
+                f"Pick one - exclude_classes would win and the include entry would do nothing."
             )
         if "auto_reject" in check and not isinstance(check["auto_reject"], bool):
             sys.exit(f'ERROR: "auto_reject" in {checks_path} must be a boolean.')
@@ -1720,7 +1850,9 @@ def run_manual_review_checks(
     prepare_build_dir - Main.java already excluded, packages already
     resolved to their canonical names) against each tests/manual_review.json
     check, skipping a file for a given check when that file's own resolved
-    class name is in the check's "exclude_classes". A match produces one
+    class name is in the check's "exclude_classes", and - when the check has
+    a non-empty "include_classes" - skipping every file whose class name is
+    NOT in it. A match produces one
     note PER CHECK (not per file), listing every matching file and the
     1-based line number of its first match, e.g. "MANUAL REVIEW: <reason> -
     found in Unit.java (line 14), Warrior.java (line 22)".
@@ -1740,8 +1872,18 @@ def run_manual_review_checks(
     for check in checks:
         pattern = re.compile(check["pattern"])
         excluded = set(check.get("exclude_classes", []))
+        # An empty/absent include list means "every class", so the common case is
+        # unchanged. A non-empty one narrows the scan to exactly those classes -
+        # which is what a rule aimed at ONE class needs. Expressing that as a list
+        # of everything else to exclude is both fragile and silently wrong when a
+        # week adds a class: in W6Q2 a rule about StackUtility alone, written as
+        # exclusions, matched the starter's own test files and flagged 123 of 132
+        # students before anyone noticed.
+        included = set(check.get("include_classes", []))
         hits: list[str] = []
         for f in student_files:
+            if included and f.stem not in included:
+                continue
             if f.stem in excluded:
                 continue
             text = f.read_text(encoding="utf-8", errors="ignore")
@@ -1991,6 +2133,7 @@ def grade_student(
     not_an_archive: bool = False,
     manual_review_checks: list[dict] | None = None,
     stub_starter_files: dict[str, str] | None = None,
+    rubric_gates: dict[str, str] | None = None,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -2187,10 +2330,28 @@ def grade_student(
             # see "they shipped the wrong src/" before a screenful of errors that
             # all look like the student never did the work. Also keeps the note
             # clear of truncate()'s cut, which lands inside the compile output.
-            prep_notes = prep_notes + detect_wrong_submission(
+            wrong_submission_notes = detect_wrong_submission(
                 compile_result.output, class_search_root,
                 class_fallback_candidates or frozenset(),
             )
+            prep_notes = prep_notes + wrong_submission_notes
+            if wrong_submission_notes:
+                # Course policy, stated explicitly rather than left to fall out of
+                # the compile failure: source belonging to a DIFFERENT question
+                # scores 0, however good the compiled code beside it turns out to
+                # be. The assignment requires the JAR to be exported with the
+                # source for THIS question, so there is nothing here to mark.
+                # Recording it as a real 0% cap keeps the reason in the audit
+                # trail, and means the rule still holds if some future
+                # wrong-question source happens to compile (Q1 and Q2 of the same
+                # week routinely share most of their class names, so "it compiled"
+                # is not evidence that the right work was submitted).
+                row["score_cap"] = "0%"
+                prep_notes = prep_notes + [
+                    "SCORE CAPPED AT 0%: source submitted belongs to a different "
+                    "question - the assignment requires the JAR to be exported with "
+                    "this question's source"
+                ]
             row["notes"] = "; ".join(prep_notes + [f"COMPILE ERROR: {compile_result.output}"]).strip("; ")
             return row
 
@@ -2210,8 +2371,11 @@ def grade_student(
             if fallback_test_package
             else test_classes
         )
+        # Written after the compile, so it mirrors exactly the source javac saw.
+        materialise_source_tree(build_dir)
         run_result = run_tests(
-            compile_result.classes_dir, reports_dir, junit_jar, timeout, effective_test_classes
+            compile_result.classes_dir, reports_dir, junit_jar, timeout,
+            effective_test_classes, cwd=build_dir,
         )
         if run_result.timed_out:
             row["compiled"] = "yes"
@@ -2249,6 +2413,10 @@ def grade_student(
             for c, methods in (rubric or {}).items()
             for m, pts in methods.items()
             if pts < 0
+        } | {
+            # A gate test is a condition, not points possible - same reasoning as
+            # a penalty test, so it's kept out of the same columns.
+            (c, m) for c, m in (rubric_gates or {}).items()
         }
         passed = [tc for tc in passed_all if (tc.classname, tc.method) not in penalty_keys]
         failed = [tc for tc in failed_all if (tc.classname, tc.method) not in penalty_keys]
@@ -2283,6 +2451,7 @@ def grade_student(
             missing = []
             penalties_applied = []     # negative-points test(s) that fired (test failed)
             penalties_no_result = []   # negative-points test(s) with no pass/fail result
+            earned_by_class: dict[str, float] = {}  # positive points earned, per class (gates)
             for classname, methods in rubric.items():
                 for method, points in methods.items():
                     key = (classname, method)
@@ -2310,12 +2479,58 @@ def grade_student(
                     max_score += points
                     if key in passed_set:
                         score += points
+                        earned_by_class[classname] = earned_by_class.get(classname, 0.0) + points
                     elif key not in found:
                         missing.append(f"{classname}.{method}")
+
+            # Gates, applied after every class has been totalled: a failed gate
+            # forfeits only what THAT class earned, leaving the other classes
+            # intact - which is the whole difference between a gate and a big
+            # penalty (see load_rubric_gates). max_score deliberately keeps the
+            # forfeited points, so the "out of" stays identical for everyone.
+            gates_fired = []
+            gates_no_result = []
+            for classname, gate_method in (rubric_gates or {}).items():
+                key = (classname, gate_method)
+                if key in passed_set:
+                    continue
+                if key not in found:
+                    gates_no_result.append(f"{classname}.{gate_method}")
+                    continue
+                forfeited = earned_by_class.get(classname, 0.0)
+                score -= forfeited
+                detail = next(
+                    (tc.detail for tc in failed_all
+                     if (tc.classname, tc.method) == key and tc.detail),
+                    "",
+                )
+                label = f"{classname}.{gate_method} (forfeits {forfeited:g} point(s) from {classname})"
+                if fallback_matches:
+                    # This submission had no .java for at least one required class
+                    # and was graded from its bytecode (already a 50% cap). A gate
+                    # that READS the student's source - the common shape, e.g.
+                    # "removeRange must not call push/pop" - then fails simply
+                    # because there is no source to read, and the student is
+                    # penalised twice for one problem. Not auto-suppressed here,
+                    # because a gate can equally be an ordinary assertion that
+                    # judges bytecode perfectly well and should fire; the TA is
+                    # told instead, so they can tell the two apart.
+                    label += (" [CHECK BY HAND: no .java source in this submission, so a "
+                              "source-reading gate would fail for that reason alone, on top "
+                              "of the no-source cap]")
+                gates_fired.append(f"{label}: {detail}" if detail else label)
+
             row["score"] = max(0.0, score)
             row["max_score"] = max_score
+            if gates_fired:
+                extra.append(f"{RUBRIC_GATE_PREFIX} " + "; ".join(gates_fired))
+            if gates_no_result:
+                extra.append(
+                    "rubric gate test(s) had no pass/fail result - NOT applied: "
+                    + ", ".join(gates_no_result)
+                )
             if penalties_applied:
-                extra.append("PENALTY applied (rubric): " + "; ".join(penalties_applied))
+                extra.append(f"{RUBRIC_PENALTY_PREFIX} " + "; ".join(penalties_applied))
             if penalties_no_result:
                 extra.append(
                     "rubric penalty test(s) had no pass/fail result - NOT applied: "
@@ -2323,7 +2538,12 @@ def grade_student(
                 )
             if missing:
                 extra.append(f"rubric test(s) not found in results: {', '.join(missing)}")
-            rubric_keys = {(c, m) for c, ms in rubric.items() for m in ms}
+            # Gate tests ARE declared in the rubric, just as a condition rather
+            # than points (load_rubric strips them out of the points mapping), so
+            # they must not be reported as unexpected extras.
+            rubric_keys = {(c, m) for c, ms in rubric.items() for m in ms} | {
+                (c, m) for c, m in (rubric_gates or {}).items()
+            }
             extras_found = found - rubric_keys
             if extras_found:
                 extra.append(
@@ -2634,6 +2854,7 @@ def main() -> None:
     test_files = discover_test_files(tests_dir)
     test_classes = [test_class_fqcn(tf) for tf in test_files]
     rubric = load_rubric(tests_dir)
+    rubric_gates = load_rubric_gates(tests_dir)
     required_classes = load_structure_baseline(tests_dir)
     manual_review_checks = load_manual_review_checks(tests_dir)
     stub_starter_files = load_stub_starter_files(tests_dir)
@@ -2682,6 +2903,10 @@ def main() -> None:
         rubric_line = f"  rubric:      {tests_dir / 'rubric.json'}  (weighted, {rubric_total:g} points total"
         if penalties:
             rubric_line += "; penalty test(s): " + ", ".join(f"{n} {p:g}" for n, p in penalties)
+        if rubric_gates:
+            rubric_line += "; gate test(s): " + ", ".join(
+                f"{c}.{m} zeroes {c}" for c, m in sorted(rubric_gates.items())
+            )
         print(rubric_line + ")")
     else:
         print("  rubric:      none (tests/rubric.json not found - scoring 1 point per test)")
@@ -2733,6 +2958,7 @@ def main() -> None:
             not_an_archive=sub.not_an_archive,
             manual_review_checks=manual_review_checks,
             stub_starter_files=stub_starter_files,
+            rubric_gates=rubric_gates,
         )
         rows.append(row)
         if row["compiled"] == "no":
