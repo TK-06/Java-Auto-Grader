@@ -53,7 +53,9 @@ from pathlib import Path
 
 # Imported, not re-spelled: grade.py owns this marker and writes it into
 # grades.csv, so a copy here would be free to drift out of sync silently.
-from grade import WRONG_SUBMISSION_PREFIX, RUBRIC_GATE_PREFIX, RUBRIC_PENALTY_PREFIX
+from grade import (
+    MIXED_SOURCE_RE, WRONG_SUBMISSION_PREFIX, RUBRIC_GATE_PREFIX, RUBRIC_PENALTY_PREFIX,
+)
 
 CSV_PATH = Path(__file__).parent / "results" / "grades.csv"
 OUT_PATH = Path(__file__).parent / "results" / "report.html"
@@ -133,6 +135,13 @@ def category_of(row):
     notes = row["notes"]
     if "TA OVERRIDE" in notes:
         return "override"
+    # A wrong-project export that COMPILED (grade.py's detect_mixed_source: the
+    # .java covered the given classes, the assessed class came only from its
+    # .class). Ahead of timeout/capped on purpose: "this is not this question's
+    # source" is the fact that decides the 0, and the capped block's hint would
+    # talk about a marking-guide rule instead.
+    if row["compiled"] == "yes" and WRONG_SUBMISSION_PREFIX in notes:
+        return "wrongwork"
     if "timed out" in notes and row["tests_total"] in ("", "0"):
         return "timeout"
     if row["compiled"] == "no" and "STRUCTURE ERROR" in notes:
@@ -270,7 +279,56 @@ def render_reason(row, cat):
     )
 
 
+def _render_compiled_wrong_source(row, notes):
+    """The Wrong submission block for a row that DID compile - grade.py's
+    detect_mixed_source. Same diagnosis -> evidence -> hint shape as the javac
+    branch, but the evidence here is real test results: the tests listed below
+    ran on the student's compiled class, and the page has to say so, or a row
+    of PASS badges next to 0/12 reads as a grading bug."""
+    m = MIXED_SOURCE_RE.search(notes)
+    assessed = [c.strip() for c in m.group(2).split(",")] if m else []
+    present = [c.strip() for c in m.group(1).split(",")] if m else []
+    if assessed:
+        files = ", ".join(f"<code>{esc(c)}.java</code>" for c in assessed)
+        have = ", ".join(f"<code>{esc(c)}</code>" for c in present)
+        what = (f"<p class='diag'>Your submitted file has <code>.java</code> source for other classes of the "
+                f"project ({have}), but <strong>not {files}</strong> &mdash; the class this question asks you to "
+                f"write. So the source that was exported is not this question's: it almost always means "
+                f"another project's <code>src</code> folder was packaged next to this question's compiled "
+                f"classes.</p>")
+    else:
+        what = ("<p class='diag'>Your submitted file has <code>.java</code> source for other classes of the "
+                "project, but not for the class this question asks you to write, so the source that was "
+                "exported is not this question's.</p>")
+    try:
+        total = int(row["tests_total"] or 0)
+        passed = int(row["tests_passed"] or 0)
+    except ValueError:
+        total = passed = 0
+    if total:
+        result = ("passed all of them" if passed == total else f"passed {passed} of {total}")
+        evidence = (f"<p class='diag'>Your work for this question is in the file only as a compiled "
+                    f"<code>.class</code>. The tests listed below were run on that compiled class, and it "
+                    f"{result} &mdash; but they do not earn marks here.</p>")
+    else:
+        evidence = ("<p class='diag'>Your work for this question is in the file only as a compiled "
+                    "<code>.class</code>, and the tests could not be run on it either, so no test results "
+                    "are listed below.</p>")
+    target = ", ".join(f"<code>{esc(c)}.java</code>" for c in assessed) or "this question's <code>.java</code> files"
+    hint = (f"<p class='hint'>Course policy: a submission whose source belongs to a different question scores "
+            f"0, even when the compiled code beside it is correct &mdash; there is no source for this question "
+            f"to mark. Next time, export this question's project with &ldquo;include source&rdquo; ticked, then "
+            f"open the JAR with 7-Zip or WinRAR and check that {target} is inside before you submit. If you "
+            f"believe the right project was submitted, take this to your TA and point them at this "
+            f"paragraph.</p>")
+    raw = f"""<details class="rawerr"><summary>Show the grader's full notes</summary>
+          <pre>{esc(notes)}</pre></details>"""
+    return f'<div class="reason reason-bad">{what}{evidence}{hint}{raw}</div>'
+
+
 def _render_category_reason(row, cat, notes):
+    if cat == "wrongwork" and row["compiled"] == "yes":
+        return _render_compiled_wrong_source(row, notes)
     if cat in ("compile", "wrongwork"):
         err = extract_compile_error(notes)
         missing, is_variant = analyze_compile_error(err)
@@ -348,9 +406,14 @@ def _render_category_reason(row, cat, notes):
         missing = re.findall(r"missing required class (\w+)", notes)
         if missing:
             names = ", ".join(f"<code>{esc(m)}</code>" for m in missing)
-            plural = "classes" if len(missing) > 1 else "class"
-            what = (f"<p class='diag'>This question requires a {plural} the submitted file does not "
-                    f"contain: {names}. Without it there was nothing to compile against the official "
+            # The article and the pronoun both have to follow the count - "requires
+            # a classes ... Without it" is what a student with several missing
+            # classes used to read.
+            several = len(missing) > 1
+            needed = "classes" if several else "a class"
+            them = "them" if several else "it"
+            what = (f"<p class='diag'>This question requires {needed} the submitted file does not "
+                    f"contain: {names}. Without {them} there was nothing to compile against the official "
                     f"test, so no test could run and the score is 0.</p>")
             hint = ("<p class='hint'>What to check: that the JAR you exported is <em>this</em> question's "
                     "project, and that the class name matches the assignment exactly &mdash; a class left "
@@ -745,7 +808,7 @@ def main():
         "gate": "A rule in the marking guide was not met, so the marks for that part were forfeited - the other parts are unaffected.",
         "penalty": "A fixed deduction from a marking-guide rule was applied.",
         "timeout": "The tests did not finish in the time limit and were stopped.",
-        "wrongwork": "The class submitted is missing the method this question asked for - usually the wrong project was exported.",
+        "wrongwork": "The source submitted is not this question's - the method or class this question asks for is missing from it. Usually the wrong project was exported.",
         "compile": "The code did not compile against the official test, so no test could run.",
         "structure": "A class the assignment required was missing, so nothing could be compiled.",
         "nosource": "No usable .java source was found in the submission.",

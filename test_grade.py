@@ -10,6 +10,8 @@ from unittest import mock
 from grade import (
     CONSOLE_REASON_MAX_CHARS,
     RMTREE_RETRY_ATTEMPTS,
+    MIXED_SOURCE_RE,
+    WRONG_SOURCE_CAP_REASON,
     WRONG_SUBMISSION_PREFIX,
     CompileResult,
     ProcResult,
@@ -25,6 +27,7 @@ from grade import (
     compile_submission,
     console_failure_reason,
     console_line_suffix,
+    detect_mixed_source,
     detect_wrong_submission,
     compile_submission_with_fallback,
     compile_with_class_fallback,
@@ -41,6 +44,7 @@ from grade import (
     load_rubric_gates,
     load_stub_starter_files,
     load_structure_baseline,
+    load_student_classes,
     materialise_source_tree,
     normalize_for_stub_compare,
     partition_fallback_matches,
@@ -48,6 +52,7 @@ from grade import (
     resolve_class_fallback_dest,
     rewrite_imports_of_renamed_packages,
     rmtree_with_retry,
+    short_cap_reason,
     run_manual_review_checks,
     strip_imports_of_packages,
     strip_package_declaration,
@@ -2960,6 +2965,195 @@ class TestManualReviewIncludeClasses(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 load_manual_review_checks(tests_dir)
 
+
+class TestDetectMixedSource(unittest.TestCase):
+    """The W7Q2 wrong-project shape: the .java covers the given classes, the
+    class the student writes arrives only as a .class, and it all compiles."""
+
+    REQUIRED = {"BankQueue", "DeQ", "DeQArray", "CDLinkedList"}
+
+    def test_student_class_only_as_bytecode_is_a_wrong_submission(self):
+        notes, wrong = detect_mixed_source(
+            {"DeQ", "DeQArray", "CDLinkedList"}, {"BankQueue"}, self.REQUIRED, {"BankQueue"}
+        )
+
+        self.assertTrue(wrong)
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith(WRONG_SUBMISSION_PREFIX))
+        self.assertIn("BankQueue", notes[0])
+
+    def test_note_parses_back_with_the_shared_regex(self):
+        # build_report.py names the missing file to the student from this.
+        notes, _ = detect_mixed_source(
+            {"DeQ", "CDLinkedList"}, {"BankQueue"}, self.REQUIRED, {"BankQueue"}
+        )
+
+        match = MIXED_SOURCE_RE.search(notes[0])
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), "CDLinkedList, DeQ")
+        self.assertEqual(match.group(2), "BankQueue")
+
+    def test_note_carries_no_bare_separator_that_would_split_it_in_two(self):
+        for student in ({"BankQueue"}, set()):
+            notes, _ = detect_mixed_source(
+                {"DeQ", "CDLinkedList"}, {"BankQueue", "DeQArray"}, self.REQUIRED, student
+            )
+            self.assertNotIn("; ", notes[0])
+
+    def test_only_a_given_class_as_bytecode_is_flagged_not_capped(self):
+        # A student who left out one given file must not lose everything to a
+        # heuristic - their own class has source.
+        notes, wrong = detect_mixed_source(
+            {"BankQueue", "DeQ", "CDLinkedList"}, {"DeQArray"}, self.REQUIRED, {"BankQueue"}
+        )
+
+        self.assertFalse(wrong)
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith("MANUAL REVIEW:"))
+        self.assertNotIn(WRONG_SUBMISSION_PREFIX, notes[0])
+        self.assertNotIn("student_classes", notes[0])
+
+    def test_without_student_classes_it_only_flags_and_says_how_to_decide(self):
+        notes, wrong = detect_mixed_source(
+            {"DeQ", "DeQArray", "CDLinkedList"}, {"BankQueue"}, self.REQUIRED, set()
+        )
+
+        self.assertFalse(wrong)
+        self.assertTrue(notes[0].startswith("MANUAL REVIEW:"))
+        self.assertIn("student_classes", notes[0])
+
+    def test_silent_for_an_ordinary_no_source_submission(self):
+        # Every required class from bytecode is the plain 50% case, not a mix.
+        self.assertEqual(
+            detect_mixed_source(set(), self.REQUIRED, self.REQUIRED, {"BankQueue"}), ([], False)
+        )
+
+    def test_silent_when_the_only_source_is_for_classes_not_required(self):
+        # e.g. a library's Version.java bundled into a no-source runnable jar.
+        self.assertEqual(
+            detect_mixed_source({"Version"}, {"BankQueue"}, self.REQUIRED, {"BankQueue"}),
+            ([], False),
+        )
+
+    def test_silent_when_nothing_came_from_bytecode(self):
+        self.assertEqual(
+            detect_mixed_source(self.REQUIRED, set(), self.REQUIRED, {"BankQueue"}), ([], False)
+        )
+
+
+class TestLoadStudentClasses(unittest.TestCase):
+    def _write(self, tmp: str, data: dict) -> Path:
+        tests_dir = Path(tmp)
+        (tests_dir / "structure.json").write_text(json.dumps(data), encoding="utf-8")
+        return tests_dir
+
+    def test_empty_when_structure_json_is_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(load_student_classes(Path(tmp)), set())
+
+    def test_empty_when_the_key_is_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = self._write(tmp, {"required_classes": ["BankQueue", "DeQ"]})
+            self.assertEqual(load_student_classes(tests_dir), set())
+
+    def test_parses_a_valid_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = self._write(
+                tmp, {"required_classes": ["BankQueue", "DeQ"], "student_classes": ["BankQueue"]}
+            )
+            self.assertEqual(load_student_classes(tests_dir), {"BankQueue"})
+
+    def test_exits_loudly_on_a_malformed_key(self):
+        for bad in ("BankQueue", [], [1]):
+            with tempfile.TemporaryDirectory() as tmp:
+                tests_dir = self._write(
+                    tmp, {"required_classes": ["BankQueue"], "student_classes": bad}
+                )
+                with self.assertRaises(SystemExit):
+                    load_student_classes(tests_dir)
+
+    def test_exits_loudly_on_a_student_class_that_is_not_required(self):
+        # Would otherwise be silently ignored: detect_mixed_source only looks
+        # at required classes.
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = self._write(
+                tmp, {"required_classes": ["DeQ"], "student_classes": ["BankQueue"]}
+            )
+            with self.assertRaises(SystemExit):
+                load_student_classes(tests_dir)
+
+
+class TestGradeStudentMixedSource(unittest.TestCase):
+    """Integration-level, real javac + JUnit: the W7Q2 case in miniature. Item
+    is the class the student writes and arrives only as a precompiled .class;
+    Helper is a given class and arrives as .java - as when another question's
+    src/ folder is exported beside this question's build output."""
+
+    def _grade(self, tmp_path: Path, student_classes):
+        class_dir = tmp_path / "archive"
+        class_dir.mkdir()
+        with tempfile.TemporaryDirectory() as src_tmp:
+            src = Path(src_tmp) / "Item.java"
+            src.write_text(
+                "public class Item { public int getValue() { return 42; } }\n", encoding="utf-8"
+            )
+            subprocess.run(["javac", "-d", str(class_dir), str(src)], check=True, capture_output=True)
+        helper = tmp_path / "src" / "Helper.java"
+        helper.parent.mkdir()
+        helper.write_text("public class Helper { public int one() { return 1; } }\n", encoding="utf-8")
+        test_file = tmp_path / "ItemTest.java"
+        test_file.write_text(
+            "import org.junit.jupiter.api.Test;\n"
+            "import static org.junit.jupiter.api.Assertions.*;\n"
+            "class ItemTest {\n"
+            "    @Test void testGetValue() { assertEquals(42, new Item().getValue() * new Helper().one()); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        build_root = tmp_path / "build_tmp"
+        build_root.mkdir()
+        return grade_student(
+            "10000001", "1", [helper], [], [test_file], ["ItemTest"],
+            find_junit_jar(Path(__file__).resolve().parent / "lib"), build_root,
+            30, False, None, ["Item", "Helper"], None,
+            class_search_root=class_dir,
+            class_fallback_candidates={"Item", "Helper"},
+            student_classes=student_classes,
+        )
+
+    def test_assessed_class_only_as_bytecode_scores_0_but_keeps_the_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._grade(Path(tmp), {"Item"})
+
+        self.assertEqual(row["compiled"], "yes")
+        self.assertEqual(row["tests_passed"], 1)
+        self.assertEqual(row["uncapped_score"], 1)
+        self.assertEqual(row["score"], 0)
+        self.assertEqual(row["score_cap"], "0%")
+        self.assertIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+        self.assertIn("SCORE CAPPED AT 0%", row["notes"])
+        self.assertIn(WRONG_SOURCE_CAP_REASON, row["notes"])
+        self.assertEqual(MIXED_SOURCE_RE.search(row["notes"]).group(2), "Item")
+
+    def test_without_student_classes_it_stays_on_the_no_source_cap_and_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._grade(Path(tmp), None)
+
+        self.assertEqual(row["score"], 0.5)
+        self.assertEqual(row["score_cap"], "50%")
+        self.assertIn("MANUAL REVIEW: mixed source", row["notes"])
+        self.assertNotIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+
+
+class TestShortCapReasonWrongSource(unittest.TestCase):
+    def test_wrong_source_label_wins_over_the_no_source_one_it_travels_with(self):
+        notes = (
+            "SCORE CAPPED AT 0%: used precompiled .class instead of .java source for "
+            "required class(es): Item; " + WRONG_SOURCE_CAP_REASON
+        )
+
+        self.assertEqual(short_cap_reason(notes), "source belongs to another question")
 
 if __name__ == "__main__":
     unittest.main()

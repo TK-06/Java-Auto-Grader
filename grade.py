@@ -127,6 +127,24 @@ MISSING_METHOD_RE = re.compile(
 # spellings must stay in sync.
 WRONG_SUBMISSION_PREFIX = "WRONG SUBMISSION LIKELY:"
 
+# The 0% cap reason for source that belongs to a different question. Shared by
+# both detections (a compile failure naming a method the test calls, see
+# detect_wrong_submission; and source that covers the given classes but not the
+# one the student writes, see detect_mixed_source) so the rule reads the same in
+# grades.csv however it was caught.
+WRONG_SOURCE_CAP_REASON = (
+    "source submitted belongs to a different question - the assignment requires "
+    "the JAR to be exported with this question's source"
+)
+
+# Reads the class lists back out of detect_mixed_source's note. build_report.py
+# imports it to name the missing file to the student, so the note's wording and
+# this pattern live side by side and a test pins them together.
+MIXED_SOURCE_RE = re.compile(
+    re.escape(WRONG_SUBMISSION_PREFIX)
+    + r" this submission's \.java source covers (.+?) but has no \.java for (.+?) - "
+)
+
 # Reserved key inside a tests/rubric.json class block, naming that class's gate
 # test rather than a scored one - see load_rubric_gates. Chosen with dunder
 # affixes so it can never collide with a real JUnit method name.
@@ -775,6 +793,74 @@ def detect_wrong_submission(
             )
             break
     return notes
+
+
+def detect_mixed_source(
+    java_classes: set[str],
+    class_only: set[str],
+    required: set[str],
+    student_classes: set[str],
+) -> tuple[list[str], bool]:
+    """The second shape of a wrong-project export, the one detect_wrong_submission
+    cannot see because nothing fails to compile.
+
+    detect_wrong_submission needs javac to complain about a method the test
+    calls. But when the exported src/ folder belongs to another question that
+    simply has no file for the class this question assesses, there is nothing
+    to complain about: the .java supplies the given classes (Q1 and Q2 of a week
+    share most of them), the assessed class is picked up from its precompiled
+    .class, it compiles, and the row used to land on the ordinary 50% no-source
+    cap. Seen for real in W7Q2: Week 7 Q1's source (SimulateQueue, no
+    BankQueue.java) beside a correct Q2 BankQueue.class scored 6/12 until a TA
+    overrode it to 0.
+
+    The signal is MIXED source among the required classes - some have .java,
+    others only a .class. A normal IDE export with source ticked includes every
+    source file, so that mix almost always means the source tree and the build
+    output came from different projects. A submission with no required .java at
+    all is the ordinary no-source case and is left alone here.
+
+    What happens next depends on WHICH class lacks source:
+      - one the student writes this week (tests/structure.json's
+        "student_classes") -> the source for this question's work is absent while
+        another project's is present: a WRONG SUBMISSION, returned with
+        wrong_source=True so the caller applies the 0% cap
+        (WRONG_SOURCE_CAP_REASON), exactly as for the compile-failure shape;
+      - only given classes, or no student_classes configured -> a MANUAL REVIEW
+        flag and nothing else. A student who forgot one given file should not
+        lose everything to a heuristic; a TA decides.
+
+    Returns (notes, wrong_source). Notes never contain "; ", which is the
+    separator the notes column is joined on.
+    """
+    java_required = java_classes & required
+    graded_from_class = class_only & required
+    if not java_required or not graded_from_class:
+        return [], False
+
+    have = ", ".join(sorted(java_required))
+    assessed = graded_from_class & student_classes
+    if assessed:
+        return [
+            f"{WRONG_SUBMISSION_PREFIX} this submission's .java source covers {have} "
+            f"but has no .java for {', '.join(sorted(assessed))} - the class(es) this "
+            f"question asks the student to write - which could only be graded from a "
+            f"precompiled .class. Source for the other classes without the assessed one "
+            f"means the .java exported belong to a different project or question than "
+            f"the .class beside them"
+        ], True
+
+    hint = (
+        "" if student_classes else
+        " (list the class(es) the student writes as \"student_classes\" in "
+        "tests/structure.json to have this decided automatically)"
+    )
+    return [
+        f"MANUAL REVIEW: mixed source - .java present for {have} but only a "
+        f"precompiled .class for {', '.join(sorted(graded_from_class))}, so the .java "
+        f"may belong to a different project or question than the .class beside them - "
+        f"check by hand{hint}"
+    ], False
 
 
 def resolve_class_fallback_dest(rel_path: Path, referenced_packages: set[str]) -> Path:
@@ -1659,6 +1745,41 @@ def load_structure_baseline(tests_dir: Path) -> list[str] | None:
     return required
 
 
+def load_student_classes(tests_dir: Path) -> set[str]:
+    """Optional "student_classes" key in tests/structure.json: the class(es) the
+    student actually writes or edits this week - the ones a marking guide means
+    by "run the submitted X.java in the solution project". Everything else in
+    required_classes was handed out complete.
+
+    Used by detect_mixed_source to tell a wrong-project export (no source for
+    the assessed class, source for the given ones -> 0%) from a student who
+    merely left out a given file (-> flagged only). Absent -> empty set, and
+    detect_mixed_source only ever flags. Malformed fails loudly at startup, as
+    required_classes does - including a name missing from required_classes,
+    which would otherwise be silently ignored."""
+    structure_path = tests_dir / "structure.json"
+    if not structure_path.exists():
+        return set()
+    with open(structure_path, encoding="utf-8") as f:
+        data = json.load(f)
+    if "student_classes" not in data:
+        return set()
+    student = data["student_classes"]
+    if not isinstance(student, list) or not student or not all(isinstance(c, str) for c in student):
+        sys.exit(
+            f'ERROR: {structure_path} "student_classes" must be a non-empty list of class '
+            f'name strings, e.g. {{"student_classes": ["BankQueue"]}} - or leave the key out.'
+        )
+    required = data.get("required_classes")
+    unknown = sorted(set(student) - set(required if isinstance(required, list) else []))
+    if unknown:
+        sys.exit(
+            f'ERROR: {structure_path} lists {", ".join(unknown)} in "student_classes" but '
+            f'not in "required_classes" - every student class must also be required.'
+        )
+    return set(student)
+
+
 def load_manual_review_checks(tests_dir: Path) -> list[dict] | None:
     """Optional tests/manual_review.json: {"checks": [{"pattern": <regex>,
     "reason": <str>, "include_classes": [<class name>, ...],
@@ -2134,6 +2255,7 @@ def grade_student(
     manual_review_checks: list[dict] | None = None,
     stub_starter_files: dict[str, str] | None = None,
     rubric_gates: dict[str, str] | None = None,
+    student_classes: set[str] | None = None,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -2347,11 +2469,7 @@ def grade_student(
                 # week routinely share most of their class names, so "it compiled"
                 # is not evidence that the right work was submitted).
                 row["score_cap"] = "0%"
-                prep_notes = prep_notes + [
-                    "SCORE CAPPED AT 0%: source submitted belongs to a different "
-                    "question - the assignment requires the JAR to be exported with "
-                    "this question's source"
-                ]
+                prep_notes = prep_notes + [f"SCORE CAPPED AT 0%: {WRONG_SOURCE_CAP_REASON}"]
             row["notes"] = "; ".join(prep_notes + [f"COMPILE ERROR: {compile_result.output}"]).strip("; ")
             return row
 
@@ -2359,6 +2477,26 @@ def grade_student(
             fallback_matches = {**fallback_matches}
             for name in used_needs_import:
                 fallback_matches[name] = [needs_import[name][0]]
+
+        # Here, not in the cap block further down: the timeout / unparseable-XML
+        # / 0-tests-found returns below leave before that block, and a
+        # wrong-project export whose .class cannot even be loaded (W7Q2: built
+        # with a newer Java) must still carry the note and the 0% cap. Only a
+        # successful compile reaches this point - a failed one is handled by
+        # detect_wrong_submission above.
+        mixed_notes, wrong_source = detect_mixed_source(
+            present_java_classes,
+            set(fallback_matches),
+            set(required_classes or []) | (class_fallback_candidates or set()),
+            student_classes or set(),
+        )
+        prep_notes = prep_notes + mixed_notes
+
+        def with_wrong_source_cap(notes: list[str]) -> list[str]:
+            if not wrong_source:
+                return notes
+            row["score_cap"] = "0%"
+            return notes + [f"SCORE CAPPED AT 0%: {WRONG_SOURCE_CAP_REASON}"]
 
         reports_dir = build_dir / "reports"
         reports_dir.mkdir(exist_ok=True)
@@ -2379,23 +2517,25 @@ def grade_student(
         )
         if run_result.timed_out:
             row["compiled"] = "yes"
-            row["notes"] = "; ".join(prep_notes + [f"test run timed out after {timeout}s"]).strip("; ")
+            row["notes"] = "; ".join(
+                with_wrong_source_cap(prep_notes + [f"test run timed out after {timeout}s"])
+            ).strip("; ")
             return row
 
         row["compiled"] = "yes"
         try:
             test_cases = collect_test_results(reports_dir)
         except ET.ParseError as exc:
-            row["notes"] = "; ".join(
+            row["notes"] = "; ".join(with_wrong_source_cap(
                 prep_notes + [f"could not parse JUnit XML reports ({exc}): {truncate(run_result.stdout)}"]
-            ).strip("; ")
+            )).strip("; ")
             return row
 
         if not test_cases:
-            row["notes"] = "; ".join(
+            row["notes"] = "; ".join(with_wrong_source_cap(
                 prep_notes
                 + ["compiled OK but 0 tests found (student may have renamed/overwritten a class referenced by the test)"]
-            ).strip("; ")
+            )).strip("; ")
             return row
 
         passed_all = [tc for tc in test_cases if tc.status == "passed"]
@@ -2589,6 +2729,13 @@ def grade_student(
         if stub_reject_reason:
             cap *= 0.0
             cap_reasons.append(stub_reject_reason)
+        if wrong_source:
+            # detect_mixed_source: the assessed class came only from bytecode while
+            # the .java covered other classes - another question's source. Course
+            # policy, same as the compile-failure shape: 0, however well the
+            # compiled class did, which uncapped_score still records.
+            cap *= 0.0
+            cap_reasons.append(WRONG_SOURCE_CAP_REASON)
         row["uncapped_score"] = row["score"]
         if cap < 1.0:
             row["score"] = min(row["score"], cap * row["max_score"])
@@ -2695,6 +2842,9 @@ JAVAC_FIRST_ERROR_RE = re.compile(r"error:\s*([^|]+)")
 
 
 CAP_REASON_LABELS = [
+    # First: a wrong-source 0% cap also carries the 50% no-source reason (the
+    # assessed class WAS graded from its .class), and the first match wins.
+    (WRONG_SOURCE_CAP_REASON, "source belongs to another question"),
     ("manual review check(s) require rejection", "rejected by manual review"),
     ("matches the unedited starter template", "stub-only submission"),
     ("used precompiled .class instead of .java source", "failed to include source file"),
@@ -2856,6 +3006,7 @@ def main() -> None:
     rubric = load_rubric(tests_dir)
     rubric_gates = load_rubric_gates(tests_dir)
     required_classes = load_structure_baseline(tests_dir)
+    student_classes = load_student_classes(tests_dir)
     manual_review_checks = load_manual_review_checks(tests_dir)
     stub_starter_files = load_stub_starter_files(tests_dir)
     class_fallback_candidates = collect_required_class_names(test_files) | set(required_classes or [])
@@ -2912,6 +3063,9 @@ def main() -> None:
         print("  rubric:      none (tests/rubric.json not found - scoring 1 point per test)")
     if required_classes is not None:
         print(f"  structure:   {tests_dir / 'structure.json'}  (required classes: {', '.join(required_classes)})")
+        if student_classes:
+            print(f"  student classes: {', '.join(sorted(student_classes))} - graded only from a .class while "
+                  f"other required classes have .java = source from another question, capped at 0%")
     else:
         print("  structure:   none (tests/structure.json not found - no structure check)")
     if manual_review_checks is not None:
@@ -2959,6 +3113,7 @@ def main() -> None:
             manual_review_checks=manual_review_checks,
             stub_starter_files=stub_starter_files,
             rubric_gates=rubric_gates,
+            student_classes=student_classes,
         )
         rows.append(row)
         if row["compiled"] == "no":
@@ -3009,12 +3164,13 @@ def main() -> None:
         print(f"  {failed_count} submission(s) failed to compile - build dir(s) saved under {failed_build_root}")
     wrong_submissions = sum(1 for r in rows if WRONG_SUBMISSION_PREFIX in r["notes"])
     if wrong_submissions:
-        # Called out separately from the compile-failure count it is a subset
-        # of: these are the 0s most likely to be worth a second look, and a run
-        # over a full class is long enough that the per-student lines above have
-        # scrolled away by the time it finishes.
+        # Called out separately: these are the 0s most likely to be worth a
+        # second look, and a run over a full class is long enough that the
+        # per-student lines above have scrolled away by the time it finishes.
+        # Not "of those" (the compile failures): detect_mixed_source catches a
+        # wrong-project export that compiled fine.
         print(
-            f"  {wrong_submissions} of those look like a WRONG SUBMISSION - the .java "
+            f"  {wrong_submissions} submission(s) look like a WRONG SUBMISSION - the .java "
             f"exported are a different assignment from the .class beside them (see notes)"
         )
 

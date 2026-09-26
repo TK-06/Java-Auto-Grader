@@ -61,6 +61,14 @@ What every submission can expect, regardless of week:
   requires the JAR to be exported with *this* question's source; without it there is
   nothing to mark. The bytecode evidence is reported, not scored — a TA who wants to check
   what the student actually built can, and can override by hand.
+  The same rule covers the shape that **does** compile: the other question's source simply
+  has no file for the class this question assesses, so the given classes come from `.java`
+  and the assessed class only from its `.class`. When `tests/structure.json` names that
+  class in `student_classes` (see [2c](#2c-optional-required-project-structure)), this is
+  also a `WRONG SUBMISSION LIKELY:` with a 0% cap — and because it compiled, the tests
+  still run on the `.class`, so `uncapped_score` records how the compiled work did. Without
+  `student_classes`, or when only a *given* class lacks source, it is flagged
+  `MANUAL REVIEW: mixed source` and left on the ordinary 50% no-source cap.
 - **Submitted as bare `.java` source instead of a packaged archive** (a loose `.java` file,
   or an unpackaged folder of them, dropped straight into `submissions/` — commonly an LMS
   bulk-download artifact bundling two individually-uploaded files together) → **0**, rejected
@@ -411,6 +419,29 @@ and an extra class sitting unused alongside the required ones doesn't break that
 this in place, a submission missing one or more required classes is rejected *before*
 compiling — `compiled` is `no` and `notes` starts with `STRUCTURE ERROR:`, listing every
 missing class, not just the first.
+
+**Optional `student_classes`** — the class(es) the student actually writes or edits this
+week, as opposed to the ones handed out complete (the class a marking guide means by "run
+the submitted `X.java` in the solution project"):
+
+```json
+{
+    "required_classes": ["BankQueue", "DeQ", "DeQArray", "CDLinkedList"],
+    "student_classes": ["BankQueue"]
+}
+```
+
+It decides one thing: what a submission with **mixed** source means — `.java` for some
+required classes, only a precompiled `.class` for others. A normal IDE export with source
+ticked includes every source file, so that mix almost always means the `src/` folder and the
+build output came from different projects (W7Q2: Week 7 Q1's source beside a correct Q2
+`BankQueue.class`). If a class listed here is one of the `.class`-only ones, the row gets
+`WRONG SUBMISSION LIKELY:` and a 0% cap (see **Grading policy**); if only given classes are,
+it gets a `MANUAL REVIEW: mixed source` flag and nothing else, since a student who left out
+one given file should not lose everything to a heuristic. A submission with *no* required
+`.java` at all is the ordinary no-source case either way (50%, see 2d). Every name here must
+also be in `required_classes`, or `grade.py` exits at startup; leaving the key out means
+mixed source is only ever flagged, never capped.
 
 **No `tests/structure.json`?** Nothing changes — no structure check runs, exactly as
 before. Entirely opt-in, per week.
