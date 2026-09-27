@@ -1,0 +1,15 @@
+# Every pull request into main needs an approving review from @TK-06 - the
+# "protectMain" ruleset requires code-owner review. TAs can push branches
+# and open pull requests; approving them is the instructor's call.
+#
+# The whole repository rather than a list of paths: grade.py,
+# check_lateness.py and extract_submissions.py decide scores, lib/ holds the
+# JUnit runner that decides pass/fail, build_report.py and README.md are what
+# students are told, and .gitignore keeps student work and answer keys out of
+# this public repo. That is nearly every file, and the tests and audit tools
+# should not change unreviewed either.
+#
+# This rule also covers this file, so a pull request cannot remove it without
+# the same approval. List only @TK-06 on a line: when a line names several
+# owners, an approval from any one of them is enough.
+*       @TK-06
