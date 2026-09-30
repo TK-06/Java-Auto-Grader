@@ -70,6 +70,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -169,20 +170,61 @@ CONSTANT_POOL_PAYLOAD_SIZES = {
 CONSTANT_POOL_DOUBLE_WIDTH_TAGS = frozenset({5, 6})
 
 
+def _clear_readonly_and_retry(func, path, _exc) -> None:
+    """shutil.rmtree error handler: clear the read-only attribute on the path
+    that could not be removed, then try that one operation again.
+
+    Windows refuses to delete a directory carrying FILE_ATTRIBUTE_READONLY
+    ("[WinError 5] Access is denied"), and OneDrive sets that attribute on
+    every folder it syncs - measured at about 35 seconds after the folder is
+    created. build_tmp/ and results/failed_builds/ are recreated on every run,
+    so inside a OneDrive folder each run left folders the NEXT run could not
+    delete. A second failure (a real lock, a real permission problem)
+    propagates to the caller unchanged."""
+    os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree(path: Path) -> None:
+    """shutil.rmtree that also removes read-only entries (see
+    _clear_readonly_and_retry). onexc replaced onerror in Python 3.12; the
+    handler ignores its third argument, so it fits both signatures."""
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+    else:
+        shutil.rmtree(path, onerror=_clear_readonly_and_retry)
+
+
+def rmtree_quietly(path: Path) -> None:
+    """Best-effort removal for cleanup that must never stop grading - the
+    per-student build dir, the end-of-run build_tmp/. Previously
+    shutil.rmtree(..., ignore_errors=True), which silently gave up on a
+    read-only folder and left it behind."""
+    try:
+        _rmtree(path)
+    except OSError:
+        pass
+
+
 def rmtree_with_retry(path: Path) -> None:
-    """shutil.rmtree, but tolerant of a file still being transiently locked
-    by something outside our control - a cloud-sync client (OneDrive,
-    Dropbox) hashing/uploading a file the instant after it's created is the
-    common case if this project lives inside a synced folder, but Windows
-    Search indexing or antivirus real-time scanning can do the same thing.
-    That lock is normally released within a second or two on its own, so
-    retrying briefly turns a hard crash into (at worst) a few seconds of
-    waiting - only a lock that's still held after every retry becomes a
-    real, reported error."""
+    """shutil.rmtree, but tolerant of the two things a synced or scanned
+    folder does to a directory tree on Windows.
+
+    A read-only attribute - OneDrive sets one on every folder it syncs - is
+    cleared and the deletion retried on the spot (see
+    _clear_readonly_and_retry).
+
+    A file still transiently locked by something outside our control - a
+    cloud-sync client hashing/uploading a file the instant after it's
+    created, Windows Search indexing, or antivirus real-time scanning - is
+    normally released within a second or two on its own, so the whole
+    removal is retried briefly: at worst a few seconds of waiting, and only a
+    lock that's still held after every retry becomes a real, reported
+    error."""
     last_exc: OSError | None = None
     for attempt in range(RMTREE_RETRY_ATTEMPTS):
         try:
-            shutil.rmtree(path)
+            _rmtree(path)
             return
         except OSError as exc:
             last_exc = exc
@@ -190,8 +232,9 @@ def rmtree_with_retry(path: Path) -> None:
                 time.sleep(RMTREE_RETRY_DELAY_SECONDS)
     sys.exit(
         f"ERROR: could not remove {path} after {RMTREE_RETRY_ATTEMPTS} attempts ({last_exc}). "
-        f"Something still has a file inside it open - close any editor/terminal browsing that "
-        f"folder, let antivirus/cloud-sync settle, and try again."
+        f"Something is still holding a file inside it open, or you lack permission to delete "
+        f"it - close any editor/terminal browsing that folder, let antivirus/cloud-sync settle, "
+        f"and try again."
     )
 
 
@@ -2760,10 +2803,10 @@ def grade_student(
                 # warning in main()) don't overwrite each other's copy.
                 audit_dir = failed_build_root / f"{student_id}__{build_key}"
                 if audit_dir.exists():
-                    shutil.rmtree(audit_dir, ignore_errors=True)
+                    rmtree_quietly(audit_dir)
                 shutil.copytree(build_dir, audit_dir)
             if not keep_build:
-                shutil.rmtree(build_dir, ignore_errors=True)
+                rmtree_quietly(build_dir)
 
 
 def sort_rows(rows: list[dict]) -> list[dict]:
@@ -3144,7 +3187,7 @@ def main() -> None:
             print(f"         build dir: {build_root / build_key}")
 
     if not args.keep_build and build_root.exists():
-        shutil.rmtree(build_root, ignore_errors=True)
+        rmtree_quietly(build_root)
 
     write_csv(rows, out_path)
     write_scores_csv(rows, scores_out_path)
