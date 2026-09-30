@@ -1,6 +1,9 @@
 import json
+import os
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -51,6 +54,7 @@ from grade import (
     prepare_build_dir,
     resolve_class_fallback_dest,
     rewrite_imports_of_renamed_packages,
+    rmtree_quietly,
     rmtree_with_retry,
     short_cap_reason,
     run_manual_review_checks,
@@ -1372,6 +1376,54 @@ class TestRmtreeWithRetry(unittest.TestCase):
                     rmtree_with_retry(target)
 
             self.assertEqual(mock_sleep.call_count, RMTREE_RETRY_ATTEMPTS - 1)
+    # OneDrive flags every folder it syncs read-only, and Windows then refuses
+    # to delete it - the run after any run failed on build_tmp/ or
+    # results/failed_builds/ with "[WinError 5] Access is denied". The
+    # read-only DIRECTORY attribute only exists on Windows.
+    def _read_only_tree(self, root: Path) -> Path:
+        target = root / "victim"
+        (target / "a" / "b").mkdir(parents=True)
+        (target / "a" / "b" / "file.txt").write_text("x", encoding="utf-8")
+        for d in (target / "a" / "b", target / "a", target):
+            os.chmod(d, stat.S_IREAD)
+            if not os.stat(d).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
+                self.skipTest("could not mark a directory read-only here")
+        return target
+
+    @unittest.skipUnless(sys.platform == "win32", "read-only directories are a Windows attribute")
+    def test_the_fixture_reproduces_the_onedrive_failure(self):
+        # Guards the next test: plain shutil.rmtree must really fail on it.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._read_only_tree(Path(tmp))
+
+            with self.assertRaises(PermissionError):
+                shutil.rmtree(target)
+
+            rmtree_with_retry(target)  # leave nothing behind for the tempdir cleanup
+
+    @unittest.skipUnless(sys.platform == "win32", "read-only directories are a Windows attribute")
+    def test_removes_read_only_nested_folders_without_retrying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._read_only_tree(Path(tmp))
+
+            with mock.patch("grade.time.sleep") as mock_sleep:
+                rmtree_with_retry(target)
+
+            self.assertFalse(target.exists())
+            mock_sleep.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "win32", "read-only directories are a Windows attribute")
+    def test_quiet_removal_also_clears_read_only_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._read_only_tree(Path(tmp))
+
+            rmtree_quietly(target)
+
+            self.assertFalse(target.exists())
+
+    def test_quiet_removal_never_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rmtree_quietly(Path(tmp) / "does-not-exist")
 
 
 class TestBareStudentId(unittest.TestCase):
