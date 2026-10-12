@@ -41,11 +41,14 @@ same-package access no import can grant (a package-private field like
 `l.header`), with those copies recompiled into that same package. It falls
 back to a clear "can't be used" note only if both attempts fail; see
 compile_with_class_fallback, derive_fallback_test_package and
-partition_fallback_matches. A submission that only yielded gradable content
+partition_fallback_matches. A submission whose archive holds no compiled
+.class of its own at all (source only - a JAR exported without its compiled
+output; see archive_has_project_classes) is capped at 50% too, the mirror of
+the no-source rule. A submission that only yielded gradable content
 after digging past a plain unzip (a .zip wrapping a nested jar, say) is
 capped at 90%,
-independent of whether source was ultimately found. Both apply together
-multiplicatively (0.5 x 0.9 = 45%) when both are true. uncapped_score always
+independent of whether source was ultimately found. These apply together
+multiplicatively (0.5 x 0.9 = 45%) when more than one is true. uncapped_score always
 records the pre-cap result; score_cap shows the cap percentage applied
 ("" when none); notes explains why ("SCORE CAPPED AT n%: ...").
 
@@ -136,6 +139,15 @@ WRONG_SUBMISSION_PREFIX = "WRONG SUBMISSION LIKELY:"
 WRONG_SOURCE_CAP_REASON = (
     "source submitted belongs to a different question - the assignment requires "
     "the JAR to be exported with this question's source"
+)
+
+# A submission whose archive holds no compiled .class at all - source only. The
+# assignment text says "Jar file without .class will only get half the score
+# (for code) at most", the mirror image of the no-.java rule (class fallback).
+# Owned here and imported by build_report.py, never re-spelled there.
+NO_CLASS_CAP_REASON = (
+    "the submission contains no compiled .class files (source only) - assignment "
+    "policy: a JAR without .class files earns at most half credit"
 )
 
 # Reads the class lists back out of detect_mixed_source's note. build_report.py
@@ -422,6 +434,21 @@ def _resolves_to_kept(declared: str, keep_packages: set[str]) -> bool:
     )
 
 
+def _qualified_reference_re(package: str) -> re.Pattern:
+    """`iterator.Iterator`, `util.io.Reader`: the package's whole dotted name,
+    a dot, then a type name.
+
+    The capital after the dot is what separates a type from a member - a local
+    variable that merely shares the package's name (`iterator.hasNext()`) is
+    not a reference to the package, and Java's own naming convention makes the
+    capital reliable. The look-behind stops `x.iterator.Foo` (a member chain
+    ending in a field) and a longer package's tail from matching, and the
+    escaped dotted name keeps `util` from matching inside `util.io.Reader`.
+    An imprecise match can only KEEP a package that the submission itself
+    declares (see expand_keep_packages), never invent one."""
+    return re.compile(r"(?<![\w.])" + re.escape(package) + r"\.[A-Z]\w*")
+
+
 def expand_keep_packages(
     student_texts: list[str],
     referenced_packages: set[str],
@@ -442,7 +469,9 @@ def expand_keep_packages(
     A package is kept once some file whose OWN package is kept imports from it,
     repeated to a fixpoint so a chain (kept -> a -> b) is covered. Only packages
     this submission actually declares can be added: an import of something
-    genuinely absent is a real compile error, not a packaging artifact.
+    genuinely absent is a real compile error, not a packaging artifact. A
+    reference by qualified name counts the same as an import: `iterator.Iterator`
+    in the body keeps `iterator`.
 
     Never adds a package declaring a class the tests can only see unqualified in
     the unnamed package (infer_unnamed_package_classes) - keeping that one named
@@ -469,6 +498,8 @@ def expand_keep_packages(
             if match and match.group(1) in unnamed_only_classes:
                 blocked.add(pkg)
 
+    qualified = {pkg: _qualified_reference_re(pkg) for pkg in declared}
+
     keep = set(referenced_packages)
     changed = True
     while changed:
@@ -477,8 +508,14 @@ def expand_keep_packages(
             if not _resolves_to_kept(pkg, keep):
                 continue
             for text in texts:
-                for m in IMPORT_RE.finditer(text):
-                    dep = m.group(1)
+                # `import dep.X;` AND a bare `dep.X` in the body: an IDE that
+                # writes fully qualified names (or a student who never added
+                # the import) is the same dependency. W10Q1 had exactly one
+                # such submission, and it scored 0 for a packaging artifact.
+                deps = {m.group(1) for m in IMPORT_RE.finditer(text)}
+                deps |= {d for d, pattern in qualified.items()
+                         if d != pkg and pattern.search(text)}
+                for dep in deps:
                     # A package that already resolves to a required one (the
                     # `Q1_toStudent.logic` -> `logic` prefix case) must be left
                     # for strip_package_declaration to REWRITE. Pinning it here
@@ -1057,6 +1094,47 @@ def find_nested_archives(root: Path) -> list[Path]:
     return sorted(root.rglob("*.zip")) + sorted(root.rglob("*.jar"))
 
 
+# Trees a "runnable jar with dependencies" export drags in. A .class under one
+# of these is a bundled LIBRARY, not the student's compiled work, so it must not
+# satisfy "the submission carries compiled classes". Prefixes are matched against
+# the path inside the archive with forward slashes.
+LIBRARY_CLASS_PREFIXES = (
+    "org/junit/", "org/opentest4j/", "org/apiguardian/", "org/hamcrest/",
+    "junit/", "META-INF/",
+)
+
+
+def _is_library_class(relative: str) -> bool:
+    name = relative.replace("\\", "/").lstrip("/")
+    return name == "module-info.class" or name.startswith(LIBRARY_CLASS_PREFIXES)
+
+
+def archive_has_project_classes(root: Path) -> bool:
+    """True when the extracted submission under `root` carries at least one
+    compiled .class that is the student's own project - either on disk, or
+    inside any .zip/.jar nested in the tree.
+
+    The nested listing matters: a `.zip` holding `src/` plus an exported jar is
+    NOT source-only, and graded as such it would lose half its score for a
+    packaging detail the assignment never asked about. Only the archive's name
+    list is read, never its content. Bundled library classes are ignored
+    (LIBRARY_CLASS_PREFIXES), so a jar whose only .class files are JUnit's is
+    still source-only."""
+    for class_file in find_class_files(root):
+        if not _is_library_class(class_file.relative_to(root).as_posix()):
+            return True
+    for nested in find_nested_archives(root):
+        try:
+            with zipfile.ZipFile(nested) as zf:
+                if any(
+                    n.endswith(".class") and not _is_library_class(n) for n in zf.namelist()
+                ):
+                    return True
+        except (zipfile.BadZipFile, OSError):
+            continue
+    return False
+
+
 @dataclass
 class Submission:
     student_id: str
@@ -1087,6 +1165,11 @@ class Submission:
     # find_class_fallback_files' own, separate, intentional path for a
     # runnable-jar export that dropped its source, not a format violation.
     not_an_archive: bool = False
+    # True when the extracted archive holds no compiled .class of the student's
+    # own at all (see archive_has_project_classes) - the "Jar file without
+    # .class will only get half the score" rule in grade_student. Left False for
+    # every submission shape that is not an extracted .zip/.jar.
+    no_compiled_classes: bool = False
 
 
 def discover_submissions(submissions_dir: Path, extract_root: Path) -> list[Submission]:
@@ -1169,6 +1252,7 @@ def discover_submissions(submissions_dir: Path, extract_root: Path) -> list[Subm
                 student_id, java_files, notes,
                 class_search_root=extract_dir,
                 zip_needed_deeper_extraction=zip_needed_deeper_extraction,
+                no_compiled_classes=not archive_has_project_classes(extract_dir),
             ))
     return results
 
@@ -2299,6 +2383,7 @@ def grade_student(
     stub_starter_files: dict[str, str] | None = None,
     rubric_gates: dict[str, str] | None = None,
     student_classes: set[str] | None = None,
+    no_compiled_classes: bool = False,
 ) -> dict:
     row = {
         "student_id": student_id,
@@ -2736,8 +2821,11 @@ def grade_student(
 
         # Score cap policy: a submission graded from precompiled .class instead of
         # .java (fallback_matches non-empty - see above) is capped at 50% of
-        # max_score, since there's no source to verify; a submission that only
-        # yielded gradable content after digging past a plain unzip
+        # max_score, since there's no source to verify; a submission whose
+        # archive holds no compiled .class at all (no_compiled_classes - see
+        # archive_has_project_classes) is also capped at 50%, the mirror of the
+        # no-source rule - both can never be true at once; a submission that
+        # only yielded gradable content after digging past a plain unzip
         # (zip_needed_deeper_extraction - see discover_submissions) is capped at
         # 90%, for improper packaging independent of whether source was found;
         # a submission that tripped an "auto_reject": true manual_review.json
@@ -2758,6 +2846,9 @@ def grade_student(
                 "used precompiled .class instead of .java source for required class(es): "
                 + ", ".join(sorted(fallback_matches))
             )
+        if no_compiled_classes:
+            cap *= 0.5
+            cap_reasons.append(NO_CLASS_CAP_REASON)
         if zip_needed_deeper_extraction:
             cap *= 0.9
             cap_reasons.append(
@@ -2892,6 +2983,7 @@ CAP_REASON_LABELS = [
     ("matches the unedited starter template", "stub-only submission"),
     ("used precompiled .class instead of .java source", "failed to include source file"),
     ("submission required extracting a nested/deeper archive", "failed to submit as .jar"),
+    (NO_CLASS_CAP_REASON, "failed to include .class files"),
 ]
 
 
@@ -3157,6 +3249,7 @@ def main() -> None:
             stub_starter_files=stub_starter_files,
             rubric_gates=rubric_gates,
             student_classes=student_classes,
+            no_compiled_classes=sub.no_compiled_classes,
         )
         rows.append(row)
         if row["compiled"] == "no":

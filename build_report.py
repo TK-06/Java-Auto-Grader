@@ -20,6 +20,12 @@ loaded below), then run this file, then publish OUT_PATH with the Artifact
 tool (title = a short name for that week's assignment topic, e.g. "Cell
 Simulation Grading"; favicon = one emoji tied to the subject).
 
+The students whose only attachment was ANOTHER question's file are listed
+under a `no_valid_q<N>` key - the one extract_submissions.py prints for the
+question it ran for (`no_valid_q1` for Q1, `no_valid_q2` for Q2). This engine
+is question-agnostic, so EVERY key of that shape is read; it used to read only
+`no_valid_q2` and silently dropped the list for any other question.
+
 WRITE EVERY STUDENT-FACING STRING FOR THE STUDENT, NOT THE GRADER. This
 page is the only explanation most of them get. Three rules this file has
 already been bitten by, all fixed in W5Q2:
@@ -53,8 +59,12 @@ from pathlib import Path
 
 # Imported, not re-spelled: grade.py owns this marker and writes it into
 # grades.csv, so a copy here would be free to drift out of sync silently.
+# NO_CLASS_CAP_REASON is the same kind of marker - the capped block below matches
+# it to choose the "include the compiled .class files" hint, so the text it looks
+# for is by construction the text grade.py wrote.
 from grade import (
     MIXED_SOURCE_RE, WRONG_SUBMISSION_PREFIX, RUBRIC_GATE_PREFIX, RUBRIC_PENALTY_PREFIX,
+    NO_CLASS_CAP_REASON,
 )
 
 CSV_PATH = Path(__file__).parent / "results" / "grades.csv"
@@ -68,7 +78,14 @@ AUTOMATED_POINTS = _config["automated_points"]
 TOTAL_POINTS = _config.get("total_points")
 MANUAL_COMPONENT_DESC = _config.get("manual_component_desc")
 NOT_SUBMITTED = _config.get("not_submitted", [])
-NO_VALID_Q2 = _config.get("no_valid_q2", [])
+# Students whose attachment was another question's file. extract_submissions.py
+# prints them as "no_valid_q<N>" for whichever question N it ran for, and this
+# engine is question-agnostic, so every such key is read (it used to read only
+# no_valid_q2, which silently dropped the list for any other question).
+NO_VALID_SUBMISSION = sorted({
+    sid for key, ids in _config.items()
+    if re.fullmatch(r"no_valid_q\d+", key) for sid in ids
+})
 NOTE_REDACTIONS = _config.get("note_redactions", {})
 # Optional {student_id: "TA NOTE: ..." or "TA OVERRIDE: ..."}, appended to that
 # student's notes before anything reads them (see main).
@@ -449,21 +466,48 @@ def _render_category_reason(row, cat, notes):
         extra = ""
         if "more recent version of the Java Runtime" in row["failure_details"]:
             extra = '<p><strong>On top of that:</strong> the compiled classes were built with a newer Java version than the grading machine supports, so those classes could not even be loaded for testing.</p>'
+        # grade.py's reason text starts lower-case because it is spliced into a
+        # "; "-joined notes string. Capitalised for DISPLAY only: the checks below
+        # match substrings of the raw `reason`, so they must not see the changed
+        # letter (a reason that began "no .java source" would stop matching).
+        reason_shown = reason[:1].upper() + reason[1:]
         # The hint has to match the reason for THIS cap, not assume the no-source one.
+        #
+        # Additive, not an if/elif chain: caps combine multiplicatively, so one row
+        # can carry two reasons (a source-only archive that also needed a deeper
+        # extraction is capped at 45%, `SCORE CAPPED AT 45%: <no-class>; <nested>`).
+        # An elif chain explained only whichever branch it reached first and left
+        # the student to guess where the other half of the 55% went.
+        hints = []
         if pct == "0":
-            hint = ('This cap is a marking-guide rule that sets the score to 0 outright, so it '
-                    'replaces whatever the tests below did - any PASS listed there does not earn points here.')
-        elif "precompiled .class" in reason or "no .java source" in reason:
-            hint = ('Assignment policy: a JAR submitted without its <code>.java</code> source earns at most '
-                    'half credit, even when the compiled code is correct. Tick "include source" when you '
-                    'export the JAR, then open it with 7-Zip/WinRAR and confirm the .java files are in there.')
-        elif "deeper archive" in reason or "nested" in reason:
-            hint = ('Submit the project archive itself, not an archive wrapping another archive - the '
-                    'grader had to dig through an extra layer to find anything gradable.')
+            # A 0% cap replaces the score outright, so the per-reason advice below
+            # would be misleading beside it - this one stands alone.
+            hints.append('This cap is a marking-guide rule that sets the score to 0 outright, so it '
+                         'replaces whatever the tests below did - any PASS listed there does not earn points here.')
         else:
-            hint = 'The cap above is applied on top of the test results listed below.'
+            # The mirror image of the no-source rule just below, and the advice is
+            # the mirror image too: this student HAS source and is missing the
+            # build output. grade.py owns the text (NO_CLASS_CAP_REASON), so it is
+            # matched, not re-spelled - and matched whole rather than by the bare
+            # substring ".class", which the no-source reason ("used precompiled
+            # .class instead of .java source") contains as well.
+            if NO_CLASS_CAP_REASON in reason:
+                hints.append('Assignment policy: a JAR submitted without its compiled <code>.class</code> files '
+                             'earns at most half credit, even when the source is correct. When you export the JAR, '
+                             'make sure the compiled classes are included, then open it with 7-Zip/WinRAR and '
+                             'confirm both .java and .class files are inside.')
+            if "precompiled .class" in reason or "no .java source" in reason:
+                hints.append('Assignment policy: a JAR submitted without its <code>.java</code> source earns at most '
+                             'half credit, even when the compiled code is correct. Tick "include source" when you '
+                             'export the JAR, then open it with 7-Zip/WinRAR and confirm the .java files are in there.')
+            if "deeper archive" in reason or "nested" in reason:
+                hints.append('Submit the project archive itself, not an archive wrapping another archive - the '
+                             'grader had to dig through an extra layer to find anything gradable.')
+            if not hints:
+                hints.append('The cap above is applied on top of the test results listed below.')
+        hint = " ".join(hints)
         return f"""<div class="reason reason-warn">
-          <p><strong>Capped at {pct}%.</strong> {esc(reason)}</p>{extra}
+          <p><strong>Capped at {pct}%.</strong> {esc(reason_shown)}</p>{extra}
           <p class="hint">{hint}</p>
         </div>"""
     if cat == "override":
@@ -684,7 +728,7 @@ h1 { font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp
 .rawerr { margin-top: .9rem; border-top: 1px solid var(--line); padding-top: .6rem; }
 .rawerr > summary { cursor: pointer; font-size: .82rem; color: var(--ink-soft); list-style: none; }
 .rawerr > summary::-webkit-details-marker { display: none; }
-.rawerr > summary::before { content: "b8 "; display: inline-block; transition: transform .15s; }
+.rawerr > summary::before { content: "\\25B8 "; display: inline-block; transition: transform .15s; }
 .rawerr[open] > summary::before { transform: rotate(90deg); }
 .rawerr > summary:hover { color: var(--ink); }
 .diag { margin: 0 0 .5rem; }
@@ -778,7 +822,7 @@ def main():
         c = category_of(r)
         cats[c] = cats.get(c, 0) + 1
 
-    total_roster = len(rows) + len(NOT_SUBMITTED) + len(NO_VALID_Q2)
+    total_roster = len(rows) + len(NOT_SUBMITTED) + len(NO_VALID_SUBMISSION)
 
     stats_html = f"""
     <div class="stats">
@@ -797,7 +841,7 @@ def main():
         ("nosource", "No source"), ("override", "TA review"), ("missing", "No submission"),
     ]
     catbar_html = '<div class="catbar">' + "".join(
-        f'<span class="chip chip-{c} filterchip" data-cat="{c}">{label} ({cats.get(c, 0) if c != "missing" else len(NOT_SUBMITTED) + len(NO_VALID_Q2)})</span>'
+        f'<span class="chip chip-{c} filterchip" data-cat="{c}">{label} ({cats.get(c, 0) if c != "missing" else len(NOT_SUBMITTED) + len(NO_VALID_SUBMISSION)})</span>'
         for c, label in catbar_defs if cats.get(c, 0) > 0 or c == "missing"
     ) + "</div>"
 
@@ -816,7 +860,7 @@ def main():
         "missing": "No gradable file was received for this assignment.",
     }
     shown = [c for c, _ in catbar_defs
-             if cats.get(c, 0) > 0 or (c == "missing" and (NOT_SUBMITTED or NO_VALID_Q2))]
+             if cats.get(c, 0) > 0 or (c == "missing" and (NOT_SUBMITTED or NO_VALID_SUBMISSION))]
     legend_html = ('<ul class="legend">' + "".join(
         f'<li><b>{label}</b> &mdash; {CATEGORY_MEANING[c]}</li>'
         for c, label in catbar_defs if c in shown) + "</ul>")
@@ -824,8 +868,11 @@ def main():
     body_rows = [render_graded_row(r) for r in rows]
     for sid in NOT_SUBMITTED:
         body_rows.append(render_missing_row(sid, "No file was received for this assignment at all, per MyCourseVille's own submission log."))
-    for sid in NO_VALID_Q2:
-        body_rows.append(render_missing_row(sid, "A file was submitted, but it wasn't for this question - the attachment on record is unrelated to this assignment. Not gradable as submitted."))
+    # "unrelated to this assignment" was wrong for these students and read as an
+    # accusation: the attachment on record IS a real submission, just for the
+    # other question of the week. Say that, and say why there is nothing to mark.
+    for sid in NO_VALID_SUBMISSION:
+        body_rows.append(render_missing_row(sid, "A file was submitted, but it was for a different question, so there was nothing to grade here. Not gradable as submitted."))
     body_rows.sort(key=lambda h: re.search(r'data-id="(\d+)"', h).group(1))
 
     if TOTAL_POINTS:
