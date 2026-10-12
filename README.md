@@ -25,9 +25,10 @@ For every student submission, it:
 alongside it in `grades.csv` so you can see what it was out of. A submission that doesn't
 compile scores 0. A submission missing `.java` source is still graded from a matching
 `.class` file when one is found, capped at 50%/90%/45% depending on why — see **Compiled-only
-submissions** below. A submission can also be capped at 0% despite compiling and passing
-every test, if a `tests/manual_review.json` check with `"auto_reject": true` matched — see
-**Manual-review flags** below.
+submissions** below. The reverse — `.java` source with no compiled `.class` anywhere in the
+archive — is capped at 50% as well, see **Grading policy** below. A submission can also be
+capped at 0% despite compiling and passing every test, if a `tests/manual_review.json` check
+with `"auto_reject": true` matched — see **Manual-review flags** below.
 
 If different test cases are worth different marks (see **Weighted scoring** below), drop a
 `rubric.json` next to that week's tests and `score`/`max_score` become the weighted point
@@ -83,10 +84,21 @@ What every submission can expect, regardless of week:
   still graded, from the bytecode, but capped at **50%** of that week's max score, since
   there's no source to verify. See [2d. Compiled-only
   submissions](#2d-compiled-only-submissions-class-instead-of-java).
+- **Submitted only `.java` source - no compiled `.class` anywhere** (a JAR exported without its
+  compiled output) → still graded, from the source, but capped at **50%** of that week's max
+  score. The assignment text says "Jar file without .class will only get half the score (for
+  code) at most"; this is the mirror image of the no-source rule above. The check looks at the
+  extracted tree **and** at the file list of any `.zip`/`.jar` nested inside it, and ignores
+  bundled library classes (`org/junit/...` and similar), so a `.zip` holding the source plus a
+  jar that does carry the classes is not capped, while a jar whose only `.class` files are
+  JUnit's is. `notes` reads `SCORE CAPPED AT 50%: the submission contains no compiled .class
+  files (source only) - assignment policy: a JAR without .class files earns at most half
+  credit`. Combines multiplicatively with the 90% nested-archive cap (**45%**), like every
+  other cap here.
 - **Submitted a `.zip` that needed extra digging** to find anything gradable (e.g. a `.zip`
   wrapping a `.jar` instead of the project directly) → capped at **90%**, regardless of
   whether what was eventually found was source or compiled classes. Combines
-  multiplicatively with the 50% rule above when both apply (**45%** total).
+  multiplicatively with either 50% rule above when one applies (**45%** total).
 - **Matched a `tests/manual_review.json` check with `"auto_reject": true`** (opt-in, per
   week — e.g. a marking guide that says to reject an instanceof-chain workaround) → capped
   at **0%**, even though it compiled and passed every test. Combines multiplicatively with
@@ -253,7 +265,9 @@ is fine. Both the stripped package and any import cleaned up alongside it are no
 **A package the tests never name is still kept when a required package depends on it.**
 The keep-set starts from what `tests/*.java` declares and imports, then grows along the
 submission's own package graph: if a file whose package is kept `import`s from another
-package the submission declares, that one is kept too, repeated until nothing new is added.
+package the submission declares - or names one of its types by its full name, like
+`iterator.Iterator` with no `import` - that one is kept too, repeated until nothing new is
+added.
 Without this, a week whose official tests are packaged breaks for the whole class — W6Q1's
 test imports `stack` and `myInterface` but never `lnkedList`, so `lnkedList` was flattened
 while `stack` stayed named, and Java cannot reference the unnamed package from a named one.
@@ -517,6 +531,12 @@ completely unrelated class) makes `Foo` *look* present, its real `thatpackage/Fo
 never used, and every class in that package that depended on it fails to compile — scoring
 a working submission 0. Only the exact `<package>/<Name>.class` path is accepted, and only
 for classes that are already required this week.
+
+The opposite case — `.java` source with no compiled `.class` anywhere in the archive — is not
+a fallback at all: it is graded from the source as normal and capped at 50% by its own rule
+under **Grading policy** above. The two caps do not apply to the same submission in practice,
+since this section needs a required class with no source and that rule needs an archive with
+no `.class` of the student's own at all.
 
 ### 2e. (Optional) Manual-review flags for things JUnit can't catch
 
@@ -804,6 +824,15 @@ gradebook upload.
   is wrapped so a batch of 60 always finishes even if one submission is garbage.
 - Results are parsed from JUnit's XML reports (not the printed text summary), so per-test
   pass/fail is exact even if a student's code prints to stdout/stderr during a test.
+- **A package named only by its fully qualified name is kept like an imported one.** The
+  keep-set walk described under **Weekly workflow §2** follows a kept package's `import`s *and*
+  its qualified references in the body: a `BST` that writes `iterator.Iterator` with no
+  `import iterator...` keeps `iterator` as a named package, so the submission compiles. It
+  used to flatten that package to the unnamed one while its dependent stayed named, which
+  gave `package iterator does not exist` and a 0 for code that compiles fine in the student's
+  own project. The match needs a capitalised type name after the package's whole dotted name,
+  so a variable that merely shares a package's name (`iterator.hasNext()`) is not read as a
+  reference; and only packages the submission itself declares are ever kept, never invented.
 
 ## Verifying a change before it ships
 
@@ -870,6 +899,7 @@ grading/                  <- repo root
   audit_forbidden.py       <- optional; re-checks a "these methods are forbidden" rule over the
                               real call graph and reports where the official text scan disagrees
   dupe_check.py            <- optional; groups students whose student-written code is identical
+  audit_given_code.py      <- optional; lists students who changed code they were given
   README.md
   lib/
     junit-platform-console-standalone-*.jar   <- committed; see lib/README.md to update it
@@ -882,6 +912,18 @@ grading/                  <- repo root
     mcvScore.csv             <- gitignored output, bare student IDs for MyCourseVille
   build_tmp/               <- gitignored scratch space, created/cleaned automatically
 ```
+
+`audit_given_code.py` (optional, read-only; run from this folder) lists the students who edited
+code the assignment *gave* them — a changed or deleted given method, a deleted `main`, an added
+field — which the official tests usually cannot see. It compares each `<Class>.java` in a
+student's jar/zip with the unedited given file member by member (name + parameter types;
+whitespace, comments, string contents and package qualifiers on starter-imported types such as
+`java.util.` are ignored) and skips the methods named in `--allow`:
+`python audit_given_code.py --allow height,rebuild --classes Tree --diff`. It is evidence
+for a human, never a score consequence. `--starter` can be any folder of unedited given files
+(`<Class>.java` each), not only `tests/starter/`; a file where 80%+ of the given members differ
+collapses to one `WHOLE FILE DIFFERS` line (almost always another question's export) — but only
+for a class with at least 3 given members; with fewer, each member is listed.
 
 ## Ideas for extending
 

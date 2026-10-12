@@ -14,11 +14,13 @@ from grade import (
     CONSOLE_REASON_MAX_CHARS,
     RMTREE_RETRY_ATTEMPTS,
     MIXED_SOURCE_RE,
+    NO_CLASS_CAP_REASON,
     WRONG_SOURCE_CAP_REASON,
     WRONG_SUBMISSION_PREFIX,
     CompileResult,
     ProcResult,
     add_imports,
+    archive_has_project_classes,
     bare_student_id,
     check_output_writable,
     check_structure_baseline,
@@ -35,6 +37,7 @@ from grade import (
     compile_submission_with_fallback,
     compile_with_class_fallback,
     discover_submissions,
+    expand_keep_packages,
     find_class_fallback_files,
     find_class_files,
     find_java_files,
@@ -296,6 +299,86 @@ class TestKeepsPackageADependencyNeeds(unittest.TestCase):
             user_text = (build_dir / "StackArray.java").read_text(encoding="utf-8")
             self.assertIn("package lnkedList;", dep_text, notes)
             self.assertIn("import lnkedList.CDLinkedList;", user_text, notes)
+            self.assertFalse([n for n in notes if "stripped package" in n], notes)
+
+
+class TestKeepsPackageNamedOnlyByQualifiedReference(unittest.TestCase):
+    """A package a kept package names by FULL name (`iterator.Iterator`, no
+    `import`) must stay a package. expand_keep_packages used to follow only
+    `import` lines, so such a package was flattened to the unnamed package while
+    its dependent stayed named - `package iterator does not exist`, a 0 for code
+    that compiles fine in the instructor's own project."""
+
+    BST = (
+        "package bst;\n\nimport java.util.ArrayList;\n\npublic class BST {\n"
+        "\tpublic iterator.Iterator findMin() { return new iterator.TreeIterator(null); }\n}\n"
+    )
+    ITERATOR = "package iterator;\n\npublic interface Iterator {}\n"
+    TREE_ITERATOR = "package iterator;\n\npublic class TreeIterator implements Iterator {}\n"
+
+    def test_qualified_reference_keeps_the_package(self):
+        keep = expand_keep_packages([self.BST, self.ITERATOR, self.TREE_ITERATOR], {"bst"})
+        self.assertEqual(keep, {"bst", "iterator"})
+
+    def test_member_access_on_a_variable_named_like_a_package_is_not_a_reference(self):
+        bst = (
+            "package bst;\n\npublic class BST {\n"
+            "\tvoid walk(java.util.Iterator<Integer> iterator) { iterator.hasNext(); }\n}\n"
+        )
+        keep = expand_keep_packages([bst, self.ITERATOR], {"bst"})
+        self.assertEqual(keep, {"bst"})
+
+    def test_qualified_reference_to_a_package_the_submission_lacks_is_ignored(self):
+        bst = "package bst;\n\npublic class BST { java.util.List<Integer> items; }\n"
+        self.assertEqual(expand_keep_packages([bst], {"bst"}), {"bst"})
+
+    def test_package_the_tests_only_see_unqualified_stays_blocked(self):
+        keep = expand_keep_packages(
+            [self.BST, self.ITERATOR, self.TREE_ITERATOR], {"bst"}, {"Iterator"}
+        )
+        self.assertEqual(keep, {"bst"})
+
+    def test_dotted_package_name_is_matched_whole_not_by_its_prefix(self):
+        app = "package app;\n\npublic class App { util.io.Reader r; }\n"
+        reader = "package util.io;\n\npublic class Reader {}\n"
+        other = "package util;\n\npublic class Other {}\n"
+        keep = expand_keep_packages([app, reader, other], {"app"})
+        self.assertEqual(keep, {"app", "util.io"})
+
+    def test_chain_of_qualified_references_reaches_a_fixpoint(self):
+        a = "package a;\n\npublic class A { b.B b; }\n"
+        b = "package b;\n\npublic class B { c.C c; }\n"
+        c = "package c;\n\npublic class C {}\n"
+        self.assertEqual(expand_keep_packages([a, b, c], {"a"}), {"a", "b", "c"})
+
+    def test_prepare_build_dir_keeps_the_declaration_and_does_not_strip_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            test_file = root / "tests" / "TreeTest.java"
+            test_file.write_text(
+                "package test;\n\nimport bst.BST;\n"
+                "public class TreeTest { BST t = new BST(); }\n",
+                encoding="utf-8",
+            )
+            files = []
+            for name, text in (
+                ("BST.java", self.BST),
+                ("Iterator.java", self.ITERATOR),
+                ("TreeIterator.java", self.TREE_ITERATOR),
+            ):
+                path = root / "src" / name
+                path.write_text(text, encoding="utf-8")
+                files.append(path)
+
+            build_dir, notes = prepare_build_dir("q", files, [test_file], root / "build")
+
+            self.assertIn(
+                "package iterator;",
+                (build_dir / "Iterator.java").read_text(encoding="utf-8"),
+                notes,
+            )
             self.assertFalse([n for n in notes if "stripped package" in n], notes)
 
 
@@ -1563,6 +1646,86 @@ class TestDiscoverSubmissionsNestedArchive(unittest.TestCase):
             self.assertEqual(sub.class_search_root, extract_root / "0")
 
 
+class TestArchiveHasProjectClasses(unittest.TestCase):
+    """The no-.class cap must fire on a source-only archive and on NOTHING
+    else: a zip wrapping the source plus a jar that carries the classes, or a
+    class-only export, are not source-only."""
+
+    def _write(self, root: Path, rel: str, data: bytes = b"\xca\xfe\xba\xbe") -> Path:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def _jar(self, path: Path, names: list[str]) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w") as zf:
+            for name in names:
+                zf.writestr(name, b"\xca\xfe\xba\xbe" if name.endswith(".class") else "x")
+        return path
+
+    def test_source_only_tree_has_no_project_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "bst/BST.java", b"public class BST {}")
+            self.assertFalse(archive_has_project_classes(root))
+
+    def test_a_project_class_file_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "bst/BST.java", b"public class BST {}")
+            self._write(root, "bin/bst/BST.class")
+            self.assertTrue(archive_has_project_classes(root))
+
+    def test_bundled_junit_classes_alone_do_not_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "bst/BST.java", b"public class BST {}")
+            self._write(root, "org/junit/jupiter/api/Test.class")
+            self._write(root, "META-INF/versions/9/module-info.class")
+            self.assertFalse(archive_has_project_classes(root))
+
+    def test_class_inside_a_nested_jar_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "src/bst/BST.java", b"public class BST {}")
+            self._jar(root / "export.jar", ["bst/BST.class", "bst/BST.java"])
+            self.assertTrue(archive_has_project_classes(root))
+
+    def test_library_only_nested_jar_does_not_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "src/bst/BST.java", b"public class BST {}")
+            self._jar(root / "lib" / "junit-api.jar", ["org/junit/jupiter/api/Test.class"])
+            self.assertFalse(archive_has_project_classes(root))
+
+
+class TestDiscoverSubmissionsFlagsSourceOnly(unittest.TestCase):
+    def _make(self, directory: Path, name: str, entries: dict[str, bytes]) -> None:
+        with zipfile.ZipFile(directory / name, "w") as zf:
+            for entry, data in entries.items():
+                zf.writestr(entry, data)
+
+    def test_flag_is_set_only_for_the_source_only_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subs = Path(tmp) / "submissions"
+            subs.mkdir()
+            self._make(subs, "10000001.jar", {"bst/BST.java": b"public class BST {}"})
+            self._make(subs, "10000002.jar", {
+                "bst/BST.java": b"public class BST {}", "bst/BST.class": b"\xca\xfe\xba\xbe"})
+            inner = Path(tmp) / "inner.jar"
+            with zipfile.ZipFile(inner, "w") as zf:
+                zf.writestr("bst/BST.class", b"\xca\xfe\xba\xbe")
+            self._make(subs, "10000003.zip", {
+                "src/bst/BST.java": b"public class BST {}", "export.jar": inner.read_bytes()})
+
+            found = {s.student_id: s for s in discover_submissions(subs, Path(tmp) / "x")}
+
+            self.assertTrue(found["10000001"].no_compiled_classes)
+            self.assertFalse(found["10000002"].no_compiled_classes)
+            self.assertFalse(found["10000003"].no_compiled_classes)
+
+
 class TestDiscoverSubmissionsBareClass(unittest.TestCase):
     def test_bare_class_file_gets_its_own_isolated_search_root(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2273,6 +2436,87 @@ class TestGradeStudentScoreCap(unittest.TestCase):
             self.assertEqual(row["score"], 1)
             self.assertEqual(row["score_cap"], "")
             self.assertNotIn("SCORE CAPPED", row["notes"])
+
+    def test_source_only_submission_is_capped_at_50_percent(self):
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_dir = tmp_path / "src"
+            src_dir.mkdir()
+            item_file = src_dir / "Item.java"
+            item_file.write_text(
+                "public class Item { public int getValue() { return 42; } }\n", encoding="utf-8"
+            )
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000007", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_fallback_candidates={"Item"},
+                no_compiled_classes=True,
+            )
+
+            self.assertEqual(row["compiled"], "yes", row["notes"])
+            self.assertEqual(row["uncapped_score"], 1)
+            self.assertEqual(row["score"], 0.5)
+            self.assertEqual(row["score_cap"], "50%")
+            self.assertIn("SCORE CAPPED AT 50%: " + NO_CLASS_CAP_REASON, row["notes"])
+
+    def test_source_only_in_a_zip_that_needed_deeper_extraction_stacks_to_45_percent(self):
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_dir = tmp_path / "src"
+            src_dir.mkdir()
+            item_file = src_dir / "Item.java"
+            item_file.write_text(
+                "public class Item { public int getValue() { return 42; } }\n", encoding="utf-8"
+            )
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000008", "1", [item_file], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                zip_needed_deeper_extraction=True,
+                class_fallback_candidates={"Item"},
+                no_compiled_classes=True,
+            )
+
+            self.assertEqual(row["score"], 0.45)
+            self.assertEqual(row["score_cap"], "45%")
+            self.assertIn(NO_CLASS_CAP_REASON, row["notes"])
+            self.assertIn("nested/deeper archive", row["notes"])
+
+    def test_class_only_submission_stays_at_50_percent_not_25(self):
+        junit_jar = self._junit_jar()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            class_dir = tmp_path / "precompiled"
+            self._compile_item_class(class_dir)
+            test_file = self._item_test_file(tmp_path)
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+
+            row = grade_student(
+                "10000009", "1", [], [], [test_file], ["ItemTest"], junit_jar, build_root,
+                30, False, None, None, failed_build_root,
+                class_search_root=class_dir,
+                class_fallback_candidates={"Item"},
+                no_compiled_classes=False,
+            )
+
+            self.assertEqual(row["score"], 0.5)
+            self.assertNotIn(NO_CLASS_CAP_REASON, row["notes"])
 
     def test_class_missing_entirely_with_no_student_files_at_all(self):
         # No .java anywhere and nothing to search for a .class fallback either -
@@ -3206,6 +3450,12 @@ class TestShortCapReasonWrongSource(unittest.TestCase):
         )
 
         self.assertEqual(short_cap_reason(notes), "source belongs to another question")
+
+    def test_no_class_cap_has_its_own_console_label(self):
+        self.assertEqual(
+            short_cap_reason("SCORE CAPPED AT 50%: " + NO_CLASS_CAP_REASON),
+            "failed to include .class files",
+        )
 
 if __name__ == "__main__":
     unittest.main()
