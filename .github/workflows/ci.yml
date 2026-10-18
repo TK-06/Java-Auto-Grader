@@ -1,0 +1,91 @@
+# Two checks on every push to main and every pull request into it:
+#
+# privacy-guard - this repository is public, and .gitignore only protects the
+#   paths it names. A backup folder created mid-week inside the repo (once: a
+#   whole class's grades.csv) is not ignored, so the next `git add -A` would
+#   publish it. This fails the run if any tracked file looks like student work,
+#   results or answer-key material. See CONTRIBUTING.md, "The privacy rule".
+#
+# tests - the full unit suite on the grading environment: Windows (the read-
+#   only-folder tests only run there) and JDK 25 (many tests compile and run
+#   real Java against the committed lib/ JUnit jar). It reads nothing from
+#   tests/, submissions/ or results/, so it needs no course material.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only token and no secrets, so a pull request from a fork is safe to run.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  privacy-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: No student data or answer keys are tracked
+        shell: bash
+        run: |
+          set -euo pipefail
+          # First grep: anything that could be private. Second grep: the only
+          # tracked exceptions - the .gitkeep placeholders that keep the
+          # gitignored folders in a fresh clone, and the committed JUnit jar.
+          offending=$(git -c core.quotepath=off ls-files \
+            | grep -Ei \
+                -e '^(submissions|results|tests|scratchPad)/' \
+                -e '\.(csv|zip|html|bak|java|class|docx|pdf|jar)$' \
+                -e '(^|/)(hs_err|replay)_pid[^/]*$' \
+            | grep -Ev \
+                -e '^(submissions|results|tests|scratchPad)/\.gitkeep$' \
+                -e '^lib/junit-platform-console-standalone-[^/]*\.jar$' \
+            || true)
+          if [ -n "$offending" ]; then
+            while IFS= read -r f; do
+              echo "::error file=$f::tracked file looks like student work, results or answer-key material"
+            done <<< "$offending"
+            echo "Remove these from the index (git rm --cached <path>) and keep them outside the repository."
+            exit 1
+          fi
+          echo "OK: $(git ls-files | wc -l) tracked files, none private-looking."
+
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      # Fail fast with a clear message if the runner's javac is not JDK 25,
+      # rather than as dozens of confusing compile failures inside the suite.
+      - name: Check javac is JDK 25
+        shell: bash
+        run: |
+          javac -version
+          javac -version 2>&1 | grep -q '^javac 25'
+
+      # Pinned so a pytest release cannot turn the build red on its own.
+      - name: Install pytest
+        run: python -m pip install pytest==9.1.1
+
+      - name: Run the unit suites
+        run: python -m pytest -q
