@@ -847,8 +847,11 @@ Verify **both** sides before shipping a change to `grade.py` or to a week's `tes
 **1. The unit suites.**
 
 ```bash
-python -m pytest test_grade.py test_check_lateness.py -q
+python -m pytest -q
 ```
+
+This runs all three suites (`test_grade.py`, `test_audit_given_code.py`,
+`test_check_lateness.py`) - the same command CI runs on every pull request.
 
 **2. The TA side — synthetic submissions, against scratch paths so `results/` is untouched.**
 Build a JAR of the reference solution and one of the untouched starter, then:
@@ -901,6 +904,9 @@ grading/                  <- repo root
   dupe_check.py            <- optional; groups students whose student-written code is identical
   audit_given_code.py      <- optional; lists students who changed code they were given
   README.md
+  CONTRIBUTING.md          <- how to change the tool safely: privacy rule, tests, versions, PRs
+  .github/
+    workflows/ci.yml       <- CI: privacy guard on tracked files + the unit suites on Windows/JDK 25
   lib/
     junit-platform-console-standalone-*.jar   <- committed; see lib/README.md to update it
     README.md
