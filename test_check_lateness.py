@@ -1,6 +1,10 @@
 import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
+from zoneinfo import ZoneInfoNotFoundError
 
-from check_lateness import apply_late_caps, parse_cap_fraction
+import check_lateness
+from check_lateness import apply_late_caps, bangkok_tz, decode_timestamp, parse_cap_fraction, parse_deadline
 
 
 def grades_row(**overrides):
@@ -143,6 +147,31 @@ class TestApplyLateCaps(unittest.TestCase):
         mcv_rows, report = apply_late_caps(rows, late_by_student)
 
         self.assertAlmostEqual(float(mcv_rows[0]["score"]), 0.0)
+
+
+class TestBangkokWithoutTzData(unittest.TestCase):
+    """Windows has no IANA time-zone database; zoneinfo only finds one when the
+    third-party tzdata package is installed. Without it this module used to
+    raise at import (CI's Windows runner, any fresh TA machine). The fallback
+    must give exactly the same answers as the real zone."""
+
+    def fallback(self):
+        with mock.patch.object(check_lateness, "ZoneInfo", side_effect=ZoneInfoNotFoundError("Asia/Bangkok")):
+            return bangkok_tz()
+
+    def test_missing_database_falls_back_to_fixed_utc_plus_7(self):
+        tz = self.fallback()
+        self.assertEqual(tz.utcoffset(None), timedelta(hours=7))
+
+    def test_fallback_reads_deadlines_and_submission_times_the_same(self):
+        with mock.patch.object(check_lateness, "BANGKOK", self.fallback()):
+            deadline = parse_deadline("2026-10-20T23:59:00")
+            # epoch 1792553400 x 10000, the MyCourseVille filename encoding
+            submitted = decode_timestamp("Item_Q1-505-17925534000000.jar")
+        self.assertEqual(deadline.astimezone(timezone.utc), datetime(2026, 10, 20, 16, 59, tzinfo=timezone.utc))
+        self.assertEqual(submitted.replace(tzinfo=None), datetime(2026, 10, 21, 10, 30))
+        self.assertEqual(submitted.utcoffset(), timedelta(hours=7))
+        self.assertEqual(check_lateness.days_late(submitted, deadline), 1)
 
 
 if __name__ == "__main__":

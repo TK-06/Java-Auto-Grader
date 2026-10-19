@@ -2,7 +2,7 @@
   "name": "dsa-grading",
   "displayName": "DSA Grading",
   "description": "The weekly auto-grading runbook as a guided checklist: each step explains itself, takes its inputs in a form, and runs with live progress.",
-  "version": "6.4.0",
+  "version": "7.0.1",
   "publisher": "TK-06",
   "license": "MIT",
   "private": true,

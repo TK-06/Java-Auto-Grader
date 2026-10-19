@@ -69,13 +69,29 @@ import shutil
 import sys
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import grade
 
-BANGKOK = ZoneInfo("Asia/Bangkok")
+
+def bangkok_tz():
+    """Asia/Bangkok, or an exact fixed UTC+7 stand-in when the IANA database is
+    missing. Windows ships no time-zone database of its own: zoneinfo finds one
+    only if the third-party `tzdata` package happens to be installed, so on a
+    fresh machine (and on CI's Windows runner) ZoneInfo("Asia/Bangkok") raised
+    at import - taking extract_submissions.py, which imports this module, down
+    with it. Thailand has been UTC+7 with no daylight saving since 1920, so the
+    fixed offset gives the same answer for every submission time; nothing here
+    prints the zone's name (times are labelled "ICT" by hand)."""
+    try:
+        return ZoneInfo("Asia/Bangkok")
+    except ZoneInfoNotFoundError:
+        return timezone(timedelta(hours=7), "ICT")
+
+
+BANGKOK = bangkok_tz()
 
 # Trailing -<14-digit>.<ext>: epoch seconds * 10000, UTC.
 TS_SCALED_RE = re.compile(r"-(\d{14})\.[A-Za-z0-9]+$")

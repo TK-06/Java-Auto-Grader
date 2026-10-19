@@ -175,6 +175,11 @@ which of the four §2 checks you ran.
   isn't a locked file. `grade.py` clears the attribute and retries (`_clear_readonly_and_retry`).
   Any new code that deletes a folder it created must go through the same path. `attrib <folder>`
   shows whether `R` is set.
+- **Windows has no time-zone database.** `ZoneInfo("Asia/Bangkok")` only works there when the
+  third-party `tzdata` package happens to be installed, so it passed on one TA machine and crashed
+  `check_lateness.py` (and `extract_submissions.py`, which imports it) on CI. `bangkok_tz()` falls
+  back to a fixed UTC+7, which is exact because Thailand has no daylight saving. Test zone-dependent
+  code with `python -s`, which hides user-installed packages like `tzdata`.
 - **Windows' 260-character path limit.** Extracting a bulk export with its original
   `<studentID>/<very long filename>` structure fails with `FileNotFoundError`. Extract to short
   synthetic names and keep the real name only in memory.
