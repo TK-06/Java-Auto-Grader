@@ -1,0 +1,135 @@
+{
+  "name": "dsa-grading",
+  "displayName": "DSA Grading",
+  "description": "The weekly auto-grading runbook as a guided checklist: each step explains itself, takes its inputs in a form, and runs with live progress.",
+  "version": "6.4.0",
+  "publisher": "TK-06",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TK-06/Java-Auto-Grader.git",
+    "directory": "vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/grade.py"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dsaGrading",
+          "title": "DSA Grading",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "dsaGrading": [
+        {
+          "type": "webview",
+          "id": "dsaGrading.steps",
+          "name": "Steps"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "dsaGrading.openCurrentStep",
+        "title": "Open the current step",
+        "category": "DSA Grading"
+      },
+      {
+        "command": "dsaGrading.refresh",
+        "title": "Refresh",
+        "category": "DSA Grading",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dsaGrading.openTerminal",
+        "title": "Open a terminal in the grading folder",
+        "category": "DSA Grading",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "dsaGrading.newWeek",
+        "title": "Start a new week (clears ticks and remembered inputs)",
+        "category": "DSA Grading"
+      },
+      {
+        "command": "dsaGrading.moveToRight",
+        "title": "Move the checklist to the right side bar",
+        "category": "DSA Grading"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "dsaGrading.openTerminal",
+          "when": "view == dsaGrading.steps",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dsaGrading.refresh",
+          "when": "view == dsaGrading.steps",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "DSA Grading",
+      "properties": {
+        "dsaGrading.gradingDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The grader folder (the one holding `grade.py`). Empty = auto-detect: a workspace folder holding `grade.py`, or its `grading/` child."
+        },
+        "dsaGrading.setupRepoDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The private setup archive (holding `restore-week.sh`). Empty = `../TA-grading-setup` next to the grader folder."
+        },
+        "dsaGrading.materialsDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Where the professor's weekly materials live (assignment, marking guide, `Solution/`, `toStudent/`). Only used for the *Open folder* button in step 1."
+        },
+        "dsaGrading.python": {
+          "type": "string",
+          "default": "python",
+          "description": "The Python 3.13 executable used to run the grader's scripts."
+        },
+        "dsaGrading.bash": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Bash used for `restore-week.sh`. Empty = Git for Windows' `bash.exe` if installed, else `bash` on PATH."
+        },
+        "dsaGrading.openOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the current step's page when a grading workspace opens."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "test": "tsc -p . && node --test out/test/*.test.js",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/vscode": "1.100.0",
+    "@vscode/vsce": "4.0.0",
+    "typescript": "5.9.3"
+  }
+}

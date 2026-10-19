@@ -147,6 +147,12 @@ auditable even when a cap brought the final `score` down.
    with no download step. See `lib/README.md` only if you need to bump it to a newer version
    later; keep just the one jar in that folder either way.
 
+**Prefer a guided version of the weekly workflow?** `vscode-extension/` is a VS Code extension
+that turns it into a checklist. Each step explains itself, takes its inputs in a form, runs the
+same script described below with live progress, and offers a prompt to hand an agent. It never
+runs git. See [vscode-extension/README.md](vscode-extension/README.md) to install it. Everything
+below still applies; the extension only remembers the order and the flags for you.
+
 ## Weekly workflow
 
 ### 1. Put this week's official test file(s) in `tests/`
@@ -905,8 +911,11 @@ grading/                  <- repo root
   audit_given_code.py      <- optional; lists students who changed code they were given
   README.md
   CONTRIBUTING.md          <- how to change the tool safely: privacy rule, tests, versions, PRs
+  vscode-extension/        <- optional VS Code extension: the weekly workflow as a guided
+                              checklist with Run buttons; see vscode-extension/README.md
   .github/
-    workflows/ci.yml       <- CI: privacy guard on tracked files + the unit suites on Windows/JDK 25
+    workflows/ci.yml       <- CI: privacy guard on tracked files, the unit suites on Windows/JDK 25,
+                              and the VS Code extension's tests + packaging
   lib/
     junit-platform-console-standalone-*.jar   <- committed; see lib/README.md to update it
     README.md

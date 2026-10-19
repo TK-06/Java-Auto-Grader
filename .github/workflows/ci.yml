@@ -10,6 +10,8 @@
 #   only-folder tests only run there) and JDK 25 (many tests compile and run
 #   real Java against the committed lib/ JUnit jar). It reads nothing from
 #   tests/, submissions/ or results/, so it needs no course material.
+#
+# extension - the VS Code extension's tests and packaging (see below).
 name: CI
 
 on:
@@ -89,3 +91,29 @@ jobs:
 
       - name: Run the unit suites
         run: python -m pytest -q
+
+  # The VS Code extension in vscode-extension/: its unit tests (which also check
+  # that every note marker it counts still appears in grade.py), and that it
+  # still packages into an installable .vsix. Pure node, so Ubuntu is enough.
+  extension:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: vscode-extension
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - run: npm ci
+
+      - name: Compile and run the extension's tests
+        run: npm test
+
+      - name: Package the .vsix
+        run: npx vsce package --no-dependencies --out dsa-grading.vsix

@@ -33,3 +33,10 @@ __pycache__/
 
 .claude/
 docs/superpowers/
+
+# the VS Code extension's build output and dependencies (see vscode-extension/README.md) -
+# rebuilt by `npm ci && npm run compile`, never committed; a packaged .vsix is a build
+# artifact too, installed locally rather than kept in history
+vscode-extension/node_modules/
+vscode-extension/out/
+*.vsix
