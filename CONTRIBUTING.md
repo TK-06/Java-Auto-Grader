@@ -27,6 +27,7 @@ javac -version       # must print 25
 | JDK | 25 | A JDK, not a JRE. It's the grading environment's requirement, see the README's **One-time setup** |
 | pytest | 9.x | Only for the test suites. CI pins `9.1.1` |
 | JUnit Console Launcher | committed in `lib/` | See [lib/README.md](lib/README.md) only if you're bumping it |
+| Node.js | 24 | Only for the VS Code extension in `vscode-extension/`. CI uses 24 |
 
 There's nothing to configure. A fresh clone runs the test suites as is. To grade for real you also
 need a week's official tests in `tests/` and submissions in `submissions/`, both gitignored. See
@@ -44,6 +45,19 @@ This runs all three suites (`test_grade.py`, `test_audit_given_code.py`, `test_c
 CI runs exactly this on Windows with JDK 25, plus a privacy guard (§4, rule 1). Many tests compile
 and run real Java, so `javac` must be on PATH. Three tests cover Windows read-only folders and are
 skipped elsewhere.
+
+If you touched `vscode-extension/`, also run, from that folder:
+
+```bash
+npm ci
+npm test
+npm run package
+```
+
+`npm test` includes a check that every note marker the extension counts in step 6 still appears in
+`grade.py` or `check_lateness.py`. A rewording in either script fails CI here rather than quietly
+zeroing a count. **Changing a marker string in a script means updating `FLAGS` in
+`vscode-extension/src/state.ts` in the same commit.**
 
 If you touched `grade.py`, `build_report.py` or a week's test setup, the unit suites are only
 step 1 of 4. Also run the other three from the README's **Verifying a change before it ships**:
@@ -71,6 +85,7 @@ pointed outside the repo). That's a hard rule. A run into the real `results/` re
 | `audit_forbidden.py`, `dupe_check.py`, `audit_given_code.py` | Read-only audits. Evidence for a human, never a score |
 | `test_*.py` | The unit suites |
 | `lib/` | The committed JUnit Console Launcher jar |
+| `vscode-extension/` | Optional VS Code extension: the weekly workflow as a checklist with Run buttons. The runbook is data in `src/steps.ts`. It never runs git |
 | `submissions/`, `tests/`, `results/`, `scratchPad/` | Gitignored. Real student work, answer keys and scores live here and **only** here |
 
 ---
