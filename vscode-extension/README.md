@@ -22,7 +22,7 @@ copy.
 cd vscode-extension
 npm ci
 npm run package
-code --install-extension dsa-grading-6.4.0.vsix
+code --install-extension dsa-grading-7.0.1.vsix
 ```
 
 Rebuild and reinstall the same way after pulling a change to the extension.
