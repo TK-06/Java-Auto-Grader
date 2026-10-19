@@ -24,36 +24,59 @@ export function activate(context: vscode.ExtensionContext): void {
     view,
     vscode.window.registerWebviewViewProvider(StepsViewProvider.viewId, view),
     vscode.commands.registerCommand("dsaGrading.openCurrentStep", () => panel.show(controller.currentIndex())),
-    vscode.commands.registerCommand("dsaGrading.refresh", () => controller.refresh()),
+    vscode.commands.registerCommand("dsaGrading.refresh", () => controller.discover()),
     vscode.commands.registerCommand("dsaGrading.openTerminal", () => controller.openTerminal()),
     vscode.commands.registerCommand("dsaGrading.newWeek", () => controller.newWeek()),
     vscode.commands.registerCommand("dsaGrading.moveToRight", moveToRight),
-    vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration("dsaGrading") && controller.refresh()),
+    vscode.commands.registerCommand("dsaGrading.chooseGradingDir", () => controller.chooseGradingDir()),
+    vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration("dsaGrading") && controller.discover()),
   );
 
   // tests/, submissions/ and results/ change under the extension's feet - a
   // script it ran, a file the TA edited, an agent in the terminal. Debounced:
-  // extraction writes a hundred files in a burst.
-  const paths = controller.paths();
-  if (paths) {
-    let timer: NodeJS.Timeout | undefined;
-    const poke = () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => controller.refresh(), 400);
-    };
+  // extraction writes a hundred files in a burst. Re-attached whenever the
+  // grader folder changes (found by the workspace search, or picked).
+  let watchers: vscode.Disposable[] = [];
+  let timer: NodeJS.Timeout | undefined;
+  const poke = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.refresh(), 400);
+  };
+  const watch = (gradingDir: string | undefined) => {
+    for (const w of watchers) w.dispose();
+    watchers = [];
+    if (!gradingDir) return;
     for (const dir of ["tests", "submissions", "results"]) {
-      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(paths.gradingDir), `${dir}/**`));
+      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(gradingDir), `${dir}/**`));
       watcher.onDidCreate(poke);
       watcher.onDidChange(poke);
       watcher.onDidDelete(poke);
-      context.subscriptions.push(watcher);
+      watchers.push(watcher);
     }
-    context.subscriptions.push({ dispose: () => clearTimeout(timer) });
-  }
-
-  if (vscode.workspace.getConfiguration("dsaGrading").get<boolean>("openOnStartup", true) && paths) {
-    panel.show(controller.currentIndex());
-  }
+  };
+  // The step page opens on its own once, the first time a grader is known -
+  // at startup, or as soon as the workspace search (or the TA) finds one.
+  let opened = false;
+  const openOnce = (gradingDir: string | undefined) => {
+    if (opened || !gradingDir) return;
+    opened = true;
+    if (vscode.workspace.getConfiguration("dsaGrading").get<boolean>("openOnStartup", true)) {
+      panel.show(controller.currentIndex());
+    }
+  };
+  context.subscriptions.push(
+    controller.onDidChangeGrader((dir) => {
+      watch(dir);
+      openOnce(dir);
+    }),
+    {
+      dispose: () => {
+        clearTimeout(timer);
+        for (const w of watchers) w.dispose();
+      },
+    },
+  );
+  void controller.discover();
 
   if (!context.globalState.get<boolean>(HINT_KEY)) {
     void context.globalState.update(HINT_KEY, true);

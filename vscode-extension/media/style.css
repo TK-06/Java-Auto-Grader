@@ -153,9 +153,29 @@ h1 {
 }
 .lede { color: var(--ink-soft); font-size: 15px; margin: 0 0 18px; }
 
-.status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 99px; }
-.status.ok { background: var(--pass-bg); color: var(--pass); }
-.status.todo { background: color-mix(in srgb, var(--ink) 8%, transparent); color: var(--ink-soft); }
+.title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 20px; flex-wrap: wrap; }
+.done-toggle {
+  flex: none;
+  margin-top: 4px;
+  display: inline-flex; align-items: center; gap: 8px;
+  border-radius: 99px;
+  padding: 6px 14px 6px 8px;
+  font-size: 13px; font-weight: 600;
+  border: 1.5px solid var(--line);
+  color: var(--ink-soft);
+}
+.done-toggle .box {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: 1.5px solid currentColor;
+  display: grid; place-items: center;
+  font-size: 11px; line-height: 1;
+}
+button.done-toggle:hover { color: var(--ink); border-color: var(--stain); }
+.done-toggle.on { background: var(--pass-bg); border-color: var(--pass); color: var(--pass); }
+.done-toggle.on .box { background: var(--pass); border-color: var(--pass); color: var(--paper); }
+button.done-toggle.on:hover { border-color: var(--pass); filter: brightness(1.05); }
+.done-toggle.auto { cursor: default; }
+
 
 .card {
   background: var(--raised);

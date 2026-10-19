@@ -2,7 +2,7 @@
   "name": "dsa-grading",
   "displayName": "DSA Grading",
   "description": "The weekly auto-grading runbook as a guided checklist: each step explains itself, takes its inputs in a form, and runs with live progress.",
-  "version": "7.0.1",
+  "version": "7.0.2",
   "publisher": "TK-06",
   "license": "MIT",
   "private": true,
@@ -67,6 +67,11 @@
         "command": "dsaGrading.moveToRight",
         "title": "Move the checklist to the right side bar",
         "category": "DSA Grading"
+      },
+      {
+        "command": "dsaGrading.chooseGradingDir",
+        "title": "Choose grader folder…",
+        "category": "DSA Grading"
       }
     ],
     "menus": {
@@ -80,6 +85,11 @@
           "command": "dsaGrading.refresh",
           "when": "view == dsaGrading.steps",
           "group": "navigation@2"
+        },
+        {
+          "command": "dsaGrading.chooseGradingDir",
+          "when": "view == dsaGrading.steps",
+          "group": "more@1"
         }
       ]
     },
@@ -89,7 +99,7 @@
         "dsaGrading.gradingDir": {
           "type": "string",
           "default": "",
-          "markdownDescription": "The grader folder (the one holding `grade.py`). Empty = auto-detect: a workspace folder holding `grade.py`, or its `grading/` child."
+          "markdownDescription": "The grader folder (the one holding `grade.py`). Empty = auto-detect: a workspace folder holding `grade.py` or its `grading/` child, else a search of the whole workspace for `grade.py` beside `tests/` and `lib/` (asks which when there are several). *DSA Grading: Choose grader folder…* picks one by hand."
         },
         "dsaGrading.setupRepoDir": {
           "type": "string",
