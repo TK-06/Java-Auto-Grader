@@ -46,6 +46,9 @@ export class StepsViewProvider implements vscode.WebviewViewProvider, vscode.Dis
       case "openTerminal":
         this.controller.openTerminal();
         break;
+      case "chooseGradingDir":
+        void this.controller.chooseGradingDir();
+        break;
     }
   }
 

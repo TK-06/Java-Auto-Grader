@@ -23,10 +23,22 @@ const isFile = (p: string) => {
 
 const expandHome = (p: string) => (p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p);
 
-/** The grader folder, or undefined when this workspace has no grade.py. */
-export function findGradingDir(): string | undefined {
+/** The dsaGrading.gradingDir setting, resolved, or undefined when it is empty. */
+export function configuredGradingDir(): string | undefined {
   const configured = vscode.workspace.getConfiguration("dsaGrading").get<string>("gradingDir", "").trim();
-  if (configured) return path.resolve(expandHome(configured));
+  return configured ? path.resolve(expandHome(configured)) : undefined;
+}
+
+/**
+ * The grader folder, in order: the setting; the folder the TA picked (or the
+ * workspace search found) last time, if it is still there; a workspace folder
+ * holding grade.py, or its grading/ child. Undefined when none of those works -
+ * the controller then searches the whole workspace (see discover.ts).
+ */
+export function findGradingDir(remembered?: string): string | undefined {
+  const configured = configuredGradingDir();
+  if (configured) return configured;
+  if (remembered && isFile(path.join(remembered, "grade.py"))) return remembered;
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
     const root = folder.uri.fsPath;
     if (isFile(path.join(root, "grade.py"))) return root;

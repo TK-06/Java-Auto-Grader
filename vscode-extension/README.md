@@ -22,7 +22,7 @@ copy.
 cd vscode-extension
 npm ci
 npm run package
-code --install-extension dsa-grading-7.0.1.vsix
+code --install-extension dsa-grading-7.0.2.vsix
 ```
 
 Rebuild and reinstall the same way after pulling a change to the extension.
@@ -30,7 +30,12 @@ Rebuild and reinstall the same way after pulling a change to the extension.
 ## First run
 
 1. Open the folder that holds `grading/` (for example `java-auto-grader/`) in VS Code. The
-   extension only wakes up in a workspace containing `grade.py`.
+   extension wakes up in any workspace containing `grade.py`. If you opened a parent folder
+   instead (all of your projects, say), it searches the workspace for the grader: a folder
+   holding `grade.py` beside `tests/` and `lib/`. If it finds one, it uses it. If it finds
+   several, it asks which. **Choose grader folder…** (the button on the "can't find the grader"
+   panel, the `…` menu of the checklist, or the command palette) switches by hand. The choice is
+   remembered for that workspace without writing a settings file.
 2. The current step's page opens in the editor. The checklist is the **DSA Grading** icon in the
    activity bar.
 3. Accept **Move it** on the first-run prompt, and pick *Secondary Side Bar*, to put the checklist
@@ -63,7 +68,7 @@ hand. Ticks and inputs are kept per workspace. **New week…** clears them, and 
 
 | Setting | Default |
 |---|---|
-| `dsaGrading.gradingDir` | auto: a workspace folder holding `grade.py`, or its `grading/` child |
+| `dsaGrading.gradingDir` | auto: a workspace folder holding `grade.py` or its `grading/` child, else a workspace search (see *First run*) |
 | `dsaGrading.setupRepoDir` | `../TA-grading-setup` next to the grader |
 | `dsaGrading.materialsDir` | empty. The professor's materials folder, for step 1's *Open* button |
 | `dsaGrading.python` | `python` |

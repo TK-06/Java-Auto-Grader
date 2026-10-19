@@ -7,7 +7,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { findGradingDir, resolvePaths } from "./config";
+import { configuredGradingDir, findGradingDir, resolvePaths } from "./config";
+import { graderCandidates, looksLikeGradingDir } from "./discover";
 import { GradeSummary } from "./progress";
 import { Runner, javacMajor } from "./runner";
 import { readState } from "./state";
@@ -38,6 +39,8 @@ export interface LastRun {
 export interface Problem {
   ok: false;
   problem: string;
+  /** Offer the "Choose grader folder..." button. */
+  canChoose?: boolean;
 }
 
 export interface ListModel {
@@ -62,6 +65,15 @@ export interface PanelModel {
 }
 
 const SESSION_KEY = "dsaGrading.session";
+/** The grader folder picked (or found by the workspace search) for this
+ *  workspace. workspaceState, not a setting: choosing a folder never writes a
+ *  .vscode/settings.json into the TA's project. */
+const GRADER_KEY = "dsaGrading.graderDir";
+
+/** Folders never worth searching for the grader: dependencies, build output,
+ *  and the grader's own data folders (a scratch copy of the tool in there is
+ *  not the one to run). */
+const SEARCH_EXCLUDE = "**/{node_modules,.git,out,build_tmp,submissions,results,scratchPad}/**";
 
 const exists = (p: string) => {
   try {
@@ -75,8 +87,13 @@ const exists = (p: string) => {
 export class Controller implements vscode.Disposable {
   private readonly changed = new vscode.EventEmitter<void>();
   private readonly progressed = new vscode.EventEmitter<RunState>();
+  private readonly graderChanged = new vscode.EventEmitter<string | undefined>();
   readonly onDidChange = this.changed.event;
   readonly onProgress = this.progressed.event;
+  /** The grader folder changed (found, picked, or the setting edited). */
+  readonly onDidChangeGrader = this.graderChanged.event;
+  private searching = false;
+  private lastGrader?: string;
   /** Ask the panel to show a step (set by extension.ts). */
   openStep: (index: number) => void = () => undefined;
 
@@ -91,7 +108,7 @@ export class Controller implements vscode.Disposable {
   // ------------------------------------------------------------- state
 
   paths(): Paths | undefined {
-    const dir = findGradingDir();
+    const dir = findGradingDir(this.context.workspaceState.get<string>(GRADER_KEY));
     return dir ? resolvePaths(dir) : undefined;
   }
 
@@ -107,10 +124,23 @@ export class Controller implements vscode.Disposable {
   ctx(): Ctx | Problem {
     const paths = this.paths();
     if (!paths) {
-      return { ok: false, problem: "No grade.py in this workspace. Open the folder that holds grading/, or set dsaGrading.gradingDir." };
+      if (this.searching) return { ok: false, problem: "Looking for the grader in this workspace…" };
+      return {
+        ok: false,
+        canChoose: true,
+        problem:
+          "No grader found in this workspace – no folder here holds grade.py together with tests/ and lib/. " +
+          "Choose the grader folder, or open the folder that contains grading/.",
+      };
     }
     const state = readState(paths.gradingDir, paths.setupRepoDir);
-    if (!state.gradingDirOk) return { ok: false, problem: `grade.py not found in ${paths.gradingDir} - check dsaGrading.gradingDir.` };
+    if (!state.gradingDirOk) {
+      return {
+        ok: false,
+        canChoose: true,
+        problem: `grade.py not found in ${paths.gradingDir}${configuredGradingDir() ? " – the dsaGrading.gradingDir setting points there" : ""}.`,
+      };
+    }
     return { state, paths, values: this.session().values, exists };
   }
 
@@ -160,7 +190,93 @@ export class Controller implements vscode.Disposable {
   }
 
   refresh(): void {
+    const now = this.paths()?.gradingDir;
+    if (now !== this.lastGrader) {
+      this.lastGrader = now;
+      this.graderChanged.fire(now);
+    }
     this.changed.fire();
+  }
+
+  // ------------------------------------------------- finding the grader
+
+  private async searchWorkspace(): Promise<string[]> {
+    const files = await vscode.workspace.findFiles("**/grade.py", SEARCH_EXCLUDE, 200);
+    return graderCandidates(files.map((u) => u.fsPath));
+  }
+
+  private async remember(dir: string): Promise<void> {
+    await this.context.workspaceState.update(GRADER_KEY, dir);
+    this.refresh();
+  }
+
+  /**
+   * At startup: when the setting, the remembered folder and the quick checks
+   * all come up empty, search the workspace. One grader found is used (and
+   * remembered); several means asking which, since guessing wrong would run
+   * the scripts in the wrong folder.
+   */
+  async discover(): Promise<void> {
+    if (this.paths()) return this.refresh();
+    this.searching = true;
+    this.changed.fire();
+    let found: string[] = [];
+    try {
+      found = await this.searchWorkspace();
+    } finally {
+      this.searching = false;
+    }
+    if (found.length === 1) return this.remember(found[0]);
+    this.refresh();
+    if (found.length > 1) {
+      const choice = await vscode.window.showInformationMessage(
+        `DSA Grading found ${found.length} grader folders in this workspace. Which one do you grade with?`,
+        "Choose…",
+      );
+      if (choice) await this.chooseGradingDir(found);
+    }
+  }
+
+  /** The "Choose grader folder..." command: every grader in the workspace, plus Browse. */
+  async chooseGradingDir(known?: string[]): Promise<void> {
+    const found = known ?? (await this.searchWorkspace());
+    const current = this.paths()?.gradingDir;
+    const roots = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+    const shown = (dir: string) => {
+      const root = roots.find((r) => dir.startsWith(r));
+      return root ? path.join(path.basename(root), path.relative(root, dir)) : dir;
+    };
+    type Item = vscode.QuickPickItem & { dir?: string };
+    const items: Item[] = [
+      ...found.map((dir) => ({ label: `$(folder) ${shown(dir)}`, description: dir === current ? "current" : undefined, detail: dir, dir })),
+      { label: "$(folder-opened) Browse…", detail: "Pick a folder holding grade.py, tests/ and lib/" },
+    ];
+    const pick = await vscode.window.showQuickPick(items, {
+      title: "Choose the grader folder",
+      placeHolder: found.length ? "The folder holding grade.py, tests/ and lib/" : "No grader found in this workspace – browse for it",
+    });
+    if (!pick) return;
+    let dir = pick.dir;
+    if (!dir) {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: "Use this grader folder",
+        defaultUri: current ? vscode.Uri.file(current) : vscode.workspace.workspaceFolders?.[0]?.uri,
+      });
+      dir = picked?.[0]?.fsPath;
+      if (!dir) return;
+      if (!looksLikeGradingDir(dir)) {
+        vscode.window.showWarningMessage(`${dir} doesn't hold grade.py, tests/ and lib/, so it isn't the grader folder.`);
+        return;
+      }
+    }
+    if (configuredGradingDir()) {
+      // The setting always wins, so a choice stored beside it would do nothing.
+      await vscode.workspace.getConfiguration("dsaGrading").update("gradingDir", dir, vscode.ConfigurationTarget.Workspace);
+    }
+    await this.remember(dir);
   }
 
   // ----------------------------------------------------------- actions
@@ -308,5 +424,6 @@ export class Controller implements vscode.Disposable {
   dispose(): void {
     this.changed.dispose();
     this.progressed.dispose();
+    this.graderChanged.dispose();
   }
 }

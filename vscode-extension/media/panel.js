@@ -235,6 +235,30 @@ function promptsCard(step) {
   );
 }
 
+/** Beside the title: whether the step is done, and the one-click way to say so.
+ *  Detected-from-disk is a badge, not a button - ticking it would change nothing. */
+function doneToggle(step) {
+  if (step.detected === true) {
+    return h(
+      "span",
+      { class: "done-toggle on auto", title: "Detected from what is on disk - nothing to tick" },
+      h("span", { class: "box" }, "✓"),
+      "Done · detected",
+    );
+  }
+  return h(
+    "button",
+    {
+      class: `done-toggle ${step.ticked ? "on" : ""}`,
+      "aria-pressed": step.ticked ? "true" : "false",
+      title: step.ticked ? "Click to mark this step not done" : "Click when you have finished this step",
+      onclick: () => post({ type: "tick", value: !step.ticked }),
+    },
+    h("span", { class: "box" }, step.ticked ? "✓" : ""),
+    step.ticked ? "Done" : "Mark done",
+  );
+}
+
 function linksRow(step) {
   if (!step.links.length) return null;
   return h(
@@ -246,7 +270,7 @@ function linksRow(step) {
 
 function build() {
   if (!model) return h("div");
-  if (!model.ok) return problemView(model.problem);
+  if (!model.ok) return problemView(model);
   const step = model.step;
   const last = model.steps.length - 1;
   return h(
@@ -272,15 +296,8 @@ function build() {
           ),
         ),
       ),
-      h("h1", {}, step.title),
+      h("div", { class: "title-row" }, h("h1", {}, step.title), doneToggle(step)),
       h("p", { class: "lede" }, step.summary),
-      h(
-        "div",
-        {},
-        step.done
-          ? h("span", { class: "status ok" }, step.detected ? "✓ Done · detected from disk" : "✓ Marked done")
-          : h("span", { class: "status todo" }, step.detected === undefined ? "Tick it below when it's done" : "Not done yet"),
-      ),
       step.facts.length ? h("section", { class: "card" }, h("h2", {}, "Where things stand"), factList(step.facts)) : null,
       h("section", { class: "card" }, h("h2", {}, "What to do"), trustedHtml(step.body)),
       fieldsCard(step, model.archived),

@@ -17,7 +17,8 @@ type Message =
   | { type: "copy"; text: string; what?: string }
   | { type: "tick"; value: boolean }
   | { type: "link"; id: string }
-  | { type: "openTerminal" };
+  | { type: "openTerminal" }
+  | { type: "chooseGradingDir" };
 
 export class StepPanel implements vscode.Disposable {
   private panel?: vscode.WebviewPanel;
@@ -90,6 +91,9 @@ export class StepPanel implements vscode.Disposable {
         break;
       case "openTerminal":
         c.openTerminal();
+        break;
+      case "chooseGradingDir":
+        void c.chooseGradingDir();
         break;
     }
   }

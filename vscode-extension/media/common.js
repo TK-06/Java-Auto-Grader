@@ -71,6 +71,12 @@ function factList(facts) {
   );
 }
 
-function problemView(problem) {
-  return h("div", { class: "problem" }, h("h1", {}, "DSA Grading can't find the grader"), h("p", {}, problem));
+function problemView(model) {
+  return h(
+    "div",
+    { class: "problem" },
+    h("h1", {}, "DSA Grading can't find the grader"),
+    h("p", {}, model.problem),
+    model.canChoose ? h("button", { class: "primary", onclick: () => post({ type: "chooseGradingDir" }) }, "Choose grader folder…") : null,
+  );
 }

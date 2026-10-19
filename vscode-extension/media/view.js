@@ -26,7 +26,7 @@ function runningBlock(running) {
 
 function build() {
   if (!model) return h("div");
-  if (!model.ok) return problemView(model.problem);
+  if (!model.ok) return problemView(model);
   return h(
     "div",
     { class: "side" },
