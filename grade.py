@@ -875,11 +875,35 @@ def detect_wrong_submission(
     return notes
 
 
+def find_uncompiled_source(
+    build_dir: Path,
+    java_classes: set[str],
+    required: set[str],
+    class_search_root: Path,
+) -> set[str]:
+    """The .java classes in the build that are neither required nor a JUnit test
+    and have no compiled .class anywhere under class_search_root - the evidence
+    detect_mixed_source needs to tell another project's source tree from a
+    library's source bundled into a runnable jar. A library's source has its own
+    .class beside it; a source tree exported without its build output does not.
+
+    Only the no-required-source shape reads this, so callers skip the walk
+    otherwise. A JUnit test source is left out on purpose: a student's own test
+    class whose .class is missing says nothing about which project it is from."""
+    stray = {
+        name for name in java_classes - required
+        if "org.junit" not in (build_dir / f"{name}.java").read_text(
+            encoding="utf-8", errors="replace")
+    }
+    return stray - set(find_class_fallback_files(class_search_root, stray))
+
+
 def detect_mixed_source(
     java_classes: set[str],
     class_only: set[str],
     required: set[str],
     student_classes: set[str],
+    uncompiled_source: set[str] = frozenset(),
 ) -> tuple[list[str], bool]:
     """The second shape of a wrong-project export, the one detect_wrong_submission
     cannot see because nothing fails to compile.
@@ -897,8 +921,17 @@ def detect_mixed_source(
     The signal is MIXED source among the required classes - some have .java,
     others only a .class. A normal IDE export with source ticked includes every
     source file, so that mix almost always means the source tree and the build
-    output came from different projects. A submission with no required .java at
-    all is the ordinary no-source case and is left alone here.
+    output came from different projects.
+
+    A submission with no required .java at all is the ordinary no-source case and
+    is left alone - unless `uncompiled_source` is non-empty (see
+    find_uncompiled_source). W12 Q1: three students' jars held the compiled
+    TTree.class and Node.class but .java for Week 10 and Week 12 Q2 projects,
+    none of it built into the archive; every one landed on the plain 50%
+    no-source cap until a TA overrode them to 0. That is the same wrong-project
+    shape with no required .java to anchor it, so it is treated the same way.
+    Library source bundled into a no-source runnable jar still has its own .class
+    in the archive, so it is not uncompiled and is still left alone.
 
     What happens next depends on WHICH class lacks source:
       - one the student writes this week (tests/structure.json's
@@ -915,10 +948,20 @@ def detect_mixed_source(
     """
     java_required = java_classes & required
     graded_from_class = class_only & required
-    if not java_required or not graded_from_class:
+    if not graded_from_class:
+        return [], False
+    if java_required:
+        have = ", ".join(sorted(java_required))
+        evidence = ""
+    elif uncompiled_source:
+        have = ", ".join(sorted(uncompiled_source))
+        evidence = (
+            ", and none of that source has a compiled .class anywhere in the "
+            "archive, so it was not built together with the .class files that were graded"
+        )
+    else:
         return [], False
 
-    have = ", ".join(sorted(java_required))
     assessed = graded_from_class & student_classes
     if assessed:
         return [
@@ -927,7 +970,7 @@ def detect_mixed_source(
             f"question asks the student to write - which could only be graded from a "
             f"precompiled .class. Source for the other classes without the assessed one "
             f"means the .java exported belong to a different project or question than "
-            f"the .class beside them"
+            f"the .class beside them{evidence}"
         ], True
 
     hint = (
@@ -938,8 +981,8 @@ def detect_mixed_source(
     return [
         f"MANUAL REVIEW: mixed source - .java present for {have} but only a "
         f"precompiled .class for {', '.join(sorted(graded_from_class))}, so the .java "
-        f"may belong to a different project or question than the .class beside them - "
-        f"check by hand{hint}"
+        f"may belong to a different project or question than the .class beside them"
+        f"{evidence} - check by hand{hint}"
     ], False
 
 
@@ -2612,11 +2655,21 @@ def grade_student(
         # with a newer Java) must still carry the note and the 0% cap. Only a
         # successful compile reaches this point - a failed one is handled by
         # detect_wrong_submission above.
+        mixed_required = set(required_classes or []) | (class_fallback_candidates or set())
+        # Only the no-required-source shape reads this, so the walk is skipped otherwise.
+        uncompiled_source = (
+            find_uncompiled_source(
+                build_dir, present_java_classes, mixed_required, class_search_root
+            )
+            if class_search_root is not None and not (present_java_classes & mixed_required)
+            else set()
+        )
         mixed_notes, wrong_source = detect_mixed_source(
             present_java_classes,
             set(fallback_matches),
-            set(required_classes or []) | (class_fallback_candidates or set()),
+            mixed_required,
             student_classes or set(),
+            uncompiled_source,
         )
         prep_notes = prep_notes + mixed_notes
 

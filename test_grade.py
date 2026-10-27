@@ -43,6 +43,7 @@ from grade import (
     find_java_files,
     find_junit_jar,
     find_nested_archives,
+    find_uncompiled_source,
     grade_student,
     infer_unnamed_package_classes,
     load_manual_review_checks,
@@ -3337,6 +3338,111 @@ class TestDetectMixedSource(unittest.TestCase):
             detect_mixed_source(self.REQUIRED, set(), self.REQUIRED, {"BankQueue"}), ([], False)
         )
 
+    # The W12 Q1 shape: no required .java at all, but other projects' source that
+    # was never built into the archive (find_uncompiled_source's evidence).
+
+    def test_no_required_source_beside_uncompiled_foreign_source_is_a_wrong_submission(self):
+        notes, wrong = detect_mixed_source(
+            {"BST", "BSTNode"}, self.REQUIRED, self.REQUIRED, {"BankQueue"}, {"BST", "BSTNode"}
+        )
+
+        self.assertTrue(wrong)
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith(WRONG_SUBMISSION_PREFIX))
+        self.assertIn("none of that source has a compiled .class", notes[0])
+
+    def test_that_note_parses_back_with_the_shared_regex(self):
+        notes, _ = detect_mixed_source(
+            {"BST", "BSTNode"}, self.REQUIRED, self.REQUIRED, {"BankQueue"}, {"BST", "BSTNode"}
+        )
+
+        match = MIXED_SOURCE_RE.search(notes[0])
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), "BST, BSTNode")
+        self.assertEqual(match.group(2), "BankQueue")
+
+    def test_that_note_carries_no_bare_separator_that_would_split_it_in_two(self):
+        for student in ({"BankQueue"}, set()):
+            notes, _ = detect_mixed_source({"BST"}, self.REQUIRED, self.REQUIRED, student, {"BST"})
+            self.assertNotIn("; ", notes[0])
+
+    def test_without_student_classes_the_new_shape_is_only_flagged(self):
+        notes, wrong = detect_mixed_source({"BST"}, self.REQUIRED, self.REQUIRED, set(), {"BST"})
+
+        self.assertFalse(wrong)
+        self.assertTrue(notes[0].startswith("MANUAL REVIEW:"))
+        self.assertIn("student_classes", notes[0])
+        self.assertIn("none of that source has a compiled .class", notes[0])
+
+    def test_uncompiled_source_is_ignored_when_a_required_class_has_source(self):
+        # The original shape keeps its note: it names the REQUIRED source and
+        # carries no extra evidence clause.
+        notes, wrong = detect_mixed_source(
+            {"DeQ", "CDLinkedList", "BST"}, {"BankQueue"}, self.REQUIRED, {"BankQueue"}, {"BST"}
+        )
+
+        self.assertTrue(wrong)
+        self.assertEqual(MIXED_SOURCE_RE.search(notes[0]).group(1), "CDLinkedList, DeQ")
+        self.assertNotIn("none of that source", notes[0])
+
+    def test_no_uncompiled_source_is_still_the_ordinary_no_source_case(self):
+        # Library source with its own .class is not "uncompiled": the caller
+        # passes an empty set and nothing is flagged.
+        self.assertEqual(
+            detect_mixed_source({"Version"}, self.REQUIRED, self.REQUIRED, {"BankQueue"}, set()),
+            ([], False),
+        )
+
+
+class TestFindUncompiledSource(unittest.TestCase):
+    def _layout(self, tmp: str, sources: dict, class_paths: list):
+        build = Path(tmp) / "build"
+        build.mkdir()
+        root = Path(tmp) / "archive"
+        root.mkdir()
+        for name, body in sources.items():
+            (build / f"{name}.java").write_text(body, encoding="utf-8")
+        for rel in class_paths:
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"")  # only the file name matters to the search
+        return build, root
+
+    def test_source_with_no_class_anywhere_is_uncompiled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build, root = self._layout(tmp, {"BST": "class BST {}"}, [])
+
+            self.assertEqual(find_uncompiled_source(build, {"BST"}, {"TTree"}, root), {"BST"})
+
+    def test_source_with_its_class_in_a_nested_folder_is_compiled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build, root = self._layout(tmp, {"Version": "class Version {}"}, ["lib/pkg/Version.class"])
+
+            self.assertEqual(find_uncompiled_source(build, {"Version"}, {"TTree"}, root), set())
+
+    def test_an_inner_class_file_counts_as_the_outer_class_being_compiled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build, root = self._layout(tmp, {"Outer": "class Outer {}"}, ["Outer$Inner.class"])
+
+            self.assertEqual(find_uncompiled_source(build, {"Outer"}, {"TTree"}, root), set())
+
+    def test_a_required_class_is_never_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build, root = self._layout(tmp, {"TTree": "class TTree {}"}, [])
+
+            self.assertEqual(find_uncompiled_source(build, {"TTree"}, {"TTree"}, root), set())
+
+    def test_a_junit_test_source_is_never_reported(self):
+        # The student's own test class says nothing about which project they exported.
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "import org.junit.jupiter.api.Test;\nclass TestTTree { @Test void t() {} }\n"
+            build, root = self._layout(tmp, {"TestTTree": body, "BST": "class BST {}"}, [])
+
+            self.assertEqual(
+                find_uncompiled_source(build, {"TestTTree", "BST"}, {"TTree"}, root), {"BST"}
+            )
+
 
 class TestLoadStudentClasses(unittest.TestCase):
     def _write(self, tmp: str, data: dict) -> Path:
@@ -3435,6 +3541,101 @@ class TestGradeStudentMixedSource(unittest.TestCase):
     def test_without_student_classes_it_stays_on_the_no_source_cap_and_is_flagged(self):
         with tempfile.TemporaryDirectory() as tmp:
             row = self._grade(Path(tmp), None)
+
+        self.assertEqual(row["score"], 0.5)
+        self.assertEqual(row["score_cap"], "50%")
+        self.assertIn("MANUAL REVIEW: mixed source", row["notes"])
+        self.assertNotIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+
+    def _grade_no_required_source(
+        self, tmp_path: Path, stray_name: str, stray_body: str, stray_has_class: bool, student_classes
+    ):
+        """W12 Q1 in miniature: BOTH required classes (Item, Helper) arrive only as
+        .class, and the one .java in the archive is another project's, which was
+        never built into it - unless stray_has_class, i.e. library source that
+        shipped with its own .class."""
+        class_dir = tmp_path / "archive"
+        class_dir.mkdir()
+        with tempfile.TemporaryDirectory() as src_tmp:
+            sources = {
+                "Item": "public class Item { public int getValue() { return 42; } }\n",
+                "Helper": "public class Helper { public int one() { return 1; } }\n",
+            }
+            if stray_has_class:
+                sources[stray_name] = stray_body
+            paths = []
+            for name, body in sources.items():
+                path = Path(src_tmp) / f"{name}.java"
+                path.write_text(body, encoding="utf-8")
+                paths.append(str(path))
+            subprocess.run(["javac", "-d", str(class_dir), *paths], check=True, capture_output=True)
+        stray = tmp_path / "src" / f"{stray_name}.java"
+        stray.parent.mkdir()
+        stray.write_text(stray_body, encoding="utf-8")
+        test_file = tmp_path / "ItemTest.java"
+        test_file.write_text(
+            "import org.junit.jupiter.api.Test;\n"
+            "import static org.junit.jupiter.api.Assertions.*;\n"
+            "class ItemTest {\n"
+            "    @Test void testGetValue() { assertEquals(42, new Item().getValue() * new Helper().one()); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        build_root = tmp_path / "build_tmp"
+        build_root.mkdir()
+        return grade_student(
+            "10000001", "1", [stray], [], [test_file], ["ItemTest"],
+            find_junit_jar(Path(__file__).resolve().parent / "lib"), build_root,
+            30, False, None, ["Item", "Helper"], None,
+            class_search_root=class_dir,
+            class_fallback_candidates={"Item", "Helper"},
+            student_classes=student_classes,
+        )
+
+    def test_no_required_source_beside_uncompiled_foreign_source_scores_0_but_keeps_the_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._grade_no_required_source(
+                Path(tmp), "Stray", "public class Stray { }\n", False, {"Item"}
+            )
+
+        self.assertEqual(row["compiled"], "yes")
+        self.assertEqual(row["tests_passed"], 1)
+        self.assertEqual(row["uncapped_score"], 1)
+        self.assertEqual(row["score"], 0)
+        self.assertEqual(row["score_cap"], "0%")
+        self.assertIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+        self.assertIn(WRONG_SOURCE_CAP_REASON, row["notes"])
+        match = MIXED_SOURCE_RE.search(row["notes"])
+        self.assertEqual(match.group(1), "Stray")
+        self.assertEqual(match.group(2), "Item")
+
+    def test_foreign_source_that_has_its_own_class_stays_on_the_plain_no_source_cap(self):
+        # A library's source bundled into a no-source runnable jar: its .class is
+        # in the archive too, so it is not another project's un-built source.
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._grade_no_required_source(
+                Path(tmp), "Version", "public class Version { }\n", True, {"Item"}
+            )
+
+        self.assertEqual(row["score"], 0.5)
+        self.assertEqual(row["score_cap"], "50%")
+        self.assertNotIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+        self.assertNotIn("MANUAL REVIEW", row["notes"])
+
+    def test_a_junit_test_source_with_no_class_does_not_count_as_foreign_source(self):
+        body = "import org.junit.jupiter.api.Test;\nclass StrayTest { @Test void t() {} }\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._grade_no_required_source(Path(tmp), "StrayTest", body, False, {"Item"})
+
+        self.assertEqual(row["score"], 0.5)
+        self.assertEqual(row["score_cap"], "50%")
+        self.assertNotIn(WRONG_SUBMISSION_PREFIX, row["notes"])
+
+    def test_without_student_classes_the_new_shape_stays_on_the_cap_and_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._grade_no_required_source(
+                Path(tmp), "Stray", "public class Stray { }\n", False, None
+            )
 
         self.assertEqual(row["score"], 0.5)
         self.assertEqual(row["score_cap"], "50%")
