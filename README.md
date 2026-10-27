@@ -70,6 +70,12 @@ What every submission can expect, regardless of week:
   still run on the `.class`, so `uncapped_score` records how the compiled work did. Without
   `student_classes`, or when only a *given* class lacks source, it is flagged
   `MANUAL REVIEW: mixed source` and left on the ordinary 50% no-source cap.
+  The variant with **no required `.java` at all** is covered too (W12 Q1: Week 10 and Week 12
+  Q2 source beside a correct `TTree.class`): if the archive holds `.java` that is not
+  required, is not a JUnit test, and has **no compiled `.class` anywhere in it**, that source
+  and the graded `.class` files were never built together, so the row is handled exactly as
+  above. Library source bundled into a no-source runnable jar has its own `.class` beside it,
+  so it is unaffected and stays on the ordinary 50% cap.
 - **Submitted as bare `.java` source instead of a packaged archive** (a loose `.java` file,
   or an unpackaged folder of them, dropped straight into `submissions/` — commonly an LMS
   bulk-download artifact bundling two individually-uploaded files together) → **0**, rejected
@@ -459,7 +465,9 @@ build output came from different projects (W7Q2: Week 7 Q1's source beside a cor
 `WRONG SUBMISSION LIKELY:` and a 0% cap (see **Grading policy**); if only given classes are,
 it gets a `MANUAL REVIEW: mixed source` flag and nothing else, since a student who left out
 one given file should not lose everything to a heuristic. A submission with *no* required
-`.java` at all is the ordinary no-source case either way (50%, see 2d). Every name here must
+`.java` at all is the ordinary no-source case (50%, see 2d) - unless the archive also holds
+`.java` that was never compiled into it (no `.class` anywhere, not a JUnit test), which is the
+same wrong-project shape and is decided the same way. Every name here must
 also be in `required_classes`, or `grade.py` exits at startup; leaving the key out means
 mixed source is only ever flagged, never capped.
 
