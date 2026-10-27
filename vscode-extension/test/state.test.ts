@@ -106,6 +106,31 @@ test("a graded week is read back from disk", () => {
   assert.equal(s.results.scoresBackup, undefined);
 });
 
+test("tests/'s newest change counts a file that was added or removed, not just edited", () => {
+  const g = tmp();
+  const tests = path.join(g, "tests");
+  write(path.join(tests, "TestA.java"));
+  write(path.join(tests, "starter", "A.java"));
+  const OLD = 1_000_000; // ms; far older than anything made now
+  for (const p of [path.join(tests, "TestA.java"), path.join(tests, "starter", "A.java"), path.join(tests, "starter"), tests]) {
+    fs.utimesSync(p, OLD / 1000, OLD / 1000);
+  }
+  assert.equal(Math.round(readState(g, g).tests.newestMtimeMs), OLD, "untouched since long ago");
+
+  write(path.join(tests, "starter", "B.java"));
+  assert.ok(readState(g, g).tests.newestMtimeMs > OLD, "a file added inside starter/ is a change");
+
+  fs.utimesSync(path.join(tests, "starter", "B.java"), OLD / 1000, OLD / 1000);
+  fs.utimesSync(path.join(tests, "starter"), OLD / 1000, OLD / 1000);
+  assert.equal(Math.round(readState(g, g).tests.newestMtimeMs), OLD);
+  fs.rmSync(path.join(tests, "TestA.java"));
+  assert.ok(readState(g, g).tests.newestMtimeMs > OLD, "removing a file moves the folder's own mtime");
+});
+
+test("no tests/ folder reads as 0, not an error", () => {
+  assert.equal(readState(tmp(), tmp()).tests.newestMtimeMs, 0);
+});
+
 test("a half-written report_config.json still counts as present", () => {
   const g = tmp();
   write(path.join(g, "tests", "report_config.json"), "{ not json");

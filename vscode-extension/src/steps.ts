@@ -40,6 +40,10 @@ export interface Ctx {
   state: GradingState;
   paths: Paths;
   values: Values;
+  /** When the TA last reset the checklist (ms since epoch). Files on disk that
+   *  are not newer than this belong to the previous question, so they no longer
+   *  count as a step being done. Unset = never reset. */
+  since?: number;
   exists(p: string): boolean;
 }
 
@@ -58,6 +62,9 @@ export interface Action {
   confirm?(ctx: Ctx): string | undefined;
   /** Check `javac -version` is 25 first. */
   needsJdk25?: boolean;
+  /** Files the script writes. Checked just before the run (see locks.ts), so a
+   *  file open in Excel is reported in words instead of as a failed run. */
+  outputs?(ctx: Ctx): string[];
   build(ctx: Ctx): Command;
 }
 
@@ -190,6 +197,10 @@ const ago = (ms: number) => {
 };
 
 const rel = (ctx: Ctx, ...p: string[]) => path.join(ctx.paths.gradingDir, ...p);
+
+/** True when a file counts for the current question: always before any reset,
+ *  and after one only if it changed since. */
+const fresh = (ctx: Ctx, mtimeMs: number) => ctx.since === undefined || mtimeMs > ctx.since;
 
 /** results/grades.csv when it holds at least one graded row. grade.py creates
  *  an empty one before it starts (to check it can write there), so a run that
@@ -353,7 +364,7 @@ export const STEPS: Step[] = [
       }
       return facts;
     },
-    done: (ctx) => ctx.state.tests.javaFiles.length > 0,
+    done: (ctx) => ctx.state.tests.javaFiles.length > 0 && fresh(ctx, ctx.state.tests.newestMtimeMs),
   },
   {
     id: "zips",
@@ -430,7 +441,7 @@ export const STEPS: Step[] = [
         ? { label: "submissions/", value: `${ctx.state.submissions.count} file(s)`, tone: "ok" }
         : { label: "submissions/", value: "empty", tone: "warn" },
     ],
-    done: (ctx) => ctx.state.submissions.count > 0,
+    done: (ctx) => ctx.state.submissions.count > 0 && fresh(ctx, ctx.state.submissions.newestMtimeMs),
   },
   {
     id: "grade",
@@ -452,6 +463,7 @@ export const STEPS: Step[] = [
         primary: true,
         needs: [],
         needsJdk25: true,
+        outputs: (ctx) => [rel(ctx, "results", "grades.csv"), rel(ctx, "results", "mcvScore.csv")],
         blocked: (ctx) => {
           if (!ctx.state.tests.javaFiles.length) return "No official test in tests/ – do step 2 first.";
           if (!ctx.state.submissions.count) return "submissions/ is empty – do step 4 first.";
@@ -489,7 +501,7 @@ export const STEPS: Step[] = [
     },
     done: (ctx) => {
       const g = graded(ctx);
-      return !!g && ctx.state.submissions.count > 0 && g.mtimeMs >= ctx.state.submissions.newestMtimeMs;
+      return !!g && ctx.state.submissions.count > 0 && g.mtimeMs >= ctx.state.submissions.newestMtimeMs && fresh(ctx, g.mtimeMs);
     },
   },
   {
@@ -625,6 +637,7 @@ export const STEPS: Step[] = [
         label: "Run check_lateness.py",
         primary: true,
         needs: ["zips", "deadline", "question"],
+        outputs: (ctx) => [rel(ctx, "results", "mcvScore.csv"), rel(ctx, "results", "mcvScore.csv.bak")],
         blocked: (ctx) => (graded(ctx) ? undefined : "results/grades.csv has no graded rows yet – do step 5 first."),
         build: (ctx) =>
           py(
@@ -649,9 +662,7 @@ export const STEPS: Step[] = [
           : { label: "mcvScore.csv", value: "as the grader wrote it – no late check since the last run", tone: "warn" },
       ];
     },
-    done: (ctx) => {
-      return lateApplied(ctx);
-    },
+    done: (ctx) => lateApplied(ctx) && fresh(ctx, ctx.state.results.scoresBackup?.mtimeMs ?? 0),
   },
   {
     id: "upload",
@@ -734,7 +745,7 @@ export const STEPS: Step[] = [
     done: (ctx) => {
       const r = ctx.state.results;
       const g = graded(ctx);
-      return !!r.report && !!g && r.report.mtimeMs >= g.mtimeMs;
+      return !!r.report && !!g && r.report.mtimeMs >= g.mtimeMs && fresh(ctx, r.report.mtimeMs);
     },
   },
   {

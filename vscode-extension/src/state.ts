@@ -34,6 +34,8 @@ export interface GradingState {
     reportConfig: boolean;
     /** report_config.json's assignment_title, when it has one. */
     assignmentTitle?: string;
+    /** Newest change anywhere in tests/, deleting or adding a file included. */
+    newestMtimeMs: number;
   };
   submissions: { count: number; newestMtimeMs: number };
   results: {
@@ -82,6 +84,26 @@ function listDir(p: string): fs.Dirent[] {
   } catch {
     return [];
   }
+}
+
+/** The newest mtime under dir, dir itself included: a folder's own mtime moves
+ *  when a file in it is added or removed, which a restore does to every file. */
+function newestIn(dir: string): number {
+  let newest = 0;
+  try {
+    newest = fs.statSync(dir).mtimeMs;
+  } catch {
+    return 0;
+  }
+  for (const d of listDir(dir)) {
+    const p = path.join(dir, d.name);
+    try {
+      newest = Math.max(newest, d.isDirectory() ? newestIn(p) : fs.statSync(p).mtimeMs);
+    } catch {
+      // Gone between the listing and the stat: nothing to count.
+    }
+  }
+  return newest;
 }
 
 /** RFC 4180: notes cells contain commas, quotes and newlines. */
@@ -224,6 +246,7 @@ export function readState(gradingDir: string, setupRepoDir: string): GradingStat
       starter: listDir(path.join(tests, "starter")).length > 0,
       reportConfig,
       assignmentTitle,
+      newestMtimeMs: newestIn(tests),
     },
     submissions: { count: subs.length, newestMtimeMs: newest },
     results: {
