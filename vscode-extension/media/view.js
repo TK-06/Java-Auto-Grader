@@ -86,7 +86,7 @@ function build() {
       h("button", { onclick: () => post({ type: "openTerminal" }) }, "Terminal"),
       h(
         "button",
-        { class: "ghost", title: "Start the checklist over for a new question. Clears ticks and inputs; never touches a file.", onclick: () => post({ type: "newWeek" }) },
+        { class: "danger", title: "Start the checklist over for a new question. Clears ticks and inputs; never touches a file.", onclick: () => post({ type: "newWeek" }) },
         "Reset progress…",
       ),
     ),

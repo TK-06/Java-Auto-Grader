@@ -83,7 +83,8 @@ button.primary {
 button.primary:hover:not(:disabled) { filter: brightness(1.08); }
 button.ghost { border-color: transparent; color: var(--ink-soft); }
 button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--line); }
-button.danger { border-color: var(--fail); color: var(--fail); }
+button.danger { border: 1px solid var(--fail); color: var(--fail); }
+button.danger:hover:not(:disabled) { border-color: var(--fail); background: var(--fail-bg); }
 :focus-visible { outline: 2px solid var(--stain); outline-offset: 2px; }
 
 input[type="text"], input[type="number"], input[type="datetime-local"] {
