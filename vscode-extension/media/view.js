@@ -84,7 +84,11 @@ function build() {
       { class: "side-foot" },
       h("button", { class: "primary", onclick: () => post({ type: "open", index: model.current }) }, `Continue: step ${model.current + 1}`),
       h("button", { onclick: () => post({ type: "openTerminal" }) }, "Terminal"),
-      h("button", { class: "ghost", onclick: () => post({ type: "newWeek" }) }, "New week…"),
+      h(
+        "button",
+        { class: "ghost", title: "Start the checklist over for a new question. Clears ticks and inputs; never touches a file.", onclick: () => post({ type: "newWeek" }) },
+        "Reset progress…",
+      ),
     ),
   );
 }

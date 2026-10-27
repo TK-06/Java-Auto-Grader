@@ -62,7 +62,18 @@ A desktop shortcut that runs `code "<path to java-auto-grader>"` makes this one 
 
 A step is ticked automatically when disk shows it's done. For example, step 5 is done when
 `grades.csv` is newer than everything in `submissions/`. A step with nothing to detect is ticked by
-hand. Ticks and inputs are kept per workspace. **New week…** clears them, and never touches a file.
+hand. Ticks and inputs are kept per workspace.
+
+**Reset progress** (the circular arrow in the side bar's title bar, or *Reset progress…* at the
+bottom of the checklist) starts the checklist over for the next question. It clears every tick and
+input and remembers the moment you pressed it: the tests, submissions and results already on disk
+stop counting as done, and a step is detected again only from files created or changed after the
+reset. It never touches, moves or deletes a file. Anything you prepared before pressing it (say, the
+next question's tests) shows as not done until you tick it by hand.
+
+Before **Run grade.py** and **Run check_lateness.py**, the extension checks that the files they
+write (`grades.csv`, `mcvScore.csv`, `mcvScore.csv.bak`) can be opened for writing. If one is open in
+Excel, it tells you to close it instead of letting the script stop with an error in the terminal.
 
 ## Settings
 

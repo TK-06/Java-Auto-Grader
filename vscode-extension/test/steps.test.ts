@@ -15,7 +15,7 @@ function state(over: Partial<GradingState> = {}): GradingState {
   return {
     gradingDir: PATHS.gradingDir,
     gradingDirOk: true,
-    tests: { javaFiles: [], rubric: false, structure: false, manualReview: false, starter: false, reportConfig: false },
+    tests: { javaFiles: [], rubric: false, structure: false, manualReview: false, starter: false, reportConfig: false, newestMtimeMs: 0 },
     submissions: { count: 0, newestMtimeMs: 0 },
     results: {},
     setupRepo: { dir: PATHS.setupRepoDir, ok: true, weeks: [{ week: "week10", questions: ["q1", "q2"] }] },
@@ -225,6 +225,55 @@ test("step 7 is done once the .bak is at least as new as grades.csv, and undone 
   assert.equal(at(100, 100), true, "same millisecond still counts");
   assert.equal(at(100, 250), true);
   assert.equal(at(300, 250), false, "re-graded after the late check");
+});
+
+test("reset progress: files from before the reset stop counting, files after it count again", () => {
+  // Everything below is a finished question: tests, submissions, grades, late check, report.
+  const finished = (at: number) =>
+    state({
+      tests: { ...state().tests, javaFiles: ["T.java"], reportConfig: true, newestMtimeMs: at },
+      submissions: { count: 2, newestMtimeMs: at },
+      results: {
+        grades: grades(at + 10),
+        scores: { mtimeMs: at + 20 },
+        scoresBackup: { mtimeMs: at + 20 },
+        report: { mtimeMs: at + 30 },
+      },
+    });
+  const detected = (c: Ctx) => ["setup", "extract", "grade", "late", "report"].map((id) => describeStep(STEPS.findIndex((s) => s.id === id), c, {}).detected);
+
+  const never = ctx({ zips: ZIPS }, finished(100));
+  assert.deepEqual(detected(never), [true, true, true, true, true], "no reset: disk decides, as before");
+  assert.equal(STEPS[currentStepIndex(never, {})].id, "materials");
+
+  const reset = { ...never, since: 1000 };
+  assert.deepEqual(detected(reset), [false, false, false, false, false], "reset after everything: nothing counts");
+  assert.equal(STEPS[currentStepIndex(reset, {})].id, "materials");
+  assert.equal(describeStep(STEPS.findIndex((s) => s.id === "setup"), reset, { setup: true }).done, true, "a hand tick still works");
+
+  // New question's files arrive one by one, each newer than the reset.
+  const withTests = { ...reset, state: { ...finished(100), tests: { ...finished(100).tests, newestMtimeMs: 2000 } } };
+  assert.deepEqual(detected(withTests), [true, false, false, false, false]);
+  const withSubs = { ...withTests, state: { ...withTests.state, submissions: { count: 2, newestMtimeMs: 2100 } } };
+  assert.deepEqual(detected(withSubs), [true, true, false, false, false], "old grades are older than the new submissions");
+  const regraded = {
+    ...withSubs,
+    state: { ...withSubs.state, results: { grades: grades(2200), scores: { mtimeMs: 2200 }, scoresBackup: { mtimeMs: 100 } } },
+  };
+  assert.deepEqual(detected(regraded), [true, true, true, false, false], "fresh grades, late check not run yet");
+
+  // The reset only changes what counts as done; it must never lock the buttons.
+  const grade = action("grade", "grade");
+  assert.equal(actionProblem(step("grade"), grade, ctx({}, finished(100))), undefined);
+  assert.equal(actionProblem(step("grade"), grade, { ...ctx({}, finished(100)), since: 1000 }), undefined);
+});
+
+test("grade and late name the files they write, so a locked one can be reported first", () => {
+  const c = ctx({});
+  const names = (stepId: string, actionId: string) => action(stepId, actionId).outputs!(c).map((f) => f.split(/[\\/]/).pop());
+  assert.deepEqual(names("grade", "grade"), ["grades.csv", "mcvScore.csv"]);
+  assert.deepEqual(names("late", "late"), ["mcvScore.csv", "mcvScore.csv.bak"]);
+  assert.equal(action("extract", "extract").outputs, undefined);
 });
 
 test("every step renders without throwing on an empty folder", () => {

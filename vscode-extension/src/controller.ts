@@ -9,6 +9,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { configuredGradingDir, findGradingDir, resolvePaths } from "./config";
 import { graderCandidates, looksLikeGradingDir } from "./discover";
+import { unwritable } from "./locks";
 import { GradeSummary } from "./progress";
 import { Runner, javacMajor } from "./runner";
 import { readState } from "./state";
@@ -17,6 +18,8 @@ import { Ctx, Fact, Paths, STEPS, StepView, Values, actionProblem, currentStepIn
 interface Session {
   values: Values;
   ticks: Record<string, boolean>;
+  /** When the TA last reset the checklist; see Ctx.since. */
+  resetAt?: number;
 }
 
 export interface RunState {
@@ -114,7 +117,7 @@ export class Controller implements vscode.Disposable {
 
   private session(): Session {
     const s = this.context.workspaceState.get<Session>(SESSION_KEY);
-    return { values: { ...(s?.values ?? {}) }, ticks: { ...(s?.ticks ?? {}) } };
+    return { values: { ...(s?.values ?? {}) }, ticks: { ...(s?.ticks ?? {}) }, resetAt: s?.resetAt };
   }
 
   private async save(s: Session): Promise<void> {
@@ -141,7 +144,8 @@ export class Controller implements vscode.Disposable {
         problem: `grade.py not found in ${paths.gradingDir}${configuredGradingDir() ? " – the dsaGrading.gradingDir setting points there" : ""}.`,
       };
     }
-    return { state, paths, values: this.session().values, exists };
+    const session = this.session();
+    return { state, paths, values: session.values, since: session.resetAt, exists };
   }
 
   private weekLabel(ctx: Ctx): string {
@@ -296,14 +300,19 @@ export class Controller implements vscode.Disposable {
     this.changed.fire();
   }
 
+  /** "Reset progress": start the checklist over for the next question. Only the
+   *  extension's own memory changes - the files on disk are never touched. They
+   *  stay where they are but stop counting as done (see Ctx.since). */
   async newWeek(): Promise<void> {
     const ok = await vscode.window.showWarningMessage(
-      "Start a new week? This clears every tick and remembered input (zips, deadline, week). Nothing on disk is touched.",
+      "Reset progress for a new question? This clears every tick and remembered input (zips, deadline, week, question), " +
+        "and treats the tests, submissions and results now on disk as the previous question's, so the checklist starts again at step 1. " +
+        "No file is changed or deleted.",
       { modal: true },
-      "Start a new week",
+      "Reset progress",
     );
     if (!ok) return;
-    await this.save({ values: {}, ticks: {} });
+    await this.save({ values: {}, ticks: {}, resetAt: Date.now() });
     for (const k of Object.keys(this.lastRuns)) delete this.lastRuns[k];
     this.changed.fire();
     this.openStep(0);
@@ -376,6 +385,15 @@ export class Controller implements vscode.Disposable {
       vscode.window.showWarningMessage(problem);
       return;
     }
+    const locked = unwritable(action.outputs?.(ctx) ?? []);
+    if (locked.length) {
+      const names = locked.map((f) => path.relative(ctx.paths.gradingDir, f)).join(", ");
+      vscode.window.showWarningMessage(
+        `${names} can't be written to - most likely it is open in Excel. Close it (choose Don't save), then run "${action.label}" again; the script would stop straight away.`,
+      );
+      return;
+    }
+
     const question = action.confirm?.(ctx);
     if (question && (await vscode.window.showWarningMessage(question, { modal: true }, "Run")) !== "Run") return;
 
