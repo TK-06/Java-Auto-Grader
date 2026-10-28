@@ -11,6 +11,7 @@ tests/*
 !tests/.gitkeep
 
 build_tmp/
+build_tmp_verify/
 # JVM crash dumps from a javac subprocess that ran out of memory/died -
 # land in the repo root (JDK's own default location), never commit these
 hs_err_pid*.log
@@ -23,6 +24,7 @@ results/*.bak
 # extracted student code from failed-to-compile submissions (see grade_student
 # in grade.py) - same privacy category as submissions/, never commit it
 results/failed_builds/
+results/verify_failed_builds/
 # junit-platform-console-standalone is committed on purpose (see lib/README.md)
 # so a fresh clone works without a manual download - ignore any OTHER jar
 # someone drops in here instead (e.g. a stray version bump left alongside it)

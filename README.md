@@ -848,6 +848,30 @@ gradebook upload.
   so a variable that merely shares a package's name (`iterator.hasNext()`) is not read as a
   reference; and only packages the submission itself declares are ever kept, never invented.
 
+## Student self-check (`verify_student_run.py`)
+
+A student can check that their export is packaged correctly, without the hidden tests:
+
+```
+# 1. drop your exported .jar / .zip into submissions/
+# 2.
+python verify_student_run.py
+```
+
+It runs the same pipeline as `grade.py` (unpacking, structure checks, every cap, compile, test
+run, notes), with one difference: the tests are the JUnit file(s) **already inside the student's
+own export**, not `tests/`. A clean result means the export is packaged right and passes the
+given tests; it says nothing about tests the student hasn't seen. Results go to
+`results/verify_grades.csv` (never `grades.csv` / `mcvScore.csv`).
+
+- `--test-file NAME.java` (repeatable) restricts it to specific bundled tests, for an export
+  that also carries old test files from earlier weeks.
+- `--config <dir>` (default `tests/`) loads `rubric.json`, `structure.json`,
+  `manual_review.json` and `starter/` from that folder when present, so a TA can hand out a
+  student-safe copy. Its `*.java` files are never used. Without them scoring is 1 point per
+  test and the required classes are inferred from the tests.
+- An export with no `org.junit` test file at all scores 0 with a note saying so.
+
 ## Verifying a change before it ships
 
 `grade.py` runs on the TA's machine, but this week's official test files also have to run on
@@ -882,7 +906,7 @@ forfeits exactly the points it should.
 **3. The student side — real submissions, in their own project layout.**
 
 ```bash
-python verify_student_run.py --grading . --work <scratch>/studentrun ALL
+python verify_student_run.py --ide-layout --grading . --work <scratch>/studentrun ALL
 ```
 
 This rebuilds each student's project from their jar exactly as the jar lays it out (some
@@ -911,8 +935,9 @@ grading/                  <- repo root
   grade.py
   extract_submissions.py   <- MCV bulk export -> one <studentID>.<ext> per student, see Weekly workflow §2
   check_lateness.py        <- optional; computes real submission times / late penalties, see Weekly workflow §4
-  verify_student_run.py    <- rebuilds each student's own project from their jar and runs this
-                              week's tests there, the way THEY would; see "Verifying a change" below
+  verify_student_run.py    <- student self-check: grades a jar in submissions/ like grade.py, but with the
+                              JUnit test bundled in that jar; see "Student self-check" below. With
+                              --ide-layout it is the TA tool described in "Verifying a change" below
   audit_forbidden.py       <- optional; re-checks a "these methods are forbidden" rule over the
                               real call graph and reports where the official text scan disagrees
   dupe_check.py            <- optional; groups students whose student-written code is identical

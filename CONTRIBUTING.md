@@ -63,7 +63,7 @@ If you touched `grade.py`, `build_report.py` or a week's test setup, the unit su
 step 1 of 4. Also run the other three from the README's **Verifying a change before it ships**:
 
 2. **TA side:** the reference solution scores full marks and the untouched starter a clean 0.
-3. **Student side:** `verify_student_run.py` gives every student the same score `grade.py` did.
+3. **Student side:** `verify_student_run.py --ide-layout` gives every student the same score `grade.py` did.
 4. **Re-grade the cohort and diff:** a behaviour-preserving change gives identical scores. An
    intentional one changes only the rows you named in advance.
 
@@ -81,7 +81,7 @@ pointed outside the repo). That's a hard rule. A run into the real `results/` re
 | `extract_submissions.py` | MyCourseVille bulk export → one `submissions/<studentID>.<ext>` per student |
 | `check_lateness.py` | Real submission times from the original export zips → late caps baked into `mcvScore.csv` |
 | `build_report.py` | The student-facing class report. Generic engine only, week data comes from `tests/report_config.json` |
-| `verify_student_run.py` | Rebuilds each student's own project and runs the tests the way their IDE would |
+| `verify_student_run.py` | Student self-check: `grade.py`'s pipeline using the tests bundled in the student's own jar. `--ide-layout`: rebuilds each project and runs the official tests the way their IDE would |
 | `audit_forbidden.py`, `dupe_check.py`, `audit_given_code.py` | Read-only audits. Evidence for a human, never a score |
 | `test_*.py` | The unit suites |
 | `lib/` | The committed JUnit Console Launcher jar |
