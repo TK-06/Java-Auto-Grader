@@ -320,6 +320,14 @@ def strip_package_declaration(
 IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\.(?:\w+|\*)\s*;\s*\n?", re.MULTILINE)
 IMPORT_CLASS_RE = re.compile(r"^\s*import\s+(?!static\s+)([\w.]+)\.(\w+)\s*;", re.MULTILINE)
 NEW_EXPR_RE = re.compile(r"\bnew\s+([A-Z]\w*)\s*[(<]")
+# A type declaration at the start of a line. Line-anchored on purpose: W14Q2's
+# similarity test holds the given code as a string ("public class SelectionSort {"),
+# and that line starts with a quote, so it is not mistaken for a declaration.
+DECLARED_TYPE_RE = re.compile(
+    r"^[ \t]*(?:(?:public|private|protected|static|final|abstract|sealed|non-sealed|strictfp)\s+)*"
+    r"(?:class|interface|enum|record)\s+([A-Z]\w*)",
+    re.MULTILINE,
+)
 
 NON_STUDENT_IMPORT_PREFIXES = (
     "java.", "javax.", "org.junit", "org.opentest4j", "org.apiguardian",
@@ -358,8 +366,16 @@ def collect_required_class_names(test_files: list[Path]) -> set[str]:
     String, ...) is dropped from the second signal to cut down noise; a
     false positive that slips through anyway is harmless - it only ever
     matters if a like-named .class also turns up inside the student's own
-    submission, which a JDK class never does."""
+    submission, which a JDK class never does.
+
+    A class the official tests DECLARE themselves (a nested helper such as
+    W14Q2's `static final class Parsed`) is never a student class, so it is
+    dropped from the second signal. Without that, a student jar bundling the
+    compiled student-facing copy of the test (`SelectionSortAlgorithmTest$Parsed
+    .class`) looked like a required class submitted without source, and 111 of
+    129 W14Q2 students were capped at 50%."""
     names: set[str] = set()
+    constructed: set[str] = set()
     for tf in test_files:
         text = tf.read_text(encoding="utf-8", errors="ignore")
         for pkg, cls in IMPORT_CLASS_RE.findall(text):
@@ -369,8 +385,17 @@ def collect_required_class_names(test_files: list[Path]) -> set[str]:
         for cls in NEW_EXPR_RE.findall(text):
             if cls in COMMON_JDK_TYPE_NAMES:
                 continue
-            names.add(cls)
-    return names
+            constructed.add(cls)
+    return names | (constructed - types_declared_in_tests(test_files))
+
+
+def types_declared_in_tests(test_files: list[Path]) -> set[str]:
+    """Every class/interface/enum/record the official test files declare,
+    nested ones included - see collect_required_class_names."""
+    declared: set[str] = set()
+    for tf in test_files:
+        declared.update(DECLARED_TYPE_RE.findall(tf.read_text(encoding="utf-8", errors="ignore")))
+    return declared
 
 
 def infer_unnamed_package_classes(test_files: list[Path]) -> set[str]:
@@ -399,7 +424,7 @@ def infer_unnamed_package_classes(test_files: list[Path]) -> set[str]:
             if cls in COMMON_JDK_TYPE_NAMES:
                 continue
             unqualified.add(cls)
-    return unqualified - qualified
+    return unqualified - qualified - types_declared_in_tests(test_files)
 
 
 def collect_referenced_packages(test_files: list[Path]) -> set[str]:

@@ -1870,6 +1870,31 @@ class TestCollectRequiredClassNames(unittest.TestCase):
 
             self.assertNotIn("ArrayList", names)
 
+    def test_excludes_helper_classes_the_tests_declare_themselves(self):
+        # W14Q2: the source-reading tests carry their own nested helpers. Treating
+        # them as student classes capped 111 students at 50%, because their jars
+        # bundled SelectionSortAlgorithmTest$Parsed.class with no Parsed.java.
+        # A class named only inside a string literal is still a student class.
+        with tempfile.TemporaryDirectory() as tmp:
+            tf = Path(tmp) / "SelectionSortAlgorithmTest2.java"
+            tf.write_text(
+                "package test;\n"
+                "import sort.SelectionSort;\n"
+                "class SelectionSortAlgorithmTest2 {\n"
+                "    static final String REF =\n"
+                "        \"public class Station {\\n\";\n"
+                "    static final class Parsed { }\n"
+                "    private static class Loop { }\n"
+                "    @Test void t() { new Parsed(); new Loop(); new Station(); }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            names = collect_required_class_names([tf])
+
+            self.assertEqual(names, {"SelectionSort", "Station"})
+            self.assertEqual(infer_unnamed_package_classes([tf]), {"Station"})
+
 
 class TestFindClassFiles(unittest.TestCase):
     def test_descends_into_build_output_dirs_unlike_find_java_files(self):
