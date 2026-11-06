@@ -125,6 +125,20 @@ def esc(s):
     return html.escape(s or "", quote=True)
 
 
+# The grading machine's own filesystem paths reach this page through test messages (a test
+# that names the file it opened, a NoSuchFileException whose whole message is the path, a
+# javac error line). A student has no use for "C:\Users\<TA>\...\build_tmp\120\", and it names
+# whoever ran the grader, so the build-dir prefix is cut: what is left is the project-relative
+# path (src\sort\SelectionSort.java). Anything else under C:\Users\ is replaced outright.
+_BUILD_DIR_PREFIX_RE = re.compile(r"[A-Za-z]:\\(?:[^\\\r\n;|]+\\)*?build_tmp\\\d+\\")
+_USER_PATH_RE = re.compile(r"[A-Za-z]:\\Users\\[^\s;|]*")
+
+
+def scrub_local_paths(text):
+    text = _BUILD_DIR_PREFIX_RE.sub("", text or "")
+    return _USER_PATH_RE.sub("<path on the grading machine>", text)
+
+
 def parse_pairs(field):
     out = []
     for part in (field or "").split(";"):
@@ -151,6 +165,11 @@ def parse_failure_details(field):
 def category_of(row):
     notes = row["notes"]
     if "TA OVERRIDE" in notes:
+        # The course's plagiarism rule (a copied FILE, not merely similar code - see the
+        # project CLAUDE.md "Plagiarism standard"): the TA opens their explanation with
+        # "PLAGIARISM:", and that row has to be unmistakable on a page the whole class reads.
+        if re.search(r"TA OVERRIDE:\s*PLAGIARISM:", notes):
+            return "plagiarism"
         return "override"
     # A wrong-project export that COMPILED (grade.py's detect_mixed_source: the
     # .java covered the given classes, the assessed class came only from its
@@ -231,6 +250,7 @@ CATEGORY_LABEL = {
     "wrongwork": "Wrong submission",
     "nosource": "No source", "override": "TA review", "missing": "No submission",
     "timeout": "Timed out", "penalty": "Penalty", "gate": "Rule not met",
+    "plagiarism": "Plagiarism",
 }
 
 
@@ -275,10 +295,10 @@ def render_ta_note(notes, cat):
     case was real (W6Q1: a submission that threw on an `instanceof` guard, where
     the six identical `java.lang.Exception` lines explain nothing on their own).
 
-    Skipped for `override`, where the branch already leads with everything from
-    the TA marker onward, so rendering here would print it twice.
+    Skipped for `override` and `plagiarism`, where the branch already leads with
+    everything from the TA marker onward, so rendering here would print it twice.
     """
-    if cat == "override" or "TA NOTE:" not in notes:
+    if cat in ("override", "plagiarism") or "TA NOTE:" not in notes:
         return ""
     said = notes[notes.find("TA NOTE:"):].split(":", 1)[-1].strip()
     return f"""<div class="reason reason-override">
@@ -288,7 +308,9 @@ def render_ta_note(notes, cat):
 
 
 def render_reason(row, cat):
-    notes = NOTE_REDACTIONS.get(row["student_id"], row["notes"])
+    # scrub_local_paths: category_of() has already decided from the raw notes; what is
+    # DISPLAYED (including the collapsed grader trail) must not carry the grader's paths.
+    notes = scrub_local_paths(NOTE_REDACTIONS.get(row["student_id"], row["notes"]))
     return (
         render_late_notice(row)
         + _render_category_reason(row, cat, notes)
@@ -510,7 +532,7 @@ def _render_category_reason(row, cat, notes):
           <p><strong>Capped at {pct}%.</strong> {esc(reason_shown)}</p>{extra}
           <p class="hint">{hint}</p>
         </div>"""
-    if cat == "override":
+    if cat in ("override", "plagiarism"):
         # An override row's notes carry the WHOLE grading trail, and the TA's
         # decision is only the last clause of it. Dumping all of it makes the
         # student read package-strip chatter and MANUAL REVIEW text written for
@@ -529,6 +551,20 @@ def _render_category_reason(row, cat, notes):
         said = notes[idx:].split(":", 1)[-1].strip()
         extra = (f"""<details class="rawerr"><summary>Show the grader's full notes</summary>
           <pre>{esc(trail)}</pre></details>""") if trail else ""
+        if cat == "plagiarism":
+            # Same decision-first shape as an ordinary override, with a banner the row
+            # cannot be mistaken without. The TA's text opens "PLAGIARISM:"; the banner
+            # says it already, so the prefix is dropped from the sentence the student reads.
+            said = re.sub(r"^PLAGIARISM:\s*", "", said)
+            return f"""<div class="reason reason-plagiarism">
+          <p class="plag-banner">Plagiarism</p>
+          <p class="diag"><strong>A TA reviewed this submission by hand and set the score to 0 under the
+          course's plagiarism rule</strong>, rather than leaving it to the automated result. Their reason:</p>
+          <p class="diag">{esc(said)}</p>
+          <p class="hint">This is the score that counts for this question. If anything here looks wrong,
+          raise it with your TA and point them at this note.</p>
+          {extra}
+        </div>"""
         return f"""<div class="reason reason-override">
           <p class="diag"><strong>A TA reviewed this submission by hand and set the score themselves</strong>,
           rather than leaving it to the automated result. Their reason:</p>
@@ -566,6 +602,30 @@ def _render_category_reason(row, cat, notes):
     return ""
 
 
+def render_failure_detail(detail):
+    """The one-line reason shown under a FAIL row.
+
+    Three things a raw failure message gets wrong for a student: it can carry the grading
+    machine's paths (scrubbed); a test that reads the student's .java can fail with a
+    NoSuchFileException whose whole message is that path, which explains nothing; and a
+    test that prints a multi-line report (the similarity test's two token lists) turns the
+    row into a wall. The first line stays visible, the rest sits behind a toggle - the same
+    shape the javac wall gets."""
+    shown = scrub_local_paths(detail).replace("\r\n", "\n").strip()
+    if not shown:
+        return ('<p class="tdetail">No result at all for this test - usually because the whole test '
+                'class failed to load.</p>')
+    if re.fullmatch(r"(?:src[\\/])?[\w$.\\/ -]+\.java", shown):
+        return (f'<p class="tdetail">{esc(shown)} was not found in the submission, and this test '
+                f'reads your .java source.</p>')
+    first, _, rest = shown.partition("\n")
+    if not rest.strip():
+        return f'<p class="tdetail">{esc(shown)}</p>'
+    return (f'<p class="tdetail">{esc(first)}</p>'
+            f'<details class="rawerr"><summary>Show the test\'s full output</summary>'
+            f'<pre>{esc(rest.strip())}</pre></details>')
+
+
 def render_tests(row):
     if row["tests_total"] in ("", "0"):
         return ""
@@ -582,8 +642,7 @@ def render_tests(row):
             label = "PASS" if ok else "FAIL"
             det_html = ""
             if not ok:
-                det_html = (f'<p class="tdetail">{esc(detail)}</p>' if detail
-                             else '<p class="tdetail">No result at all for this test - usually because the whole test class failed to load.</p>')
+                det_html = render_failure_detail(detail)
             out.append(f"""<div class="trow {cls_name}">
               <span class="tbadge">{label}</span><span class="tname">{esc(method)}</span>
               <p class="twhat">{desc}</p>{det_html}
@@ -610,7 +669,7 @@ def render_graded_row(row):
         summary_extra = '<span class="note-flag">test run timed out</span>'
     elif cat == "capped":
         summary_extra = f'<span class="note-flag">capped {row["score_cap"]}</span>'
-    elif cat == "override":
+    elif cat in ("override", "plagiarism"):
         summary_extra = '<span class="note-flag">TA reviewed</span>'
     elif cat == "penalty":
         summary_extra = '<span class="note-flag">rubric penalty</span>'
@@ -734,6 +793,11 @@ h1 { font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp
 .diag { margin: 0 0 .5rem; }
 .diag code { font-size: .9em; }
 .chip-override { background: var(--override-bg); color: var(--ink); border: 1px solid var(--override-line); }
+.chip-plagiarism { background: var(--fail-bg); color: var(--fail); border: 1px solid var(--fail); text-transform: uppercase; letter-spacing: .05em; font-weight: 700; }
+.row[data-cat="plagiarism"] { border-color: var(--fail); }
+.reason-plagiarism { background: var(--fail-bg); border-left: 4px solid var(--fail); border-radius: 8px; padding: .85rem 1rem .5rem; margin-top: .85rem; }
+.reason.reason-plagiarism pre { background: var(--paper-raised); color: var(--ink); border: 1px solid var(--line); }
+.plag-banner { margin: 0 0 .4rem; color: var(--fail); font-weight: 700; font-size: .78rem; letter-spacing: .09em; text-transform: uppercase; }
 .chip-missing { background: var(--missing-bg); color: var(--ink-soft); }
 .note-flag { font-size: .78rem; color: var(--ink-soft); }
 .score { margin-left: auto; font-family: "Fraunces", serif; font-weight: 600; font-size: 1.05rem; font-variant-numeric: tabular-nums; flex: none; }
@@ -743,7 +807,7 @@ h1 { font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp
 .reason { padding-top: .85rem; font-size: .89rem; }
 .reason p { margin: 0 0 .5rem; }
 .reason .hint { color: var(--ink-soft); font-size: .84rem; }
-.reason pre {
+.reason pre, .trow pre {
   background: var(--code-bg); color: var(--code-ink); padding: .8rem .9rem; border-radius: 8px;
   overflow-x: auto; font-size: .8rem; white-space: pre-wrap; word-break: break-word; font-family: "JetBrains Mono", monospace;
   margin: 0 0 .5rem;
@@ -838,7 +902,8 @@ def main():
         ("pass", "Full pass"), ("partial", "Partial"), ("capped", "Capped"),
         ("gate", "Rule not met"), ("penalty", "Penalty"), ("timeout", "Timed out"),
         ("wrongwork", "Wrong submission"), ("compile", "Compile error"), ("structure", "Structure error"),
-        ("nosource", "No source"), ("override", "TA review"), ("missing", "No submission"),
+        ("nosource", "No source"), ("plagiarism", "Plagiarism"), ("override", "TA review"),
+        ("missing", "No submission"),
     ]
     catbar_html = '<div class="catbar">' + "".join(
         f'<span class="chip chip-{c} filterchip" data-cat="{c}">{label} ({cats.get(c, 0) if c != "missing" else len(NOT_SUBMITTED) + len(NO_VALID_SUBMISSION)})</span>'
@@ -856,6 +921,7 @@ def main():
         "compile": "The code did not compile against the official test, so no test could run.",
         "structure": "A class the assignment required was missing, so nothing could be compiled.",
         "nosource": "No usable .java source was found in the submission.",
+        "plagiarism": "The JAR file submitted was also submitted by another student - the file itself, not just similar code - so a TA set the score to 0 under the course's plagiarism rule.",
         "override": "A TA reviewed this one by hand; the note explains what was decided.",
         "missing": "No gradable file was received for this assignment.",
     }
