@@ -64,7 +64,7 @@ from pathlib import Path
 # for is by construction the text grade.py wrote.
 from grade import (
     MIXED_SOURCE_RE, WRONG_SUBMISSION_PREFIX, RUBRIC_GATE_PREFIX, RUBRIC_PENALTY_PREFIX,
-    NO_CLASS_CAP_REASON,
+    NO_CLASS_CAP_REASON, EXTRACT_FAILED_NOTE,
 )
 
 CSV_PATH = Path(__file__).parent / "results" / "grades.csv"
@@ -464,6 +464,14 @@ def _render_category_reason(row, cat, notes):
                     "whether the code itself would have compiled.</p>")
             hint = ("<p class='hint'>What to do: export the project as a <code>.jar</code> with source "
                     "included, or zip the project folder, and submit that one file.</p>")
+        elif cat == "nosource" and notes.startswith(EXTRACT_FAILED_NOTE):
+            # A grading-machine failure, not evidence about the student's source:
+            # the "tick include source" hint below would blame them for it.
+            what = ("<p class='diag'>The grader could not unpack this submission, so nothing in it was "
+                    "graded. This is not a finding that your source is missing &mdash; the score here "
+                    "is pending a TA check.</p>")
+            hint = ("<p class='hint'>Nothing to fix on your side unless a TA contacts you; if your score "
+                    "stays at 0, ask a TA to re-check your file.</p>")
         elif cat == "nosource":
             what = ("<p class='diag'>No usable <code>.java</code> source file was found inside this "
                     "submission, so there was nothing to compile and no test could run.</p>")

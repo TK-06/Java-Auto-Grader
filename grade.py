@@ -91,6 +91,12 @@ OUTPUT_TRUNCATE_LINES = 40
 RMTREE_RETRY_ATTEMPTS = 5
 RMTREE_RETRY_DELAY_SECONDS = 2.0
 
+# Start of the note discover_submissions writes when an archive could not be
+# unpacked. A row carrying it failed on the grading machine, not for lack of
+# source, so it gets its own console status (see failure_status) and never the
+# "no .java source files found" note. build_report.py imports it.
+EXTRACT_FAILED_NOTE = "could not extract"
+
 # The exact header line the JVM prints (to stderr, then repeats atop
 # hs_err_pid<pid>.log) when a javac subprocess dies from native-memory
 # exhaustion on the machine running grade.py itself - never something the
@@ -197,14 +203,36 @@ def _clear_readonly_and_retry(func, path, _exc) -> None:
     func(path)
 
 
+def long_path(path: Path) -> str:
+    """path in the Windows extended-length form (\\\\?\\C:\\...), which is exempt
+    from the 260-character MAX_PATH limit; unchanged on other platforms.
+
+    W14 Q2: a jar bundling the whole JUnit console jar has entries ~126
+    characters long, so extracting it under a deep working directory passed
+    260 characters, extractall() raised partway, and the student was reported
+    as having no source. Used for extraction and deletion only - the paths
+    graded afterwards stay in their ordinary form."""
+    if sys.platform != "win32":
+        return str(path)
+    text = str(Path(path).resolve())
+    if text.startswith("\\\\?\\"):
+        return text
+    if text.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + text[2:]
+    return "\\\\?\\" + text
+
+
 def _rmtree(path: Path) -> None:
     """shutil.rmtree that also removes read-only entries (see
     _clear_readonly_and_retry). onexc replaced onerror in Python 3.12; the
-    handler ignores its third argument, so it fits both signatures."""
+    handler ignores its third argument, so it fits both signatures. Goes
+    through long_path so an extracted tree deeper than 260 characters can be
+    deleted too - otherwise the next run's rmtree_with_retry(build_root)
+    would stop the grader."""
     if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+        shutil.rmtree(long_path(path), onexc=_clear_readonly_and_retry)
     else:
-        shutil.rmtree(path, onerror=_clear_readonly_and_retry)
+        shutil.rmtree(long_path(path), onerror=_clear_readonly_and_retry)
 
 
 def rmtree_quietly(path: Path) -> None:
@@ -250,18 +278,52 @@ def rmtree_with_retry(path: Path) -> None:
     )
 
 
+def blank_comments_and_strings(text: str) -> str:
+    """text with every comment and string/char/text-block literal replaced by
+    spaces, so a regex sees only code. W14 Q2: a test file holding a reference
+    class as data ("public class SelectionSort {\\n" in a string) was taken to
+    BE SelectionSort.java."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end == -1 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = n if end == -1 else end + 2
+        elif text.startswith('"""', i):
+            end = i + 3
+            while end < n and not text.startswith('"""', end):
+                end += 2 if text[end] == "\\" else 1
+            end = min(end + 3, n)
+        elif text[i] in "\"'":
+            end = i + 1
+            while end < n and text[end] != text[i] and text[end] != "\n":
+                end += 2 if text[end] == "\\" else 1
+            end = min(end + 1, n)
+        else:
+            out.append(text[i])
+            i += 1
+            continue
+        out.append(" " * (end - i))
+        i = end
+    return "".join(out)
+
+
 def resolve_java_filename(path: Path) -> str:
     """Java requires a public top-level type's filename to match its name.
     LMS downloads often rename single-file submissions to the student's ID
     (e.g. 87654321.java), which breaks that constraint even though the
     student's own code is otherwise fine. Detect the real public type name
     from the source and use THAT as the copied filename instead of trusting
-    whatever the file was called on disk."""
+    whatever the file was called on disk. Comments and literals are ignored
+    (see blank_comments_and_strings)."""
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return path.name
-    match = PUBLIC_TYPE_RE.search(text)
+    match = PUBLIC_TYPE_RE.search(blank_comments_and_strings(text))
     if match:
         return f"{match.group(1)}.java"
     return path.name
@@ -1288,14 +1350,15 @@ def discover_submissions(submissions_dir: Path, extract_root: Path) -> list[Subm
             extract_dir.mkdir(parents=True)
             try:
                 with zipfile.ZipFile(entry) as zf:
-                    zf.extractall(extract_dir)
+                    zf.extractall(long_path(extract_dir))
             except zipfile.BadZipFile:
                 results.append(Submission(student_id, [], [f"could not open {entry.name}: not a valid zip/jar file"]))
                 continue
             except OSError as exc:
-                # e.g. Windows path-length limit blown by a long filename/deeply
-                # nested entry inside the archive - must not crash the whole batch.
-                results.append(Submission(student_id, [], [f"could not extract {entry.name}: {exc}"]))
+                # Long paths are handled by long_path above; anything still raised
+                # here (disk full, a locked file, a malformed entry name) must not
+                # crash the whole batch.
+                results.append(Submission(student_id, [], [f"{EXTRACT_FAILED_NOTE} {entry.name}: {exc}"]))
                 continue
             java_files = find_java_files(extract_dir)
             notes: list[str] = []
@@ -1304,7 +1367,7 @@ def discover_submissions(submissions_dir: Path, extract_root: Path) -> list[Subm
                 for nested in find_nested_archives(extract_dir):
                     try:
                         with zipfile.ZipFile(nested) as nzf:
-                            nzf.extractall(extract_dir)
+                            nzf.extractall(long_path(extract_dir))
                     except (zipfile.BadZipFile, OSError):
                         continue
                     java_files = find_java_files(extract_dir)
@@ -2470,7 +2533,11 @@ def grade_student(
     build_dir = None
     try:
         if not student_files and class_search_root is None:
-            row["notes"] = "; ".join(discovery_notes + ["no .java source files found"]).strip("; ")
+            # An archive that could not be unpacked says nothing about its source.
+            extract_failed = any(n.startswith(EXTRACT_FAILED_NOTE) for n in discovery_notes)
+            row["notes"] = "; ".join(
+                discovery_notes + ([] if extract_failed else ["no .java source files found"])
+            ).strip("; ")
             return row
 
         build_dir, prep_notes = prepare_build_dir(build_key, student_files, test_files, build_root)
@@ -3091,6 +3158,24 @@ def clip_console_reason(text: str) -> str:
     return text
 
 
+def failure_status(row: dict) -> str:
+    """The console status for a row that did not compile."""
+    notes = row["notes"]
+    if "STRUCTURE ERROR" in notes:
+        return "STRUCTURE ERROR"
+    if WRONG_SUBMISSION_PREFIX in notes:
+        # Deliberately REPLACES "COMPILE ERROR" rather than qualifying
+        # it, matching how build_report.py routes the same row to its
+        # own "Wrong submission" category instead of "Compile error".
+        # That it failed to compile is true but not the useful half.
+        return "WRONG SUBMISSION"
+    if "COMPILE ERROR" in notes:
+        return "COMPILE ERROR"
+    if notes.startswith(EXTRACT_FAILED_NOTE):
+        return "COULD NOT EXTRACT"
+    return "NO SOURCE FILES"
+
+
 def console_failure_reason(row: dict) -> str:
     """One short clause naming WHY a submission scored 0, appended to its
     console progress line in main(). grades.csv keeps the full notes either way.
@@ -3331,18 +3416,7 @@ def main() -> None:
         )
         rows.append(row)
         if row["compiled"] == "no":
-            if "STRUCTURE ERROR" in row["notes"]:
-                status = "STRUCTURE ERROR"
-            elif WRONG_SUBMISSION_PREFIX in row["notes"]:
-                # Deliberately REPLACES "COMPILE ERROR" rather than qualifying
-                # it, matching how build_report.py routes the same row to its
-                # own "Wrong submission" category instead of "Compile error".
-                # That it failed to compile is true but not the useful half.
-                status = "WRONG SUBMISSION"
-            elif "COMPILE ERROR" in row["notes"]:
-                status = "COMPILE ERROR"
-            else:
-                status = "NO SOURCE FILES"
+            status = failure_status(row)
             reason = console_failure_reason(row)
             print(
                 f"[{i}/{total}] {student_id}: {status} (score {row['score']})"
