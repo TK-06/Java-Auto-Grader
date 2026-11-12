@@ -12,6 +12,7 @@ from unittest import mock
 
 from grade import (
     CONSOLE_REASON_MAX_CHARS,
+    EXTRACT_FAILED_NOTE,
     RMTREE_RETRY_ATTEMPTS,
     MIXED_SOURCE_RE,
     NO_CLASS_CAP_REASON,
@@ -38,6 +39,7 @@ from grade import (
     compile_with_class_fallback,
     discover_submissions,
     expand_keep_packages,
+    failure_status,
     find_class_fallback_files,
     find_class_files,
     find_java_files,
@@ -57,6 +59,7 @@ from grade import (
     partition_fallback_matches,
     prepare_build_dir,
     resolve_class_fallback_dest,
+    resolve_java_filename,
     rewrite_imports_of_renamed_packages,
     rmtree_quietly,
     rmtree_with_retry,
@@ -1360,6 +1363,35 @@ class TestGradeStudentStructureBaseline(unittest.TestCase):
             self.assertEqual(list(failed_build_root.iterdir()), [])
 
 
+class TestResolveJavaFilenameIgnoresStringsAndComments(unittest.TestCase):
+    """W14 Q2: a student's bundled SelectionSortSimilarityTest.java holds the
+    reference class as test data - "public class SelectionSort {\\n" inside a
+    string. It resolved to SelectionSort.java and, in the self-check, pushed the
+    student's real SelectionSort.java out as a collision with a 'test' file."""
+
+    def _resolve(self, name, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.write_text(text, encoding="utf-8")
+            return resolve_java_filename(path)
+
+    def test_class_declaration_inside_a_string_is_not_the_files_type(self):
+        text = ('package test;\nclass SelectionSortSimilarityTest {\n'
+                '    static final String REF =\n        "public class SelectionSort {\\n" +\n        "}";\n}\n')
+        self.assertEqual(self._resolve("SelectionSortSimilarityTest.java", text),
+                         "SelectionSortSimilarityTest.java")
+
+    def test_text_block_char_literal_and_comments_are_ignored(self):
+        text = ('// public class FromLineComment {}\n/* public class FromBlockComment {} */\n'
+                'class Holder {\n    char q = \'"\';\n    String s = """\n        public class FromTextBlock {}\n        """;\n}\n'
+                'public class Real {}\n')
+        self.assertEqual(self._resolve("87654321.java", text), "Real.java")
+
+    def test_lms_renamed_file_still_resolves_to_its_public_class(self):
+        text = 'public class Calculator {\n    String s = "x // not a comment";\n}\n'
+        self.assertEqual(self._resolve("87654321.java", text), "Calculator.java")
+
+
 class TestFindJavaFiles(unittest.TestCase):
     def test_skips_known_build_and_ide_folders(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1645,6 +1677,75 @@ class TestDiscoverSubmissionsNestedArchive(unittest.TestCase):
             self.assertTrue(any("contained no .java files" in n for n in sub.notes), sub.notes)
             self.assertTrue(sub.zip_needed_deeper_extraction)
             self.assertEqual(sub.class_search_root, extract_root / "0")
+
+
+class TestDiscoverSubmissionsExtractionFailure(unittest.TestCase):
+    """W14 Q2: a jar bundling the whole JUnit console jar has entries ~126
+    characters long. Extracted under a deep working directory, the full path
+    passed Windows' 260-character limit, extractall() died partway, and the row
+    read 'NO SOURCE FILES - no .java source files found' for a student whose
+    sort/SelectionSort.java was in the jar all along."""
+
+    @unittest.skipUnless(sys.platform == "win32", "the 260-character limit is Windows-only")
+    def test_extracts_an_entry_whose_full_path_passes_260_characters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+            deep_entry = "org/" + "a" * 120 + "/" + "b" * 120 + ".class"
+            self.assertGreater(len(str(extract_root.resolve() / "0" / deep_entry)), 260)
+
+            with zipfile.ZipFile(submissions_dir / "6800000021.jar", "w") as zf:
+                zf.writestr(deep_entry, b"\xca\xfe\xba\xbe")
+                zf.writestr("sort/SelectionSort.java", "package sort;\npublic class SelectionSort {}\n")
+
+            submissions = discover_submissions(submissions_dir, extract_root)
+
+            sub = submissions[0]
+            self.assertEqual([f.name for f in sub.java_files], ["SelectionSort.java"])
+            self.assertFalse(any(EXTRACT_FAILED_NOTE in n for n in sub.notes), sub.notes)
+            # The end-of-run cleanup has to be able to delete what was extracted,
+            # or the NEXT run's rmtree_with_retry(build_root) exits the grader.
+            rmtree_with_retry(extract_root)
+            self.assertFalse(extract_root.exists())
+
+    def test_extraction_failure_is_not_reported_as_no_source(self):
+        junit_jar = find_junit_jar(Path(__file__).resolve().parent / "lib")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submissions_dir = tmp_path / "submissions"
+            submissions_dir.mkdir()
+            extract_root = tmp_path / "_extracted"
+            extract_root.mkdir()
+            with zipfile.ZipFile(submissions_dir / "6800000021.jar", "w") as zf:
+                zf.writestr("sort/SelectionSort.java", "package sort;\npublic class SelectionSort {}\n")
+            build_root = tmp_path / "build_tmp"
+            build_root.mkdir()
+            failed_build_root = tmp_path / "failed_builds"
+            failed_build_root.mkdir()
+            test_file = tmp_path / "SelectionSortTest.java"
+            test_file.write_text("class SelectionSortTest {}\n")
+
+            with mock.patch.object(zipfile.ZipFile, "extractall",
+                                   side_effect=FileNotFoundError(2, "No such file or directory")):
+                sub = discover_submissions(submissions_dir, extract_root)[0]
+            row = grade_student(
+                sub.student_id, "1", sub.java_files, sub.notes, [test_file], ["SelectionSortTest"],
+                junit_jar, build_root, 30, False, None, None, failed_build_root,
+                class_search_root=sub.class_search_root,
+            )
+
+            self.assertIn(EXTRACT_FAILED_NOTE, row["notes"])
+            self.assertNotIn("no .java source files found", row["notes"])
+            self.assertEqual(failure_status(row), "COULD NOT EXTRACT")
+
+    def test_status_of_a_genuinely_empty_submission_is_unchanged(self):
+        row = {"notes": "no .java source files found"}
+        self.assertEqual(failure_status(row), "NO SOURCE FILES")
+        self.assertEqual(failure_status({"notes": "STRUCTURE ERROR: missing required class Sort"}),
+                         "STRUCTURE ERROR")
 
 
 class TestArchiveHasProjectClasses(unittest.TestCase):

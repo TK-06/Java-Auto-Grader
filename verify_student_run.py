@@ -247,6 +247,17 @@ def student_main(args):
         found = bundled_test_files(sub.java_files, wanted, grade)
         print(f"[{i}/{total}] {sub.student_id}:")
 
+        if any(n.startswith(grade.EXTRACT_FAILED_NOTE) for n in sub.notes):
+            # Nothing was unpacked, so "no test file" (and its advice) would be a
+            # guess about a file we never looked inside.
+            row = {"student_id": sub.student_id, "compiled": "no", "tests_passed": 0,
+                   "tests_total": 0, "score": 0, "max_score": 0, "uncapped_score": 0,
+                   "score_cap": "", "passed_tests": "", "failed_tests": "",
+                   "failure_details": "", "notes": "; ".join(sub.notes)}
+            rows.append(row)
+            print(f"         COULD NOT EXTRACT (score 0) - {grade.console_failure_reason(row)}")
+            continue
+
         if not found and not sub.not_an_archive:
             if wanted:
                 why = f"none of the requested test file(s) {sorted(wanted)} are in the submission"
@@ -297,14 +308,7 @@ def student_main(args):
         rows.append(row)
 
         if row["compiled"] == "no":
-            if "STRUCTURE ERROR" in row["notes"]:
-                status = "STRUCTURE ERROR"
-            elif grade.WRONG_SUBMISSION_PREFIX in row["notes"]:
-                status = "WRONG SUBMISSION"
-            elif "COMPILE ERROR" in row["notes"]:
-                status = "COMPILE ERROR"
-            else:
-                status = "NO SOURCE FILES"
+            status = grade.failure_status(row)
             reason = grade.console_failure_reason(row)
             print(f"         {status} (score {row['score']})" + (f" - {reason}" if reason else ""))
         else:

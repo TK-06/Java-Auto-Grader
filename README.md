@@ -825,6 +825,11 @@ gradebook upload.
   junk like `-1522399-17860067636260` before the extension) never hit Windows' 260-character
   path limit during extraction, since the filesystem folder used is always a short hash —
   the real filename is preserved as-is for the `student_id` column.
+- **Long paths inside the archive** (a jar bundling the whole JUnit console jar has
+  entries ~126 characters long) are extracted and cleaned up through Windows'
+  extended-length `\\?\` form, so the grader's own folder depth can't push them past 260
+  characters. An archive that still cannot be unpacked prints `COULD NOT EXTRACT`, never
+  `NO SOURCE FILES`, and its note starts `could not extract` — check that file by hand.
 - **0 tests found** (student renamed/overwrote a class the test depends on) is reported
   distinctly from a compile failure.
 - **A single-file submission renamed to the student's ID** by the LMS (e.g. `87654321.java`
